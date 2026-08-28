@@ -36,9 +36,7 @@ cd plugin
 #    Settings | Plugins | ⚙ | Install Plugin from Disk… → выбрать этот zip
 #    Перезапустить IDE
 
-# 3. Подключить оркестратор к плагину
-#    Tools | MetaJetCore | Copy MCP Config Command
-#    вставить полученную команду в терминал (это claude mcp add --transport http …)
+# 3. Ничего. Плагин сам прописывает себя в ~/.claude.json для этого проекта.
 
 # 4. Проверить, что всё нашлось
 #    Tools | MetaJetCore | Diagnostics

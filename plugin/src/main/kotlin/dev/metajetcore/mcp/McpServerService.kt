@@ -53,7 +53,7 @@ class McpServerService(private val project: Project) : Disposable {
             ?: MjcSettings.derivePort(project.basePath.orEmpty())
 
         if (tryStart(settings, preferred)) {
-            announceEndpoint()
+            registerInClaudeConfig()
             return
         }
 
@@ -67,20 +67,40 @@ class McpServerService(private val project: Project) : Disposable {
     }
 
     /**
-     * Показывает команду подключения при старте.
+     * Прописывает себя в конфигурацию Claude Code, чтобы подключение не требовало действий.
      *
-     * Действие в меню для этого же есть, но на него нельзя полагаться: при установке плагина
-     * без перезапуска IDE главное меню не перестраивается, и пункт просто не появляется, хотя
-     * сам плагин уже работает. Уведомление приходит независимо от состояния меню.
+     * Раньше плагин показывал команду и предлагал выполнить её руками. Шаг оказался ломким:
+     * при установке плагина без перезапуска IDE меню не перестраивается и пункт не появляется,
+     * а при смене порта команду пришлось бы выполнять заново.
+     *
+     * Уведомление остаётся только на случай, когда записать не удалось.
      */
-    private fun announceEndpoint() {
+    private fun registerInClaudeConfig() {
+        val url = endpoint() ?: return
+        val projectPath = project.basePath ?: return
+
+        if (McpConfigWriter.isUpToDate(projectPath, url)) return
+        if (McpConfigWriter.write(projectPath, url)) return
+
+        notify(
+            "MetaJetCore: не удалось прописать подключение",
+            "Выполните команду в терминале сами:<br/><code>${claudeMcpAddCommand()}</code>",
+            NotificationType.WARNING,
+        )
+    }
+
+    /** Громкое уведомление: порт занят, URL изменился, конфигурацию надо обновить. */
+    private fun warnPortTaken(preferred: Int) {
         val command = claudeMcpAddCommand()
         NotificationGroupManager.getInstance()
             .getNotificationGroup("MetaJetCore")
             .createNotification(
-                "MetaJetCore готов",
-                "Подключите оркестратор одной командой в терминале:<br/><code>$command</code>",
-                NotificationType.INFORMATION,
+                "MetaJetCore: порт $preferred занят",
+                "MCP-сервер поднялся на $boundPort. Скорее всего этот проект уже открыт в " +
+                    "другой IDE — её экземпляр рабочий, и конфигурацию я намеренно не трогаю, " +
+                    "чтобы его не сломать. Если нужен именно этот экземпляр, подключите его " +
+                    "вручную:<br/><code>$command</code>",
+                NotificationType.WARNING,
             )
             .also { notification ->
                 notification.addAction(
@@ -93,25 +113,10 @@ class McpServerService(private val project: Project) : Disposable {
             .notify(project)
     }
 
-    /** Громкое уведомление: порт занят, URL изменился, конфигурацию надо обновить. */
-    private fun warnPortTaken(preferred: Int) {
-        val command = claudeMcpAddCommand()
+    private fun notify(title: String, text: String, type: NotificationType) {
         NotificationGroupManager.getInstance()
             .getNotificationGroup("MetaJetCore")
-            .createNotification(
-                "MetaJetCore: порт $preferred занят",
-                "MCP-сервер поднялся на $boundPort. Сохранённая конфигурация указывает на " +
-                    "старый порт — обновите её:<br/><code>$command</code>",
-                NotificationType.WARNING,
-            )
-            .also { notification ->
-                notification.addAction(
-                    NotificationAction.createSimple("Скопировать команду") {
-                        CopyPasteManager.getInstance().setContents(StringSelection(command))
-                        notification.expire()
-                    },
-                )
-            }
+            .createNotification(title, text, type)
             .notify(project)
     }
 
