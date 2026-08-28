@@ -10,6 +10,7 @@ import com.intellij.openapi.project.Project
 import dev.metajetcore.agents.AgentManager
 import dev.metajetcore.mcp.McpServerService
 import dev.metajetcore.registry.SessionRegistry
+import dev.metajetcore.roles.RoleInstaller
 import dev.metajetcore.settings.MjcSettings
 import dev.metajetcore.shell.ShellDialect
 import dev.metajetcore.skill.SkillInstaller
@@ -54,8 +55,11 @@ class NewOrchestratorAction : AnAction() {
 
         val backend = TerminalBackends.resolve()
         val shell = ShellDialect.detect(System.getenv("SHELL") ?: System.getenv("ComSpec"))
-        val command = shell.unsetPrefix(
-            if (settings.stripApiKeys) listOf("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN") else emptyList(),
+        val command = shell.purgeByPrefix(
+            buildList {
+                if (settings.stripInheritedClaudeMarkers) add("CLAUDE")
+                if (settings.stripApiKeys) add("ANTHROPIC_")
+            },
         ) + shell.composeCommand(
             mapOf("CLAUDE_CODE_SESSION_NAME" to name),
             settings.launchCommand,
@@ -91,7 +95,6 @@ class DiagnosticsAction : AnAction() {
         val endpoint = project?.getService(McpServerService::class.java)?.endpoint() ?: "не запущен"
         val text = buildString {
             append("MCP: $endpoint<br/>")
-            append("режим роли: ${settings.roleDelivery}<br/>")
             append("команда запуска: ${settings.launchCommand}<br/>")
             append("реестр сессий: ${SessionRegistry.directory()}<br/>")
             append("живых сессий: ${SessionRegistry.all().size}<br/>")
@@ -105,11 +108,12 @@ class DiagnosticsAction : AnAction() {
 class InstallSkillAction : AnAction() {
     override fun actionPerformed(event: AnActionEvent) {
         val project = event.getData(CommonDataKeys.PROJECT)
-        val changed = SkillInstaller.installIfChanged()
+        val skill = SkillInstaller.installIfChanged()
+        val roles = RoleInstaller.installIfChanged()
         notify(
             project,
-            if (changed) "Скилл обновлён: ${SkillInstaller.skillDirectory()}"
-            else "Скилл уже актуален: ${SkillInstaller.skillDirectory()}",
+            "Скилл: ${if (skill) "обновлён" else "актуален"} (${SkillInstaller.skillDirectory()})<br/>" +
+                "Роли: переписано $roles (${RoleInstaller.agentsDirectory()})",
         )
     }
 }

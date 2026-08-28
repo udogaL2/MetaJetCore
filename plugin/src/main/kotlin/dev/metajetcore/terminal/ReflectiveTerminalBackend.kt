@@ -157,6 +157,32 @@ private class GenerationBackend(
         return false
     }
 
+    /**
+     * Снимок экрана вкладки через TerminalTextBuffer из JediTerm.
+     *
+     * Путь: widget.getTerminalTextBuffer() -> getScreenLines(). Оба метода живут в JediTerm
+     * и переживали все переделки терминала IDE, так что это самая устойчивая точка чтения.
+     */
+    override fun readScreen(handle: TabHandle): String? {
+        val widget = handle.widget ?: return null
+        return try {
+            val buffer = widget.javaClass.methods
+                .firstOrNull { it.name == "getTerminalTextBuffer" && it.parameterCount == 0 }
+                ?.invoke(widget) ?: return null
+
+            sequenceOf("getScreenLines", "getScreenText", "getText")
+                .mapNotNull { name ->
+                    buffer.javaClass.methods
+                        .firstOrNull { it.name == name && it.parameterCount == 0 }
+                        ?.invoke(buffer) as? String
+                }
+                .firstOrNull()
+        } catch (e: Throwable) {
+            log.warn("MetaJetCore: cannot read terminal screen", e)
+            null
+        }
+    }
+
     override fun closeTab(handle: TabHandle): Boolean {
         val widget = handle.widget ?: return false
         for (name in listOf("close", "dispose", "closeTab")) {

@@ -49,6 +49,15 @@ interface TerminalBackend {
 
     fun sendLine(handle: TabHandle, text: String): Boolean
 
+    /**
+     * Текст, который сейчас на экране вкладки.
+     *
+     * Нужен для разбора ситуаций «агент запустился, но не отвечает»: без этого видно только,
+     * что процесс жив, а что он спрашивает — нет. Оркестратору тоже полезно: если агент
+     * упёрся в интерактивный вопрос, единственный способ узнать какой — прочитать экран.
+     */
+    fun readScreen(handle: TabHandle): String?
+
     fun closeTab(handle: TabHandle): Boolean
 
     fun focusTab(handle: TabHandle): Boolean
@@ -67,6 +76,7 @@ object UnavailableTerminalBackend : TerminalBackend {
     override fun openTab(project: Project, request: OpenTabRequest): TabHandle? = null
     override fun isReady(handle: TabHandle): Boolean = false
     override fun sendLine(handle: TabHandle, text: String): Boolean = false
+    override fun readScreen(handle: TabHandle): String? = null
     override fun closeTab(handle: TabHandle): Boolean = false
     override fun focusTab(handle: TabHandle): Boolean = false
 }

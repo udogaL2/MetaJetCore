@@ -7,14 +7,14 @@ import com.intellij.openapi.project.Project
 import dev.metajetcore.registry.SessionRecord
 import dev.metajetcore.registry.SessionRegistry
 import dev.metajetcore.roles.Role
-import dev.metajetcore.roles.Roles
+import dev.metajetcore.roles.RoleInstaller
 import dev.metajetcore.settings.MjcSettings
-import dev.metajetcore.settings.RoleDelivery
 import dev.metajetcore.shell.ShellDialect
 import dev.metajetcore.terminal.OpenTabRequest
 import dev.metajetcore.terminal.TabHandle
 import dev.metajetcore.terminal.TerminalBackends
 import dev.metajetcore.terminal.TerminalShell
+import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.util.concurrent.ConcurrentHashMap
@@ -32,7 +32,11 @@ data class AgentInfo(
 
 /** Результат спавна: либо агент поднят, либо команда, которую надо выполнить руками. */
 sealed interface SpawnResult {
-    data class Started(val agent: AgentInfo) : SpawnResult
+    /**
+     * @param pendingBriefing текст, который оркестратор обязан отправить агенту через
+     *   SendMessage. Плагин его не печатает: см. комментарий в [AgentManager.spawn].
+     */
+    data class Started(val agent: AgentInfo, val pendingBriefing: String) : SpawnResult
 
     /** Терминал недоступен или сессия не поднялась. Оркестратор попросит разработчика. */
     data class Manual(val command: String, val reason: String) : SpawnResult
@@ -116,9 +120,16 @@ class AgentManager(private val project: Project) {
             tabs[actualName] = handle
         }
 
-        val briefing = buildBriefing(role, task)
-        sendOnEdt(handle, briefing)
-
+        // Задачу в терминал НЕ печатаем.
+        //
+        // Проверено живым прогоном: печать текста в поднявшийся TUI Claude Code даёт две
+        // проблемы. Во-первых, кодировка — виджет пишет в pty в кодировке JVM (в песочнице
+        // это была windows-1251), и кириллица приезжала кракозябрами. Во-вторых, executeCommand
+        // рассчитан на шелл, а не на TUI: текст оседал в поле ввода неотправленным.
+        //
+        // Правильный канал — межсессионный обмен: он UTF-8-безопасен, и именно им оркестратор
+        // общается с агентом дальше. Поэтому плагин печатает только команду запуска (чистый
+        // ASCII), а задачу отправляет оркестратор через SendMessage.
         val info = AgentInfo(
             name = actualName,
             role = role,
@@ -129,7 +140,7 @@ class AgentManager(private val project: Project) {
             tabId = handle.id,
         )
         spawned[actualName] = info
-        return SpawnResult.Started(info)
+        return SpawnResult.Started(info, pendingBriefing = buildBriefing(role, task))
     }
 
     // ------------------------------------------------------------- lifecycle
@@ -162,6 +173,15 @@ class AgentManager(private val project: Project) {
         val handle = tabs[name] ?: return false
         return sendOnEdt(handle, text)
     }
+
+    /** Что сейчас на экране вкладки агента. Для разбора «запустился, но молчит». */
+    fun readScreen(name: String): String? {
+        val handle = tabs[name] ?: return null
+        return runOnEdt { TerminalBackends.resolve().readScreen(handle) }
+    }
+
+    /** Имена вкладок, которые ведёт плагин, — включая те, где спавн не доехал. */
+    fun knownTabs(): Set<String> = tabs.keys.toSet()
 
     fun focus(name: String): Boolean {
         val handle = tabs[name] ?: return false
@@ -205,6 +225,8 @@ class AgentManager(private val project: Project) {
         return "$base-${System.currentTimeMillis() % 10_000}"
     }
 
+    fun dialectForDiagnostics(): ShellDialect = dialect()
+
     private fun dialect(): ShellDialect {
         val configured = settings.shellDialect.lowercase()
         return when (configured) {
@@ -234,30 +256,44 @@ class AgentManager(private val project: Project) {
         env["CLAUDE_CODE_AGENT"] = role.id
         env.putAll(settings.extraEnv())
 
-        val flags = when (settings.roleDelivery) {
-            RoleDelivery.INLINE -> {
-                val json = Roles.agentsJson(role, model)
-                " --agents ${shell.quoteArgument(json)} --agent ${role.id}"
-            }
-            RoleDelivery.FLAG -> " --agent ${role.id}"
-            RoleDelivery.MESSAGE -> ""
-        }
+        // Роль — одним флагом из файла, который плагин ставит в ~/.claude/agents/ сам.
+        // Инлайновый JSON в командной строке был выброшен: под PowerShell он не передаётся
+        // вовсе, а кириллицу в промптах портит кодировка терминала (docs/ARCHITECTURE.md §2.6).
+        val roleFlag = " --agent ${RoleInstaller.agentName(role)}"
 
-        val unset = if (settings.stripApiKeys) {
-            shell.unsetPrefix(listOf("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"))
+        // Без этого агент стартует в manual mode и встанет на первом запросе прав в вкладке,
+        // которую никто не смотрит. Значение — чистый ASCII, кавычек не требует.
+        val modeFlag = settings.permissionMode
+            .trim()
+            .takeIf { it.isNotEmpty() && it.all { ch -> ch.isLetter() } }
+            ?.let { " --permission-mode $it" }
+            .orEmpty()
+
+        val flags = roleFlag + modeFlag
+
+        // Вычистка окружения по ПРЕФИКСУ, а не по списку имён: список устаревает молча,
+        // стоит Claude Code завести новую переменную. Подробности — в ShellDialect.purgeByPrefix.
+        val prefixes = buildList {
+            if (settings.stripInheritedClaudeMarkers) add("CLAUDE")
+            if (settings.stripApiKeys) add("ANTHROPIC_")
+        }
+        val unset = if (shell.supportsPrefixPurge) {
+            shell.purgeByPrefix(prefixes)
         } else {
-            ""
+            // cmd.exe перечислить окружение одной строкой не умеет — только поимённо.
+            shell.unsetNames(
+                buildList {
+                    if (settings.stripApiKeys) addAll(listOf("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"))
+                    if (settings.stripInheritedClaudeMarkers) addAll(INHERITED_CLAUDE_MARKERS)
+                },
+            )
         }
 
         return unset + shell.composeCommand(env, settings.launchCommand + flags)
     }
 
-    private fun buildBriefing(role: Role, task: String): String =
-        if (settings.roleDelivery == RoleDelivery.MESSAGE) {
-            Roles.roleAsMessage(role) + "\n\n---\n\nЗадача: " + task
-        } else {
-            task
-        }
+    /** Брифинг — это просто задача: роль агент уже получил флагом при запуске. */
+    private fun buildBriefing(role: Role, task: String): String = task
 
     /** Ждём, пока во вкладке поднимется шелл: до этого печатать бессмысленно. */
     private fun awaitTabReady(handle: TabHandle): Boolean {
@@ -322,6 +358,35 @@ class AgentManager(private val project: Project) {
     }
 
     private companion object {
+        /**
+         * Поимённый список маркеров — резервный путь ТОЛЬКО для cmd.exe, который не умеет
+         * перечислить окружение одной строкой. Во всех остальных шеллах вычистка идёт по
+         * префиксу, и список знать не требуется.
+         *
+         * Они наследуются по всей цепочке процессов. Если IDE запущена из терминала, который
+         * сам живёт внутри сессии Claude Code, маркеры доезжают до спавненного агента, и он
+         * ведёт себя как вложенный дочерний процесс: не сохраняет транскрипт и НЕ РЕГИСТРИРУЕТСЯ
+         * в ~/.claude/sessions. Снаружи это выглядит как «агент запустился, но его нет в
+         * ListAgents» — проверено живым прогоном, агент показывал
+         * «Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker».
+         *
+         * Опаснее всех три последних: сокет и токен — это инбокс РОДИТЕЛЬСКОЙ сессии, и агент
+         * принял бы его за свой, сломав межсессионный обмен непредсказуемым образом.
+         */
+        val INHERITED_CLAUDE_MARKERS = listOf(
+            "CLAUDECODE",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "CLAUDE_CODE_EXECPATH",
+            "CLAUDE_JOB_DIR",
+            "CLAUDE_PID",
+            "CLAUDE_AGENTS_SELECT",
+            "CLAUDE_EFFORT",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+        )
+
         const val POLL_INTERVAL_MS = 250L
         const val EXIT_TIMEOUT_MS = 15_000L
         const val TAB_READY_TIMEOUT_MS = 20_000L

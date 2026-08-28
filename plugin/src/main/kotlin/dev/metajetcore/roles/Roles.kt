@@ -1,15 +1,11 @@
 package dev.metajetcore.roles
 
-import dev.metajetcore.util.Json
-
 /**
- * Встроенные определения ролей.
+ * Встроенные определения ролей: системный промпт и список инструментов.
  *
- * Передаются агенту флагом `--agents '<json>'` в момент запуска, поэтому целевой проект
- * не обязан содержать ничего в `.claude/agents/` (docs/ARCHITECTURE.md §12.1.1).
- *
- * Промпты держим компактными: JSON уезжает в командную строку терминала. За один спавн
- * передаётся ровно одна роль, так что реальный размер — порядка килобайта.
+ * Текст отсюда [RoleInstaller] раскладывает файлами в ~/.claude/agents/, а агент получает
+ * роль флагом `--agent mjc-<role>`. Через командную строку текст НЕ передаётся: см.
+ * docs/ARCHITECTURE.md §2.6 о том, почему инлайновый JSON пришлось выбросить.
  */
 enum class Role(
     val id: String,
@@ -157,20 +153,4 @@ reset_agent, и только тогда контекст сбрасываетс�
 
     fun toolsFor(role: Role): List<String> = tools.getValue(role)
 
-    /**
-     * JSON для флага `--agents`. Передаём ровно одну роль — ту, что запускаем: так строка
-     * остаётся около килобайта и её не страшно печатать в терминал.
-     */
-    fun agentsJson(role: Role, model: String): String = Json.obj(
-        role.id to Json.obj(
-            "description" to Json.of(descriptions.getValue(role)),
-            "prompt" to Json.of(promptFor(role)),
-            "tools" to Json.arr(toolsFor(role).map { Json.of(it) }),
-            "model" to Json.of(model),
-        ),
-    ).render()
-
-    /** Текст для деградированного режима `message`, когда флаги до claude не доходят. */
-    fun roleAsMessage(role: Role): String =
-        "Это твоя роль на всю сессию, следуй ей до конца сессии.\n\n" + promptFor(role)
 }

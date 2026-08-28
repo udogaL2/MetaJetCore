@@ -61,7 +61,11 @@ class MjcSettingsTest {
         // Вычистка ключей включена по умолчанию: иначе агент молча уезжает
         // с подписки на API-биллинг.
         assertTrue(settings.stripApiKeys)
-        assertEquals(RoleDelivery.INLINE, settings.roleDelivery)
+        // Наследуемые маркеры Claude Code тоже вычищаются по умолчанию: иначе агент
+        // считает себя вложенным процессом и не регистрируется в реестре сессий.
+        assertTrue(settings.stripInheritedClaudeMarkers)
+        // Режим прав задан: без него агент стартует в manual mode.
+        assertEquals("auto", settings.permissionMode)
         assertEquals("claude", settings.launchCommand)
         // Ожидание должно быть заметно меньше таймаута MCP-вызова на стороне оркестратора.
         assertTrue(settings.readyTimeoutSeconds <= 60)

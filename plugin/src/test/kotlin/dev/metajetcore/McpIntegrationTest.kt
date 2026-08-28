@@ -5,7 +5,6 @@ import dev.metajetcore.agents.AgentManager
 import dev.metajetcore.mcp.McpTools
 import dev.metajetcore.roles.Role
 import dev.metajetcore.settings.MjcSettings
-import dev.metajetcore.settings.RoleDelivery
 import dev.metajetcore.util.Json
 
 /**
@@ -24,7 +23,6 @@ class McpIntegrationTest : BasePlatformTestCase() {
         super.setUp()
         settings = MjcSettings.getInstance()
         settings.launchCommand = "claude"
-        settings.roleDelivery = RoleDelivery.INLINE
         settings.stripApiKeys = true
         settings.shellDialect = "posix"
         settings.namePrefix = "mjc"
@@ -33,40 +31,45 @@ class McpIntegrationTest : BasePlatformTestCase() {
         tools = McpTools(project)
     }
 
-    fun testInlineCommandCarriesEverything() {
+    fun testCommandCarriesEverything() {
         val line = manager.buildCommandLine(Role.IMPLEMENTER, "mjc-impl-be", "opus")
 
-        assertTrue(line, line.contains("unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN"))
+        // Вычистка идёт по префиксу, поэтому в строке не имена, а перечисление окружения.
+        assertTrue(line, line.contains("unset \$(env |"))
+        assertTrue(line, line.contains("CLAUDE|ANTHROPIC_"))
         assertTrue(line, line.contains("CLAUDE_CODE_SESSION_NAME='mjc-impl-be'"))
         assertTrue(line, line.contains("ANTHROPIC_MODEL='opus'"))
-        assertTrue(line, line.contains("--agent implementer"))
-        assertTrue(line, line.contains("--agents '"))
-
-        // Роль обязана уехать валидным JSON, иначе агент стартует без неё.
-        val json = line.substringAfter("--agents '").substringBefore("' --agent")
-        val parsed = Json.parseOrNull(json.replace("""'\''""", "'"))
-        assertNotNull("JSON ролей в командной строке невалиден", parsed)
-        assertNotNull(parsed!!["implementer"])
-    }
-
-    fun testFlagModeOmitsInlineDefinitions() {
-        settings.roleDelivery = RoleDelivery.FLAG
-        val line = manager.buildCommandLine(Role.RESEARCHER, "mjc-rsrch", "sonnet")
+        // Роль — одним флагом из файла в пользовательском скоупе.
+        assertTrue(line, line.contains("--agent mjc-implementer"))
+        // Инлайнового JSON в строке быть не должно: он ломался под PowerShell и портился
+        // кодировкой терминала. См. docs/ARCHITECTURE.md §2.6.
         assertFalse(line, line.contains("--agents"))
-        assertTrue(line, line.contains("--agent researcher"))
+        // Режим прав обязателен: без него агент встанет в manual mode в вкладке,
+        // которую никто не читает.
+        assertTrue(line, line.contains("--permission-mode auto"))
+
+        // Ключевой инвариант: вся набираемая строка — ASCII. Всё остальное портит
+        // кодировка терминала IDE.
+        val nonAscii = line.filter { it.code >= 128 }
+        assertTrue("в командной строке не-ASCII: '$nonAscii'", nonAscii.isEmpty())
     }
 
-    fun testMessageModePassesNoFlags() {
-        settings.roleDelivery = RoleDelivery.MESSAGE
-        val line = manager.buildCommandLine(Role.REVIEWER, "mjc-rev-sec", "sonnet")
-        assertFalse(line, line.contains("--agent"))
-        assertTrue(line, line.contains("CLAUDE_CODE_SESSION_NAME='mjc-rev-sec'"))
-    }
-
-    fun testStripApiKeysCanBeDisabled() {
+    fun testPurgeCanBeDisabled() {
         settings.stripApiKeys = false
+        settings.stripInheritedClaudeMarkers = false
         val line = manager.buildCommandLine(Role.IMPLEMENTER, "mjc-impl", "opus")
-        assertFalse(line, line.contains("unset ANTHROPIC_API_KEY"))
+        // Исчезнуть должна именно вычистка. ANTHROPIC_MODEL мы задаём сами — он остаётся.
+        assertFalse(line, line.contains("unset "))
+        assertTrue(line, line.contains("ANTHROPIC_MODEL="))
+    }
+
+    fun testPurgeCoversBothFamiliesByPrefix() {
+        settings.stripApiKeys = true
+        settings.stripInheritedClaudeMarkers = true
+        val line = manager.buildCommandLine(Role.IMPLEMENTER, "mjc-impl", "opus")
+        // Префиксы, а не имена: список имён устаревал бы с каждой новой версией Claude Code.
+        assertTrue(line, line.contains("CLAUDE|ANTHROPIC_"))
+        assertFalse("вычистка не должна перечислять имена", line.contains("unset ANTHROPIC_API_KEY"))
     }
 
     fun testCustomLaunchCommandIsUsedVerbatim() {
@@ -88,8 +91,8 @@ class McpIntegrationTest : BasePlatformTestCase() {
         val names = definitions.mapNotNull { it["name"]?.asString }.toSet()
         assertEquals(
             setOf(
-                "spawn_agent", "list_agents", "brief_agent",
-                "reset_agent", "close_agent", "focus_agent", "diagnostics",
+                "spawn_agent", "list_agents", "brief_agent", "reset_agent",
+                "close_agent", "focus_agent", "read_tab", "diagnostics",
             ),
             names,
         )
@@ -155,7 +158,7 @@ class McpIntegrationTest : BasePlatformTestCase() {
         assertEquals(false, result["isError"]?.asBoolean)
         val text = result["content"]!!.asList!!.first()["text"]!!.asString!!
         assertTrue(text, text.contains("backend:"))
-        assertTrue(text, text.contains("режим роли:"))
+        assertTrue(text, text.contains("диалект шелла:"))
     }
 
     fun testListAgentsAnswersWhenNothingRuns() {

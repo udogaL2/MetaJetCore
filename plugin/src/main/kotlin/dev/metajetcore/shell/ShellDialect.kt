@@ -34,7 +34,7 @@ enum class ShellDialect {
         }
 
         POWERSHELL -> {
-            val prefix = env.entries.joinToString("; ") { (k, v) -> "\$env:$k=${quotePowerShell(v)}" }
+            val prefix = env.entries.joinToString("; ") { (k, v) -> "\$env:$k=${quotePsLiteral(v)}" }
             if (prefix.isEmpty()) command else "$prefix; $command"
         }
 
@@ -44,8 +44,44 @@ enum class ShellDialect {
         }
     }
 
-    /** Как убрать переменную, если она унаследована и мешает (например, ANTHROPIC_API_KEY). */
-    fun unsetPrefix(names: List<String>): String = when {
+    /**
+     * Стереть ВСЕ унаследованные переменные с указанными префиксами.
+     *
+     * Именно префиксами, а не списком имён. Список — это денилист: он устаревает молча, стоит
+     * Claude Code завести новую переменную, и она снова просочится в агента. А просачивается
+     * там существенное: `CLAUDE_CODE_MESSAGING_TOKEN` и `..._SOCKET` — это инбокс РОДИТЕЛЬСКОЙ
+     * сессии, `CLAUDE_CODE_CHILD_SESSION` заставляет агента считать себя вложенным процессом
+     * и не регистрироваться в реестре, `ANTHROPIC_API_KEY` молча уводит с подписки на
+     * API-биллинг.
+     *
+     * cmd.exe перечислять окружение одной строкой не умеет, поэтому для него остаётся
+     * поимённый список — см. [unsetNames].
+     */
+    fun purgeByPrefix(prefixes: List<String>): String = when {
+        prefixes.isEmpty() -> ""
+
+        this == POSIX -> {
+            val pattern = prefixes.joinToString("|")
+            // unset без аргументов — no-op, поэтому пустой env безопасен.
+            "unset \$(env | grep -oE '^($pattern)[A-Za-z0-9_]*' | tr '\\n' ' '); "
+        }
+
+        this == FISH -> {
+            val pattern = prefixes.joinToString("|")
+            "for v in (env | grep -oE '^($pattern)[A-Za-z0-9_]*'); set -e \$v; end; "
+        }
+
+        this == POWERSHELL -> {
+            val filter = prefixes.joinToString(" -or ") { "\$_.Name -like '$it*'" }
+            "Get-ChildItem Env: | Where-Object { $filter } | " +
+                "ForEach-Object { Remove-Item \"Env:\$(\$_.Name)\" -ErrorAction SilentlyContinue }; "
+        }
+
+        else -> ""
+    }
+
+    /** Поимённая вычистка. Нужна только там, где перечислить окружение нельзя. */
+    fun unsetNames(names: List<String>): String = when {
         names.isEmpty() -> ""
         this == POSIX -> "unset ${names.joinToString(" ")}; "
         this == FISH -> names.joinToString("") { "set -e $it; " }
@@ -55,18 +91,22 @@ enum class ShellDialect {
         else -> ""
     }
 
-    /** Экранирование одного аргумента (например, JSON для --agents). */
-    fun quoteArgument(value: String): String = when (this) {
-        POSIX, FISH -> quotePosix(value)
-        POWERSHELL -> quotePowerShell(value)
-        CMD -> "\"" + value.replace("\"", "\\\"") + "\""
-    }
+    /** Умеет ли шелл стереть переменные по префиксу одной строкой. */
+    val supportsPrefixPurge: Boolean get() = this != CMD
 
     private fun quotePosix(value: String): String =
         "'" + value.replace("'", "'\\''") + "'"
 
-    private fun quotePowerShell(value: String): String =
+    /**
+     * Значение для присваивания `$env:X=...` внутри самого PowerShell.
+     *
+     * Здесь второго слоя разбора нет — это не аргумент нативной программы, — поэтому
+     * достаточно удвоить одинарные кавычки. Экранировать двойные тут нельзя: они уехали бы
+     * в значение переменной как есть.
+     */
+    private fun quotePsLiteral(value: String): String =
         "'" + value.replace("'", "''") + "'"
+
 
     companion object {
         /**

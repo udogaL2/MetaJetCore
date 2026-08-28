@@ -1,6 +1,3 @@
 {
-  "crossSessionInbound": "accept",
-  "permissions": {
-    "defaultMode": "auto"
-  }
+  "crossSessionInbound": "accept"
 }

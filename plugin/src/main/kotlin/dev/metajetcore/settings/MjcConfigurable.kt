@@ -25,20 +25,30 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
                             "пробрасывала \"\$@\" — проверить: scripts/check-wrapper.sh",
                     )
             }
-            row("Передача роли:") {
-                comboBox(RoleDelivery.entries)
-                    .bindItem(settings::roleDelivery.toNullableProperty())
-                    .comment(
-                        "Inline — определения из плагина, проект не трогаем (рекомендуется). " +
-                            "Flag — из .claude/agents/ проекта. " +
-                            "Message — роль текстом, ограничение tools не работает.",
-                    )
-            }
             row("Префикс имён:") {
                 textField()
                     .bindText(settings::namePrefix)
                     .columns(10)
                     .comment("Пусто — вывести из имени проекта. Имена сессий глобальны на машину.")
+            }
+            row("Режим прав агентов:") {
+                comboBox(listOf("auto", "acceptEdits", "plan", "bypassPermissions", ""))
+                    .bindItem(settings::permissionMode.toNullableProperty())
+                    .comment(
+                        "Уезжает флагом --permission-mode. Задавать обязательно: агент по " +
+                            "умолчанию стартует в manual mode и встанет на первом запросе прав " +
+                            "в вкладке, которую никто не читает. Настройкой проекта это не " +
+                            "лечится — repo-level defaultMode Claude Code игнорирует.",
+                    )
+            }
+            row {
+                checkBox("Вычищать наследуемые маркеры Claude Code")
+                    .bindSelected(settings::stripInheritedClaudeMarkers)
+                    .comment(
+                        "CLAUDE_CODE_CHILD_SESSION и соседние. Без вычистки агент, запущенный " +
+                            "из IDE, которая сама стартовала внутри сессии Claude Code, считает " +
+                            "себя вложенным процессом и не регистрируется в ~/.claude/sessions.",
+                    )
             }
             row("Диалект шелла:") {
                 comboBox(listOf("auto", "posix", "powershell", "cmd", "fish"))

@@ -17,22 +17,15 @@ class ShellDialectTest {
     }
 
     @Test
-    fun `posix quoting survives embedded single quotes`() {
-        // Через это проходит JSON ролей, в котором кавычки встречаются постоянно.
-        val quoted = ShellDialect.POSIX.quoteArgument("""{"a":"it's"}""")
-        assertTrue(quoted, quoted.startsWith("'") && quoted.endsWith("'"))
-        assertTrue(quoted, quoted.contains("""'\''"""))
-    }
-
-    @Test
     fun `powershell uses env prefix syntax`() {
         val line = ShellDialect.POWERSHELL.composeCommand(linkedMapOf("A" to "1"), "claude")
         assertEquals("\$env:A='1'; claude", line)
     }
 
     @Test
-    fun `powershell doubles single quotes`() {
-        assertEquals("'it''s'", ShellDialect.POWERSHELL.quoteArgument("it's"))
+    fun `powershell doubles single quotes in env values`() {
+        val line = ShellDialect.POWERSHELL.composeCommand(linkedMapOf("A" to "it's"), "claude")
+        assertEquals("\$env:A='it''s'; claude", line)
     }
 
     @Test
@@ -55,18 +48,42 @@ class ShellDialectTest {
     }
 
     @Test
-    fun `unset prefix is empty when nothing to unset`() {
+    fun `purge is empty when there is nothing to purge`() {
         for (dialect in ShellDialect.entries) {
-            assertEquals(dialect.name, "", dialect.unsetPrefix(emptyList()))
+            assertEquals(dialect.name, "", dialect.purgeByPrefix(emptyList()))
+            assertEquals(dialect.name, "", dialect.unsetNames(emptyList()))
         }
     }
 
     @Test
-    fun `unset prefix names every variable`() {
-        val prefix = ShellDialect.POSIX.unsetPrefix(listOf("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"))
-        assertTrue(prefix, prefix.contains("ANTHROPIC_API_KEY"))
-        assertTrue(prefix, prefix.contains("ANTHROPIC_AUTH_TOKEN"))
-        assertTrue(prefix, prefix.trimEnd().endsWith(";"))
+    fun `posix purge covers unknown variables by prefix`() {
+        // Смысл префиксной вычистки: она снимает и те переменные, о которых мы не знаем.
+        // Поимённый список устаревал бы с каждой новой версией Claude Code.
+        val purge = ShellDialect.POSIX.purgeByPrefix(listOf("CLAUDE", "ANTHROPIC_"))
+        assertTrue(purge, purge.startsWith("unset "))
+        assertTrue(purge, purge.contains("CLAUDE|ANTHROPIC_"))
+        assertTrue(purge, purge.contains("env |"))
+        assertTrue(purge, purge.trimEnd().endsWith(";"))
+    }
+
+    @Test
+    fun `powershell purge enumerates the environment`() {
+        val purge = ShellDialect.POWERSHELL.purgeByPrefix(listOf("CLAUDE", "ANTHROPIC_"))
+        assertTrue(purge, purge.contains("Get-ChildItem Env:"))
+        assertTrue(purge, purge.contains("'CLAUDE*'"))
+        assertTrue(purge, purge.contains("'ANTHROPIC_*'"))
+        assertTrue(purge, purge.contains("SilentlyContinue"))
+    }
+
+    @Test
+    fun `cmd cannot purge by prefix and says so`() {
+        // cmd.exe не умеет перечислить окружение одной строкой — для него остаётся список имён.
+        assertFalse(ShellDialect.CMD.supportsPrefixPurge)
+        for (dialect in listOf(ShellDialect.POSIX, ShellDialect.POWERSHELL, ShellDialect.FISH)) {
+            assertTrue(dialect.name, dialect.supportsPrefixPurge)
+        }
+        val named = ShellDialect.CMD.unsetNames(listOf("ANTHROPIC_API_KEY"))
+        assertTrue(named, named.contains("ANTHROPIC_API_KEY"))
     }
 
     @Test
@@ -79,29 +96,4 @@ class ShellDialectTest {
         assertEquals(ShellDialect.CMD, ShellDialect.detect("C:\\Windows\\system32\\cmd.exe"))
     }
 
-    @Test
-    fun `composed command never leaks unquoted json`() {
-        // Регрессия: неэкранированный JSON ломает командную строку и агент стартует без роли.
-        // JSON намеренно содержит и одинарные кавычки, и экранированные двойные, и перевод
-        // строки — всё, чем богаты промпты ролей.
-        val json = """{"implementer":{"prompt":"it's \"quoted\"\nsecond line","tools":["Read"]}}"""
-        val quoted = ShellDialect.POSIX.quoteArgument(json)
-        val line = ShellDialect.POSIX.composeCommand(
-            linkedMapOf("CLAUDE_CODE_SESSION_NAME" to "mjc-impl"),
-            "claude --agents $quoted --agent implementer",
-        )
-
-        assertTrue(line, line.contains("--agents '"))
-        assertTrue(line, line.endsWith("--agent implementer"))
-
-        // Главное: аргумент должен доехать до claude ровно тем, чем был. Моделируем то,
-        // что сделает posix-шелл с '...'-строкой: снимает внешние кавычки и склеивает
-        // куски, разделённые последовательностью '\''.
-        val unquoted = quoted.removeSurrounding("'").replace("""'\''""", "'")
-        assertEquals(json, unquoted)
-
-        // Голых одинарных кавычек внутри остаться не должно: каждая обязана быть
-        // представлена последовательностью '\'' — иначе строка порвётся на первой же.
-        assertFalse(quoted, quoted.removeSurrounding("'").replace("""'\''""", "").contains("'"))
-    }
 }

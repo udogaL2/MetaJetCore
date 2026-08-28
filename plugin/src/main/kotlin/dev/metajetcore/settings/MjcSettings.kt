@@ -6,17 +6,6 @@ import com.intellij.openapi.components.State
 import com.intellij.openapi.components.Storage
 import com.intellij.util.xmlb.XmlSerializerUtil
 
-enum class RoleDelivery {
-    /** `--agents '<json>' --agent <role>` — определения из плагина, проект не трогаем. */
-    INLINE,
-
-    /** `--agent <role>` — определения из .claude/agents/ проекта. */
-    FLAG,
-
-    /** Без флагов, роль уезжает текстом первым сообщением. Ограничение tools не работает. */
-    MESSAGE,
-}
-
 @State(
     name = "MetaJetCoreSettings",
     storages = [Storage("metajetcore.xml")],
@@ -31,7 +20,16 @@ class MjcSettings : PersistentStateComponent<MjcSettings> {
      */
     var launchCommand: String = "claude"
 
-    var roleDelivery: RoleDelivery = RoleDelivery.INLINE
+
+    /**
+     * Режим прав для спавненных агентов, уезжает флагом `--permission-mode`.
+     *
+     * Задавать обязательно: агент по умолчанию стартует в manual mode и встанет на первом же
+     * запросе прав, а его вкладку никто не читает. Настройкой проекта это не решается —
+     * `permissions.defaultMode: auto` из repo-level настроек Claude Code игнорирует, о чём
+     * прямо сообщает: «repo-level settings cannot grant it». Пусто — флаг не добавлять.
+     */
+    var permissionMode: String = "auto"
 
     /** Пусто — вывести из имени проекта. Имена сессий глобальны на машину. */
     var namePrefix: String = ""
@@ -50,6 +48,15 @@ class MjcSettings : PersistentStateComponent<MjcSettings> {
      * Иначе сессия молча уезжает с подписки на API-биллинг.
      */
     var stripApiKeys: Boolean = true
+
+    /**
+     * Вычищать наследуемые маркеры Claude Code (CLAUDE_CODE_CHILD_SESSION и прочие).
+     *
+     * Без этого агент, запущенный из IDE, которая сама стартовала внутри сессии Claude Code,
+     * считает себя вложенным процессом и не регистрируется в ~/.claude/sessions.
+     * Выключать только при отладке.
+     */
+    var stripInheritedClaudeMarkers: Boolean = true
 
     /** auto | posix | powershell | cmd | fish */
     var shellDialect: String = "auto"

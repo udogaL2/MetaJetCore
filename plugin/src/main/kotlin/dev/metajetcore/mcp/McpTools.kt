@@ -5,6 +5,7 @@ import dev.metajetcore.agents.AgentInfo
 import dev.metajetcore.agents.AgentManager
 import dev.metajetcore.agents.SpawnResult
 import dev.metajetcore.roles.Role
+import dev.metajetcore.roles.RoleInstaller
 import dev.metajetcore.terminal.TerminalBackends
 import dev.metajetcore.util.Json
 
@@ -23,9 +24,10 @@ class McpTools(private val project: Project) {
         tool(
             name = "spawn_agent",
             description =
-                "Открыть новую вкладку с полноценной сессией Claude Code в этой IDE и выдать ей " +
-                    "задачу. Это НЕ субагент: отдельный процесс, свой контекст, свой адрес для " +
-                    "SendMessage. Возвращает имя, по которому агенту можно писать.",
+                "Открыть новую вкладку с полноценной сессией Claude Code в этой IDE. Это НЕ " +
+                    "субагент: отдельный процесс, свой контекст, свой адрес для SendMessage. " +
+                    "Задачу инструмент НЕ передаёт — после успешного спавна отправь её сам " +
+                    "через SendMessage на возвращённое имя.",
             properties = Json.obj(
                 "role" to schema(
                     "string",
@@ -87,6 +89,14 @@ class McpTools(private val project: Project) {
             required = listOf("name"),
         ),
         tool(
+            name = "read_tab",
+            description = "Прочитать, что сейчас на экране вкладки агента. Применять, когда " +
+                "агент запустился, но не отвечает: скорее всего он упёрся в интерактивный " +
+                "вопрос, и увидеть его можно только так.",
+            properties = Json.obj("name" to schema("string", "Имя агента")),
+            required = listOf("name"),
+        ),
+        tool(
             name = "diagnostics",
             description = "Состояние плагина: какое терминальное API разрешилось, " +
                 "режим передачи роли, команда запуска. Для разбора проблем.",
@@ -108,6 +118,7 @@ class McpTools(private val project: Project) {
                 "reset_agent" -> resetAgent(args)
                 "close_agent" -> closeAgent(args)
                 "focus_agent" -> focusAgent(args)
+                "read_tab" -> readTab(args)
                 "diagnostics" -> diagnostics()
                 else -> textResult("неизвестный инструмент: $name", isError = true)
             }
@@ -145,7 +156,12 @@ class McpTools(private val project: Project) {
                 buildString {
                     append("Агент запущен.\n")
                     append(describe(result.agent))
-                    append("\nПиши ему через SendMessage по имени '${result.agent.name}'.")
+                    append("\n\nСЛЕДУЮЩИЙ ШАГ, ОБЯЗАТЕЛЬНО: отправь агенту задачу через ")
+                    append("SendMessage(to=\"${result.agent.name}\"). ")
+                    append("Плагин задачу не передаёт намеренно: печать текста в терминал ")
+                    append("портит не-ASCII и не нажимает Enter в TUI. ")
+                    append("Отправь ему это:\n\n")
+                    append(result.pendingBriefing)
                 },
             )
 
@@ -193,6 +209,19 @@ class McpTools(private val project: Project) {
         else textResult("вкладка '$name' плагину неизвестна", isError = true)
     }
 
+    private fun readTab(args: Json): Json {
+        val name = args["name"]?.asString ?: return textResult("ошибка: нет name", isError = true)
+        val screen = manager.readScreen(name)
+        return when {
+            screen == null && !manager.knownTabs().contains(name) -> textResult(
+                "вкладка '$name' плагину неизвестна; известны: ${manager.knownTabs().joinToString()}",
+                isError = true,
+            )
+            screen == null -> textResult("экран вкладки '$name' прочитать не удалось", isError = true)
+            else -> textResult("экран вкладки '$name':\n\n$screen")
+        }
+    }
+
     private fun diagnostics(): Json {
         val settings = dev.metajetcore.settings.MjcSettings.getInstance()
         return textResult(
@@ -200,7 +229,9 @@ class McpTools(private val project: Project) {
                 append("проект: ${project.name}\n")
                 append("префикс имён: ${manager.prefix()}\n")
                 append("команда запуска: ${settings.launchCommand}\n")
-                append("режим роли: ${settings.roleDelivery}\n")
+                append("роли в: ${RoleInstaller.agentsDirectory()}\n")
+                append("режим прав агентов: ${settings.permissionMode.ifBlank { "(не задан)" }}\n")
+                append("диалект шелла: ${manager.dialectForDiagnostics()}\n")
                 append("вычищать API-ключи: ${settings.stripApiKeys}\n")
                 append(TerminalBackends.describe())
                 append("\nпример команды спавна:\n")
