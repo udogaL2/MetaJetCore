@@ -94,11 +94,13 @@ class MjcSettings : PersistentStateComponent<MjcSettings> {
                 .flatMap { chunk -> Regex("[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])").findAll(chunk).map { it.value } }
                 .filter { it.isNotBlank() }
             val initials = words.mapNotNull { it.firstOrNull() }.joinToString("").lowercase()
-            return when {
+            val candidate = when {
                 initials.length >= 2 -> initials.take(5)
-                projectName.isNotBlank() -> projectName.lowercase().filter { it.isLetterOrDigit() }.take(4)
-                else -> "mjc"
+                else -> projectName.lowercase().filter { it.isLetterOrDigit() }.take(4)
             }
+            // Имя целиком из пунктуации ("!!!") давало пустой префикс, а он делает имена
+            // сессий неразличимыми между проектами — они глобальны на машину.
+            return candidate.ifBlank { "mjc" }
         }
     }
 }

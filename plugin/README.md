@@ -63,6 +63,33 @@ Gradle wrapper в репозитории отсутствует — сгенер
 Если что-то всё-таки сломается — `Tools | MetaJetCore | Diagnostics` покажет, какое поколение
 терминального API разрешилось и разрешилось ли вообще.
 
+## Terminal API: что там на самом деле
+
+Проверено `javap` по jar-ам двух платформ — IDEA Community 2025.1 (то, против чего собираем)
+и PyCharm Community 2026.1 (рабочая IDE). **Наборы совпадают полностью:**
+
+| Класс / метод | 2025.1 | 2026.1 |
+|---|---|---|
+| `TerminalToolWindowManager.getInstance(Project)` | есть | есть |
+| `createLocalShellWidget(String, String[, boolean[, boolean]])` → `ShellTerminalWidget` | есть, 3 арности | есть, 3 арности |
+| `createShellWidget(String, String, boolean, boolean)` → `TerminalWidget` | есть | есть |
+| `ShellTerminalWidget.executeCommand(String)` | есть | есть |
+| `ShellTerminalWidget.getProcessTtyConnector()` | есть | есть |
+| `TerminalOptionsProvider.getInstance().getShellPath()` | есть | есть |
+| `TerminalToolWindowTabsManager` | **нет** | **нет** |
+
+Отсюда два следствия:
+
+1. **`createLocalShellWidget` предпочтительнее `createShellWidget`.** Первый возвращает
+   конкретный `ShellTerminalWidget` с `executeCommand(String)`; второй — интерфейс
+   `TerminalWidget`, в который печатать нечем.
+2. **Ветка G3 (`TerminalToolWindowTabsManager`) — задел на будущее.** Этот класс описан в
+   SDK-документации, но в поставке его нет ни в 2025.1, ни в 2026.1. Ветка просто не
+   срабатывает и стоит первой на случай, когда он появится.
+
+Практический вывод: прогон в песочнице 2025.1 проверяет **ровно тот же путь кода**, который
+выполнится в рабочей IDE 2026.1.
+
 ## Статус
 
 Код написан, но **ни разу не собирался и не запускался** — в среде, где он писался, не было

@@ -108,6 +108,26 @@ private class GenerationBackend(
     }
 
     /**
+     * Шелл считается поднявшимся, когда у виджета появился TtyConnector: до этого писать
+     * некуда и строка теряется без следа.
+     */
+    override fun isReady(handle: TabHandle): Boolean {
+        val widget = handle.widget ?: return false
+        // getTtyConnector наследуется от JediTermWidget, getProcessTtyConnector объявлен
+        // прямо в ShellTerminalWidget — проверено по jar платформы. Хватит любого.
+        for (name in listOf("getTtyConnector", "getProcessTtyConnector")) {
+            try {
+                val method = widget.javaClass.methods
+                    .firstOrNull { it.name == name && it.parameterCount == 0 } ?: continue
+                if (method.invoke(widget) != null) return true
+            } catch (_: Throwable) {
+                // Часть реализаций бросает, пока сессия не стартовала — это и есть «не готов».
+            }
+        }
+        return false
+    }
+
+    /**
      * Печать строки в терминал.
      *
      * Порядок попыток отражает историю API. Ищем метод по имени и арности, а не по точной
@@ -188,38 +208,53 @@ private class GenerationBackend(
         null
     }
 
-    /** 2023.2+: createShellWidget(cwd, tabName, requestFocus, deferSessionStart) */
-    private fun openViaShellWidget(manager: Any, request: OpenTabRequest): Any? = try {
-        val method = manager.javaClass.methods.firstOrNull {
-            it.name == "createShellWidget" && it.parameterCount == 4
+    /**
+     * 2023.2+: TerminalToolWindowManager.
+     *
+     * Порядок не случаен. `createLocalShellWidget` возвращает конкретный
+     * `ShellTerminalWidget`, у которого есть `executeCommand(String)` — проверено по jar
+     * платформы 2025.1. `createShellWidget` отдаёт интерфейс `TerminalWidget`, и печатать
+     * в него нечем. Поэтому конкретный класс пробуем первым, а интерфейс оставляем в запас
+     * на случай, если в будущей версии уберут именно `createLocalShellWidget`.
+     */
+    private fun openViaShellWidget(manager: Any, request: OpenTabRequest): Any? {
+        val cwd = request.workingDirectory.toString()
+
+        openViaLocalShellWidget(manager, request)?.let { return it }
+
+        return try {
+            manager.javaClass.methods
+                .firstOrNull { it.name == "createShellWidget" && it.parameterCount == 4 }
+                ?.invoke(manager, cwd, request.tabName, request.requestFocus, false)
+        } catch (e: Throwable) {
+            log.warn("MetaJetCore: G2 createShellWidget fallback failed", e)
+            null
         }
-        method?.invoke(
-            manager,
-            request.workingDirectory.toString(),
-            request.tabName,
-            request.requestFocus,
-            false,
-        )
-    } catch (e: Throwable) {
-        log.warn("MetaJetCore: G2 createShellWidget path failed", e)
-        null
     }
 
-    /** legacy: createLocalShellWidget(cwd, tabName) */
-    private fun openViaLocalShellWidget(manager: Any, request: OpenTabRequest): Any? = try {
-        val method = manager.javaClass.methods.firstOrNull {
-            it.name == "createLocalShellWidget" && it.parameterCount >= 2
+    /**
+     * createLocalShellWidget — существует в трёх арностях, от самой полной к самой старой.
+     * Возвращает ShellTerminalWidget, у которого есть executeCommand(String).
+     */
+    private fun openViaLocalShellWidget(manager: Any, request: OpenTabRequest): Any? {
+        val cwd = request.workingDirectory.toString()
+        val candidates = manager.javaClass.methods
+            .filter { it.name == "createLocalShellWidget" && it.parameterCount in 2..4 }
+            .sortedByDescending { it.parameterCount }
+
+        for (method in candidates) {
+            try {
+                val result = when (method.parameterCount) {
+                    4 -> method.invoke(manager, cwd, request.tabName, request.requestFocus, false)
+                    3 -> method.invoke(manager, cwd, request.tabName, request.requestFocus)
+                    else -> method.invoke(manager, cwd, request.tabName)
+                }
+                if (result != null) return result
+            } catch (e: Throwable) {
+                log.warn("MetaJetCore: createLocalShellWidget/${method.parameterCount} failed", e)
+            }
         }
-        when (method?.parameterCount) {
-            2 -> method.invoke(manager, request.workingDirectory.toString(), request.tabName)
-            3 -> method.invoke(
-                manager, request.workingDirectory.toString(), request.tabName, request.requestFocus,
-            )
-            else -> null
-        }
-    } catch (e: Throwable) {
-        log.warn("MetaJetCore: G1 createLocalShellWidget path failed", e)
-        null
+        return null
     }
 
     // --- вспомогательное ---

@@ -82,12 +82,26 @@ class ShellDialectTest {
     @Test
     fun `composed command never leaks unquoted json`() {
         // Регрессия: неэкранированный JSON ломает командную строку и агент стартует без роли.
-        val json = """{"implementer":{"prompt":"a b \"c\"","tools":["Read"]}}"""
+        // JSON намеренно содержит и одинарные кавычки, и экранированные двойные, и перевод
+        // строки — всё, чем богаты промпты ролей.
+        val json = """{"implementer":{"prompt":"it's \"quoted\"\nsecond line","tools":["Read"]}}"""
+        val quoted = ShellDialect.POSIX.quoteArgument(json)
         val line = ShellDialect.POSIX.composeCommand(
             linkedMapOf("CLAUDE_CODE_SESSION_NAME" to "mjc-impl"),
-            "claude --agents ${ShellDialect.POSIX.quoteArgument(json)} --agent implementer",
+            "claude --agents $quoted --agent implementer",
         )
+
         assertTrue(line, line.contains("--agents '"))
-        assertFalse("двойные кавычки не должны требовать экранирования в posix-строке", line.contains("\\\""))
+        assertTrue(line, line.endsWith("--agent implementer"))
+
+        // Главное: аргумент должен доехать до claude ровно тем, чем был. Моделируем то,
+        // что сделает posix-шелл с '...'-строкой: снимает внешние кавычки и склеивает
+        // куски, разделённые последовательностью '\''.
+        val unquoted = quoted.removeSurrounding("'").replace("""'\''""", "'")
+        assertEquals(json, unquoted)
+
+        // Голых одинарных кавычек внутри остаться не должно: каждая обязана быть
+        // представлена последовательностью '\'' — иначе строка порвётся на первой же.
+        assertFalse(quoted, quoted.removeSurrounding("'").replace("""'\''""", "").contains("'"))
     }
 }

@@ -14,6 +14,7 @@ import dev.metajetcore.shell.ShellDialect
 import dev.metajetcore.terminal.OpenTabRequest
 import dev.metajetcore.terminal.TabHandle
 import dev.metajetcore.terminal.TerminalBackends
+import dev.metajetcore.terminal.TerminalShell
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.util.concurrent.ConcurrentHashMap
@@ -92,6 +93,10 @@ class AgentManager(private val project: Project) {
         ) ?: return SpawnResult.Manual(commandLine, "не удалось открыть вкладку терминала")
 
         tabs[name] = handle
+
+        if (!awaitTabReady(handle)) {
+            return SpawnResult.Manual(commandLine, "шелл во вкладке не поднялся за ${TAB_READY_TIMEOUT_MS / 1000} c")
+        }
 
         if (!sendOnEdt(handle, commandLine)) {
             return SpawnResult.Manual(commandLine, "вкладка открыта, но команду напечатать не удалось")
@@ -207,7 +212,9 @@ class AgentManager(private val project: Project) {
             "powershell" -> ShellDialect.POWERSHELL
             "cmd" -> ShellDialect.CMD
             "fish" -> ShellDialect.FISH
-            else -> ShellDialect.detect(System.getenv("SHELL") ?: System.getenv("ComSpec"))
+            // auto: спрашиваем саму IDE, какой шелл она откроет во вкладке. Переменные
+            // окружения описывают шелл процесса IDE, а это не одно и то же.
+            else -> TerminalShell.detectDialect()
         }
     }
 
@@ -251,6 +258,16 @@ class AgentManager(private val project: Project) {
         } else {
             task
         }
+
+    /** Ждём, пока во вкладке поднимется шелл: до этого печатать бессмысленно. */
+    private fun awaitTabReady(handle: TabHandle): Boolean {
+        val deadline = System.currentTimeMillis() + TAB_READY_TIMEOUT_MS
+        while (System.currentTimeMillis() < deadline) {
+            if (runOnEdt { TerminalBackends.resolve().isReady(handle) }) return true
+            Thread.sleep(POLL_INTERVAL_MS)
+        }
+        return false
+    }
 
     private fun awaitSession(name: String): SessionRecord? {
         val deadline = System.currentTimeMillis() + settings.readyTimeoutSeconds * 1000L
@@ -307,5 +324,6 @@ class AgentManager(private val project: Project) {
     private companion object {
         const val POLL_INTERVAL_MS = 250L
         const val EXIT_TIMEOUT_MS = 15_000L
+        const val TAB_READY_TIMEOUT_MS = 20_000L
     }
 }

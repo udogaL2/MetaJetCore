@@ -38,6 +38,15 @@ interface TerminalBackend {
 
     fun openTab(project: Project, request: OpenTabRequest): TabHandle?
 
+    /**
+     * Поднялся ли шелл во вкладке.
+     *
+     * Между созданием виджета и стартом процесса шелла проходит заметное время, и строка,
+     * напечатанная в этот промежуток, теряется молча. Без этой проверки спавн выглядит как
+     * «вкладка открылась, но ничего не запустилось».
+     */
+    fun isReady(handle: TabHandle): Boolean
+
     fun sendLine(handle: TabHandle, text: String): Boolean
 
     fun closeTab(handle: TabHandle): Boolean
@@ -56,6 +65,7 @@ object UnavailableTerminalBackend : TerminalBackend {
     override val id: String = "unavailable"
     override fun isAvailable(): Boolean = false
     override fun openTab(project: Project, request: OpenTabRequest): TabHandle? = null
+    override fun isReady(handle: TabHandle): Boolean = false
     override fun sendLine(handle: TabHandle, text: String): Boolean = false
     override fun closeTab(handle: TabHandle): Boolean = false
     override fun focusTab(handle: TabHandle): Boolean = false

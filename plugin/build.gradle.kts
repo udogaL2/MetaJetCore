@@ -67,6 +67,70 @@ tasks {
         gradleVersion = "8.10.2"
     }
 
+    /**
+     * Подготовка песочницы перед runIde.
+     *
+     * Свежая песочница встречает модальными диалогами — доверие к проекту, tips of the day,
+     * согласие на сбор статистики. В автоматическом прогоне нажать на них некому, и IDE
+     * зависает на старте, так и не дойдя до project-сервисов и MCP-сервера.
+     */
+    val seedSandbox by registering {
+        val repoRoot = rootProject.projectDir.parentFile
+        val optionsDir = layout.buildDirectory.dir("idea-sandbox").get().asFile
+
+        doLast {
+            val targets = optionsDir.listFiles()
+                ?.filter { it.isDirectory }
+                ?.map { File(it, "config/options") }
+                ?: emptyList()
+
+            for (dir in targets) {
+                dir.mkdirs()
+
+                File(dir, "trusted-paths.xml").writeText(
+                    """
+                    <application>
+                      <component name="Trusted.Paths.Settings">
+                        <option name="TRUSTED_PATHS">
+                          <list>
+                            <option value="${repoRoot.absolutePath.replace('\\', '/')}" />
+                          </list>
+                        </option>
+                      </component>
+                    </application>
+                    """.trimIndent(),
+                )
+
+                File(dir, "ide.general.xml").writeText(
+                    """
+                    <application>
+                      <component name="GeneralSettings">
+                        <option name="showTipsOnStartup" value="false" />
+                        <option name="confirmExit" value="false" />
+                        <option name="reopenLastProject" value="false" />
+                      </component>
+                    </application>
+                    """.trimIndent(),
+                )
+
+                logger.lifecycle("MetaJetCore: seeded sandbox config at $dir")
+            }
+        }
+    }
+
+    runIde {
+        dependsOn(seedSandbox)
+        // Без аргумента песочница открывает welcome-экран, а там нет открытого проекта —
+        // значит не стартуют project-сервисы и MCP-сервер. Открываем корень репозитория.
+        args = listOf(rootProject.projectDir.parentFile.absolutePath)
+        // Статистика и прочие сетевые «первый запуск» диалоги в автопрогоне только мешают.
+        jvmArgumentProviders.add(
+            CommandLineArgumentProvider {
+                listOf("-Didea.is.internal=false", "-Djb.consents.confirmation.enabled=false")
+            },
+        )
+    }
+
     test {
         useJUnit()
         testLogging {
