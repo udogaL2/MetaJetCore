@@ -13,20 +13,12 @@
 # ИСКЛЮЧЕНИЕ — роль. Её задаёт только флаг --agent; env-переменная CLAUDE_CODE_AGENT
 # роль не применяет, проверено (§2.2.1). Поэтому:
 #
-#   MJC_ROLE_DELIVERY=flag     (по умолчанию) — добавляет --agent <role>.
-#                              Работает, если обёртка пробрасывает "$@".
-#                              Проверить: ./scripts/check-wrapper.sh
-#
-#   MJC_ROLE_DELIVERY=message  — флаг не добавляется; роль придётся выдать первой
-#                              строкой сообщения:
-#                                "Прочитай .claude/agents/<role>.md — это твоя роль
-#                                 на всю сессию, следуй ей."
-#                              Список tools при этом НЕ применяется.
+# Роль уезжает флагом --agent mjc-<role>, определение читается из ~/.claude/agents/.
+# Это требует, чтобы обёртка пробрасывала "$@" — проверить: ./scripts/check-wrapper.sh
 
 set -euo pipefail
 
 LAUNCH="${MJC_LAUNCH:-claude}"
-ROLE_DELIVERY="${MJC_ROLE_DELIVERY:-flag}"
 
 role="${1:-}"
 name="${2:-}"
@@ -43,9 +35,12 @@ case "$role" in
     *) echo "unknown role: $role" >&2; exit 2 ;;
 esac
 
-if [[ ! -f ".claude/agents/${role}.md" ]]; then
-    echo "no agent definition: .claude/agents/${role}.md" >&2
-    echo "run from the project root" >&2
+# Определения ролей ставит плагин в пользовательский скоуп; без него их просто нет.
+definition="$HOME/.claude/agents/mjc-${role}.md"
+if [[ ! -f "$definition" ]]; then
+    echo "нет определения роли: $definition" >&2
+    echo "поставьте плагин и запустите IDE — он разложит роли сам," >&2
+    echo "либо в IDE: Tools | MetaJetCore | Reinstall Orchestrator Skill" >&2
     exit 2
 fi
 
@@ -58,17 +53,8 @@ export ANTHROPIC_MODEL="${model:-$default_model}"
 
 printf '\033]0;%s\007' "$name"            # заголовок вкладки терминала
 
-echo "role=$role  name=$name  model=$ANTHROPIC_MODEL  delivery=$ROLE_DELIVERY"
+echo "role=$role  name=$name  model=$ANTHROPIC_MODEL"
 
-if [[ "$ROLE_DELIVERY" == "flag" ]]; then
-    exec $LAUNCH --agent "$role"
-else
-    cat <<MSG
-
-  Режим message: роль флагом не передана. Первой строкой отправь агенту:
-
-      Прочитай .claude/agents/${role}.md — это твоя роль на всю сессию, следуй ей.
-
-MSG
-    exec $LAUNCH
-fi
+# Режим прав обязателен: без него агент стартует в manual mode и встанет на первом
+# запросе прав в вкладке, которую никто не читает.
+exec $LAUNCH --agent "mjc-${role}" --permission-mode auto
