@@ -18,46 +18,98 @@ import dev.metajetcore.shell.ShellDialect
 object TerminalShell {
     private val log = Logger.getInstance(TerminalShell::class.java)
 
-    /** Путь к шеллу из настроек IDE, либо null если API недоступен или путь не задан. */
-    fun configuredShellPath(): String? = try {
-        val cls = Class.forName(
-            "org.jetbrains.plugins.terminal.TerminalOptionsProvider",
-            false,
-            javaClass.classLoader,
-        )
-        val instance = cls.methods
-            .firstOrNull { it.name == "getInstance" && it.parameterCount == 0 }
-            ?.invoke(null)
+    /**
+     * Путь к шеллу из настроек IDE.
+     *
+     * Настройка живёт в двух местах: `TerminalOptionsProvider` (application) и
+     * `TerminalProjectOptionsProvider` (project, там же вычисляется умолчание, когда
+     * пользователь ничего не задавал). Спрашиваем оба — application-уровень у большинства
+     * пуст, и раньше именно поэтому определение проваливалось.
+     */
+    fun configuredShellPath(project: com.intellij.openapi.project.Project? = null): String? {
+        applicationShellPath()?.let { return it }
+        if (project != null) projectShellPath(project)?.let { return it }
+        return null
+    }
+
+    private fun applicationShellPath(): String? = shellPathFrom(
+        className = "org.jetbrains.plugins.terminal.TerminalOptionsProvider",
+        instanceArg = null,
+    )
+
+    private fun projectShellPath(project: com.intellij.openapi.project.Project): String? = shellPathFrom(
+        className = "org.jetbrains.plugins.terminal.TerminalProjectOptionsProvider",
+        instanceArg = project,
+    )
+
+    private fun shellPathFrom(className: String, instanceArg: Any?): String? = try {
+        val cls = Class.forName(className, false, javaClass.classLoader)
+        val getInstance = cls.methods.firstOrNull {
+            it.name == "getInstance" && it.parameterCount == (if (instanceArg == null) 0 else 1)
+        }
+        val instance = if (instanceArg == null) {
+            getInstance?.invoke(null)
+        } else {
+            getInstance?.invoke(null, instanceArg)
+        }
 
         if (instance == null) {
             null
         } else {
-            // getShellPath() в одних версиях, getShellPathOrDefault() в других.
-            val value = sequenceOf("getShellPath", "getShellPathOrDefault", "getDefaultShellPath")
+            // Имя метода менялось между версиями; берём первый подошедший.
+            sequenceOf("getShellPath", "getShellPathOrDefault", "getDefaultShellPath")
                 .mapNotNull { name ->
                     instance.javaClass.methods
                         .firstOrNull { it.name == name && it.parameterCount == 0 }
-                        ?.invoke(instance)
+                        ?.invoke(instance) as? String
                 }
-                .firstOrNull()
-            (value as? String)?.takeIf { it.isNotBlank() }
+                .firstOrNull { it.isNotBlank() }
         }
     } catch (e: Throwable) {
-        log.debug("MetaJetCore: cannot read terminal shell path", e)
+        log.debug("MetaJetCore: cannot read shell path from $className", e)
         null
     }
 
     /**
-     * Диалект для вкладок, которые откроет плагин.
+     * Диалект по ФАКТИЧЕСКОМУ процессу шелла в уже открытой вкладке.
      *
-     * Приоритет: настройка терминала IDE → окружение процесса → умолчание платформы.
+     * Самый надёжный источник: спрашиваем не настройку и не окружение, а сам запущенный
+     * процесс. `ProcessHandle.info().command()` — чистый JDK, от версии IDE не зависит.
+     *
+     * Это исправление реальной поломки: при пустом `getShellPath()` код падал на `ComSpec`,
+     * то есть на шелл ПРОЦЕССА IDE, и во вкладку с PowerShell уезжала команда в синтаксисе
+     * cmd. PowerShell отвечал «Амперсанд (&) не разрешен».
      */
-    fun detectDialect(): ShellDialect {
-        configuredShellPath()?.let { path ->
+    fun detectDialectForTab(shellPid: Long?): ShellDialect? {
+        val pid = shellPid ?: return null
+        val command = try {
+            ProcessHandle.of(pid).orElse(null)?.info()?.command()?.orElse(null)
+        } catch (_: Throwable) {
+            null
+        }
+        if (command.isNullOrBlank()) return null
+        val dialect = ShellDialect.detect(command)
+        log.info("MetaJetCore: процесс шелла во вкладке '$command' -> $dialect")
+        return dialect
+    }
+
+    /**
+     * Диалект, когда фактического процесса ещё нет.
+     *
+     * Порядок: настройка терминала в IDE (application, затем project), переменная SHELL,
+     * умолчание платформы.
+     *
+     * `ComSpec` здесь намеренно НЕ используется: он описывает шелл процесса IDE, а вкладку
+     * IDE открывает своим — на Windows это почти всегда PowerShell, тогда как ComSpec
+     * указывает на cmd. Ровно эта подмена и ломала команду запуска.
+     */
+    fun detectDialect(project: com.intellij.openapi.project.Project? = null): ShellDialect {
+        configuredShellPath(project)?.let { path ->
             val dialect = ShellDialect.detect(path)
-            log.info("MetaJetCore: terminal shell '$path' -> $dialect")
+            log.info("MetaJetCore: shell path из настроек IDE '$path' -> $dialect")
             return dialect
         }
-        return ShellDialect.detect(System.getenv("SHELL") ?: System.getenv("ComSpec"))
+        System.getenv("SHELL")?.takeIf { it.isNotBlank() }?.let { return ShellDialect.detect(it) }
+        return if (ShellDialect.isWindows()) ShellDialect.POWERSHELL else ShellDialect.POSIX
     }
 }

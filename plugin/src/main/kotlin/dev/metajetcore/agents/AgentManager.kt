@@ -59,6 +59,28 @@ class AgentManager(private val project: Project) {
     fun projectDirectory(): Path =
         project.basePath?.let { Paths.get(it) } ?: Paths.get(System.getProperty("user.dir"))
 
+    /**
+     * Куда агенты кладут развёрнутые отчёты: `~/.claude/metajetcore/<проект>/reports`.
+     *
+     * Вне репозитория намеренно: иначе каждый новый проект требовал бы строки в .gitignore,
+     * а следы работы агентов засоряли бы историю.
+     */
+    fun reportsDirectory(): Path {
+        val home = System.getenv("CLAUDE_CONFIG_DIR")?.takeIf { it.isNotBlank() }
+            ?.let { Paths.get(it) }
+            ?: Paths.get(System.getProperty("user.home"), ".claude")
+        val dir = home.resolve("metajetcore").resolve(sanitize(project.name)).resolve("reports")
+        runCatching { Files.createDirectories(dir) }
+            .onFailure { log.warn("MetaJetCore: не удалось создать $dir", it) }
+        return dir
+    }
+
+    private fun sanitize(name: String): String =
+        name.map { if (it.isLetterOrDigit() || it == '-' || it == '_') it else '-' }
+            .joinToString("")
+            .trim('-')
+            .ifBlank { "project" }
+
     fun prefix(): String =
         settings.namePrefix.ifBlank { MjcSettings.derivePrefix(project.name) }
 
@@ -100,13 +122,23 @@ class AgentManager(private val project: Project) {
             return SpawnResult.Manual(commandLine, "шелл во вкладке не поднялся за ${TAB_READY_TIMEOUT_MS / 1000} c")
         }
 
-        if (!sendOnEdt(handle, commandLine)) {
+        // Диалект берём по ФАКТИЧЕСКОМУ процессу шелла в этой вкладке, а не по настройкам.
+        // Настройка терминала у большинства пуста, и любая догадка промахивается: во вкладку
+        // с PowerShell уезжала команда в синтаксисе cmd, и он отвечал «Амперсанд не разрешен».
+        val actual = tabDialect(handle)
+        val commandForTab = if (actual == null) {
+            commandLine
+        } else {
+            buildCommandLine(role, name, model, actual)
+        }
+
+        if (!sendOnEdt(handle, commandForTab)) {
             return SpawnResult.Manual(commandLine, "вкладка открыта, но команду напечатать не удалось")
         }
 
         val record = awaitSession(name)
             ?: return SpawnResult.Manual(
-                commandLine,
+                commandForTab,
                 "сессия не появилась в реестре за ${settings.readyTimeoutSeconds} c; " +
                     "проверь команду запуска в настройках плагина",
             )
@@ -249,7 +281,7 @@ class AgentManager(private val project: Project) {
             "fish" -> ShellDialect.FISH
             // auto: спрашиваем саму IDE, какой шелл она откроет во вкладке. Переменные
             // окружения описывают шелл процесса IDE, а это не одно и то же.
-            else -> TerminalShell.detectDialect()
+            else -> TerminalShell.detectDialect(project)
         }
     }
 
@@ -259,14 +291,28 @@ class AgentManager(private val project: Project) {
      * Всё конфигурируемое едет здесь, а не через API терминала: env инлайном, роль флагом.
      * Единственное исключение — режим MESSAGE, где роль уходит первым сообщением.
      */
-    internal fun buildCommandLine(role: Role, name: String, model: String): String {
-        val shell = dialect()
+    /** Диалект берётся общий; вариант с явным диалектом — ниже. */
+    internal fun buildCommandLine(role: Role, name: String, model: String): String =
+        buildCommandLine(role, name, model, dialect())
+
+    // Явная перегрузка вместо параметра по умолчанию: у internal-функции Kotlin искажает имя
+    // и генерирует синтетику для дефолтов, из-за чего вызывающий код молча остаётся на старой
+    // сигнатуре и падает с NoSuchMethodError.
+    internal fun buildCommandLine(
+        role: Role,
+        name: String,
+        model: String,
+        shell: ShellDialect,
+    ): String {
 
         val env = LinkedHashMap<String, String>()
         env["CLAUDE_CODE_SESSION_NAME"] = name
         env["ANTHROPIC_MODEL"] = model
         // Метка для реестра: роль этим НЕ задаётся (проверено), но удобна для list().
         env["CLAUDE_CODE_AGENT"] = role.id
+        // Каталог для развёрнутых отчётов — ВНЕ репозитория, иначе в каждом проекте
+        // пришлось бы добавлять строку в .gitignore, а артефакты агентов там не нужны.
+        env["MJC_REPORTS_DIR"] = reportsDirectory().toString().replace(BACKSLASH, '/')
         env.putAll(settings.extraEnv())
 
         // Роль — одним флагом из файла, который плагин ставит в ~/.claude/agents/ сам.
@@ -357,6 +403,13 @@ class AgentManager(private val project: Project) {
             }
             handle
         }
+    }
+
+    /** Диалект по процессу шелла вкладки; null — определить не вышло, берём общий. */
+    private fun tabDialect(handle: TabHandle): ShellDialect? {
+        if (settings.shellDialect.lowercase() != "auto") return null
+        val pid = runOnEdt { TabResolver.shellPidOf(handle.widget) }
+        return TerminalShell.detectDialectForTab(pid)
     }
 
     /** Ждём, пока во вкладке поднимется шелл: до этого печатать бессмысленно. */
@@ -450,6 +503,8 @@ class AgentManager(private val project: Project) {
             "CLAUDE_CODE_MESSAGING_SOCKET",
             "CLAUDE_CODE_MESSAGING_TOKEN",
         )
+
+        val BACKSLASH: Char = 92.toChar()
 
         const val POLL_INTERVAL_MS = 250L
         const val EXIT_TIMEOUT_MS = 15_000L

@@ -19,12 +19,32 @@ class RolesTest {
     }
 
     @Test
-    fun readOnlyRolesCannotWrite() {
+    fun readOnlyRolesCannotEditExistingCode() {
+        // Edit нет намеренно: их дело исследовать и вычитывать, менять код — имплементер.
         for (role in listOf(Role.RESEARCHER, Role.REVIEWER)) {
-            val tools = Roles.toolsFor(role)
-            assertFalse("${role.id} умеет Edit", tools.contains("Edit"))
-            assertFalse("${role.id} умеет Write", tools.contains("Write"))
+            assertFalse("${role.id} умеет Edit", Roles.toolsFor(role).contains("Edit"))
         }
+    }
+
+    @Test
+    fun readOnlyRolesCanWriteReports() {
+        // Write выдан осознанно: без него отчёт пишется Bash-heredoc'ом и рвётся на длине
+        // команды — поймано живым прогоном. Гарантии это не рушит, Bash у них всё равно есть.
+        for (role in listOf(Role.RESEARCHER, Role.REVIEWER)) {
+            assertTrue("${role.id} не умеет Write", Roles.toolsFor(role).contains("Write"))
+            assertTrue(
+                "${role.id}: в промпте не сказано, куда класть отчёт",
+                Roles.promptFor(role).contains("MJC_REPORTS_DIR"),
+            )
+        }
+    }
+
+    @Test
+    fun onlyOrchestratorIsTrulyRestricted() {
+        // Единственная роль, у которой запрет на изменение файлов — настоящий.
+        val tools = Roles.toolsFor(Role.ORCHESTRATOR)
+        assertFalse(tools.toString(), tools.contains("Write"))
+        assertFalse(tools.toString(), tools.contains("Edit"))
     }
 
     @Test

@@ -111,6 +111,9 @@ object TabResolver {
      * Путь: виджет -> TtyConnector -> ProcessTtyConnector.getProcess() -> Process.pid().
      * Оба звена стабильны: первое — JediTerm, второе — JDK начиная с девятой версии.
      */
+    /** pid процесса шелла во вкладке. Публичный: по нему определяется диалект. */
+    fun shellPidOf(widget: Any?): Long? = if (widget == null) null else shellPid(widget)
+
     private fun shellPid(widget: Any): Long? {
         for (candidate in listOf(widget) + unwrapped(widget)) {
             for (accessor in listOf("getProcessTtyConnector", "getTtyConnector")) {

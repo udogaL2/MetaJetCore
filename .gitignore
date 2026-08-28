@@ -21,9 +21,6 @@ __pycache__/
 # local — личные переопределения, у каждого свои.
 .claude/settings.local.json
 
-# Рабочие артефакты агентов: чистый шум в истории.
-docs/reports/
-docs/board.md
 
 # --- разное ---
 *.log
