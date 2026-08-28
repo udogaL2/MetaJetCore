@@ -1,0 +1,31 @@
+# --- IDE ---
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# --- Gradle / сборка плагина ---
+plugin/build/
+plugin/.gradle/
+plugin/.intellijPlatform/
+.gradle/
+build/
+
+# --- Python (проект начинался как питоновский шаблон PyCharm) ---
+.venv/
+__pycache__/
+*.py[cod]
+
+# --- Claude Code ---
+# settings.json коммитим: это конфигурация проекта, нужна всем.
+# local — личные переопределения, у каждого свои.
+.claude/settings.local.json
+
+# Рабочие артефакты агентов: чистый шум в истории.
+docs/reports/
+docs/board.md
+
+# --- разное ---
+*.log
+.DS_Store
+Thumbs.db

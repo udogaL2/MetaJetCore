@@ -1,0 +1,66 @@
+<idea-plugin>
+    <id>dev.metajetcore.plugin</id>
+    <name>MetaJetCore</name>
+    <vendor>metajetcore</vendor>
+
+    <description><![CDATA[
+        Метаоркестратор Claude Code внутри JetBrains IDE.
+        <br/><br/>
+        Поднимает локальный MCP-сервер, через который сессия-оркестратор открывает рядом
+        с собой вкладки с другими полноценными сессиями Claude Code — имплементером,
+        ресерчером, ревьювером — и управляет их жизненным циклом.
+        <br/><br/>
+        Субагенты не используются: каждый агент это отдельный процесс со своим контекстом.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <!--
+      Плагин терминала объявлен ОПЦИОНАЛЬНЫМ и без config-file.
+      Код обращается к нему только рефлексией, поэтому:
+        * плагин загрузится даже если терминал отключён или его API переехал;
+        * при недоступности терминала MetaJetCore переходит в ручной режим и отдаёт
+          оркестратору готовую команду, вместо того чтобы упасть.
+    -->
+    <depends optional="true">org.jetbrains.plugins.terminal</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <applicationService serviceImplementation="dev.metajetcore.settings.MjcSettings"/>
+        <projectService serviceImplementation="dev.metajetcore.agents.AgentManager"/>
+        <projectService serviceImplementation="dev.metajetcore.mcp.McpServerService"/>
+
+        <applicationConfigurable
+                parentId="tools"
+                instance="dev.metajetcore.settings.MjcConfigurable"
+                id="dev.metajetcore.settings"
+                displayName="MetaJetCore"/>
+
+        <postStartupActivity implementation="dev.metajetcore.MjcStartupActivity"/>
+
+        <notificationGroup id="MetaJetCore" displayType="BALLOON"/>
+    </extensions>
+
+    <actions>
+        <group id="MetaJetCore.Menu" text="MetaJetCore" popup="true">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+
+            <action id="MetaJetCore.NewOrchestrator"
+                    class="dev.metajetcore.actions.NewOrchestratorAction"
+                    text="New Orchestrator Here"
+                    description="Открыть вкладку с сессией Claude Code под управлением плагина"/>
+            <action id="MetaJetCore.CopyMcpConfig"
+                    class="dev.metajetcore.actions.CopyMcpConfigAction"
+                    text="Copy MCP Config Command"
+                    description="Скопировать команду claude mcp add для подключения оркестратора"/>
+            <separator/>
+            <action id="MetaJetCore.InstallSkill"
+                    class="dev.metajetcore.actions.InstallSkillAction"
+                    text="Reinstall Orchestrator Skill"
+                    description="Переустановить ~/.claude/skills/orchestrate"/>
+            <action id="MetaJetCore.Diagnostics"
+                    class="dev.metajetcore.actions.DiagnosticsAction"
+                    text="Diagnostics"
+                    description="Какое терминальное API разрешилось и что вообще происходит"/>
+        </group>
+    </actions>
+</idea-plugin>
