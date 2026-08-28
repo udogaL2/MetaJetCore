@@ -25,9 +25,12 @@
     <depends optional="true">org.jetbrains.plugins.terminal</depends>
 
     <extensions defaultExtensionNs="com.intellij">
+        <!--
+          AgentManager и McpServerService объявлены аннотацией @Service(PROJECT) и здесь
+          НЕ регистрируются: двойная регистрация — ошибка на современных платформах.
+          MjcSettings аннотации не имеет (только @State), поэтому регистрируется тут.
+        -->
         <applicationService serviceImplementation="dev.metajetcore.settings.MjcSettings"/>
-        <projectService serviceImplementation="dev.metajetcore.agents.AgentManager"/>
-        <projectService serviceImplementation="dev.metajetcore.mcp.McpServerService"/>
 
         <applicationConfigurable
                 parentId="tools"

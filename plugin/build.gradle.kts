@@ -1,3 +1,5 @@
+import org.jetbrains.intellij.platform.gradle.TestFrameworkType
+
 plugins {
     kotlin("jvm") version "2.1.0"
     id("org.jetbrains.intellij.platform") version "2.2.1"
@@ -22,10 +24,16 @@ dependencies {
         // Плагин терминала НАМЕРЕННО не объявлен зависимостью сборки: весь доступ к нему
         // идёт через рефлексию (см. terminal/ReflectiveTerminalBackend.kt). Это то, что
         // позволяет пережить смену экспериментального Terminal API между версиями IDE.
+
+        testFramework(TestFrameworkType.Platform)
     }
+
+    // Тестовые зависимости в поставку плагина не попадают, поэтому конфликтовать
+    // с платформой в рантайме им негде.
+    testImplementation("junit:junit:4.13.2")
 }
 
-// Никаких сторонних библиотек: ни JSON, ни HTTP. Всё либо из JDK, либо своё.
+// В рантайме — никаких сторонних библиотек: ни JSON, ни HTTP. Всё либо из JDK, либо своё.
 // Каждая внешняя зависимость — это ещё один способ конфликтнуть с платформой при апгрейде.
 
 kotlin {
@@ -57,5 +65,13 @@ intellijPlatform {
 tasks {
     wrapper {
         gradleVersion = "8.10.2"
+    }
+
+    test {
+        useJUnit()
+        testLogging {
+            events("passed", "skipped", "failed")
+            showStandardStreams = false
+        }
     }
 }

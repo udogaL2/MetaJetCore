@@ -60,8 +60,10 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
             row("Доп. переменные:") {
                 textArea()
                     .bindText(settings::extraEnvRaw)
-                    .rows(4)
                     .columns(40)
+                    // rows() — расширение, которое живёт не во всех версиях UI DSL;
+                    // applyToComponent есть всегда и делает то же самое.
+                    .applyToComponent { rows = 4 }
                     .comment("По одной на строку, в формате KEY=VALUE.")
             }
         }
