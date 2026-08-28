@@ -52,7 +52,10 @@ class McpServerService(private val project: Project) : Disposable {
         val preferred = settings.mcpPort.takeIf { it != 0 }
             ?: MjcSettings.derivePort(project.basePath.orEmpty())
 
-        if (tryStart(settings, preferred)) return
+        if (tryStart(settings, preferred)) {
+            announceEndpoint()
+            return
+        }
 
         // Порт занят. Поднимаемся на свободном, но молчать нельзя: у разработчика сохранён
         // старый URL, и без предупреждения он увидит лишь «инструментов нет».
@@ -61,6 +64,33 @@ class McpServerService(private val project: Project) : Disposable {
             return
         }
         log.warn("MetaJetCore: не удалось занять ни порт $preferred, ни свободный")
+    }
+
+    /**
+     * Показывает команду подключения при старте.
+     *
+     * Действие в меню для этого же есть, но на него нельзя полагаться: при установке плагина
+     * без перезапуска IDE главное меню не перестраивается, и пункт просто не появляется, хотя
+     * сам плагин уже работает. Уведомление приходит независимо от состояния меню.
+     */
+    private fun announceEndpoint() {
+        val command = claudeMcpAddCommand()
+        NotificationGroupManager.getInstance()
+            .getNotificationGroup("MetaJetCore")
+            .createNotification(
+                "MetaJetCore готов",
+                "Подключите оркестратор одной командой в терминале:<br/><code>$command</code>",
+                NotificationType.INFORMATION,
+            )
+            .also { notification ->
+                notification.addAction(
+                    NotificationAction.createSimple("Скопировать команду") {
+                        CopyPasteManager.getInstance().setContents(StringSelection(command))
+                        notification.expire()
+                    },
+                )
+            }
+            .notify(project)
     }
 
     /** Громкое уведомление: порт занят, URL изменился, конфигурацию надо обновить. */
