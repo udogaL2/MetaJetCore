@@ -12,11 +12,13 @@ import dev.metajetcore.settings.MjcSettings
 import dev.metajetcore.shell.ShellDialect
 import dev.metajetcore.terminal.OpenTabRequest
 import dev.metajetcore.terminal.TabHandle
+import dev.metajetcore.terminal.TabPlacement
 import dev.metajetcore.terminal.TerminalBackends
 import dev.metajetcore.terminal.TerminalShell
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 /** Что плагин знает про запущенного агента. */
@@ -88,13 +90,8 @@ class AgentManager(private val project: Project) {
         }
 
         val parentTab = parentName?.let { tabs[it] }
-        val handle = openTabOnEdt(
-            OpenTabRequest(
-                tabName = name,
-                workingDirectory = projectDirectory(),
-                nearTab = parentTab,
-            ),
-        ) ?: return SpawnResult.Manual(commandLine, "не удалось открыть вкладку терминала")
+        val handle = openTabNearParent(name, parentTab)
+            ?: return SpawnResult.Manual(commandLine, "не удалось открыть вкладку терминала")
 
         tabs[name] = handle
 
@@ -294,6 +291,57 @@ class AgentManager(private val project: Project) {
 
     /** Брифинг — это просто задача: роль агент уже получил флагом при запуске. */
     private fun buildBriefing(role: Role, task: String): String = task
+
+    /**
+     * Открывает вкладку рядом с родительской — там же, где живёт родитель.
+     *
+     * Разработчик держит сессии не в терминальном тулвиндоу, а в editor area, поэтому правило
+     * одно: новая вкладка появляется там, где родительская. Механику см. в [TabPlacement].
+     *
+     * Размещение — best-effort. Не получилось попасть рядом — открываем обычным способом:
+     * вкладка не там, где хотелось, это косметика, а вот отсутствие вкладки — отказ спавна.
+     */
+    private fun openTabNearParent(name: String, parentTab: TabHandle?): TabHandle? {
+        val request = OpenTabRequest(
+            tabName = name,
+            workingDirectory = projectDirectory(),
+            nearTab = parentTab,
+        )
+
+        val parentWidget = parentTab?.widget
+        if (parentWidget == null) return openTabOnEdt(request)
+
+        return runOnEdt<TabHandle?> {
+            val location: TabPlacement.Location = TabPlacement.locate(parentWidget)
+            val backend = TerminalBackends.resolve()
+
+            // Сплит сам создаёт новую сессию, поэтому порядок обратный ожидаемому: не
+            // «создать вкладку и подвинуть», а «сплитнуть от родителя и забрать появившийся
+            // виджет». split() возвращает void, хендл иначе не получить.
+            var handle: TabHandle? = null
+            if (location != TabPlacement.Location.UNKNOWN) {
+                val widget: Any? = TabPlacement.splitFromParent(project, parentWidget, true)
+                if (widget != null) {
+                    handle = TabHandle(
+                        id = UUID.randomUUID().toString(),
+                        displayName = name,
+                        widget = widget,
+                        backendId = backend.id,
+                    )
+                }
+            }
+
+            if (handle == null) handle = backend.openTab(project, request)
+
+            // Родитель живёт в editor area — новую вкладку переносим туда же тем же
+            // действием, которым это делает разработчик руками.
+            val created: Any? = handle?.widget
+            if (created != null && location == TabPlacement.Location.EDITOR) {
+                TabPlacement.moveToEditor(project, created)
+            }
+            handle
+        }
+    }
 
     /** Ждём, пока во вкладке поднимется шелл: до этого печатать бессмысленно. */
     private fun awaitTabReady(handle: TabHandle): Boolean {

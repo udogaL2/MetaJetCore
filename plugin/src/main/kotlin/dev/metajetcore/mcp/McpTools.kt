@@ -234,6 +234,7 @@ class McpTools(private val project: Project) {
                 append("диалект шелла: ${manager.dialectForDiagnostics()}\n")
                 append("вычищать API-ключи: ${settings.stripApiKeys}\n")
                 append(TerminalBackends.describe())
+                append("вкладки под управлением: ${manager.knownTabs().size}\n")
                 append("\nпример команды спавна:\n")
                 append(manager.buildCommandLine(Role.IMPLEMENTER, "${manager.prefix()}-impl", "opus"))
             },
