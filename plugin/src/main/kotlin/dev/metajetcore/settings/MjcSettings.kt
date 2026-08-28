@@ -61,7 +61,17 @@ class MjcSettings : PersistentStateComponent<MjcSettings> {
     /** auto | posix | powershell | cmd | fish */
     var shellDialect: String = "auto"
 
-    /** 0 — выбрать свободный порт автоматически. */
+    /**
+     * Порт MCP-сервера. `0` — вывести из пути проекта (см. `MjcSettings.derivePort`).
+     *
+     * Порт входит в URL, а URL — в сохранённую конфигурацию MCP, поэтому он обязан быть
+     * стабильным между запусками IDE: иначе `claude mcp add` пришлось бы переделывать после
+     * каждого рестарта. Случайный порт здесь недопустим — сохранённый конфиг стал бы
+     * указывать в пустоту, а оркестратор увидел бы просто «инструментов нет».
+     *
+     * Вывод из пути проекта даёт и стабильность, и разные порты для разных проектов, так что
+     * два окна IDE не столкнутся.
+     */
     var mcpPort: Int = 0
 
     /** Слушать только на localhost. Менять незачем; поле оставлено для отладки. */
@@ -92,8 +102,29 @@ class MjcSettings : PersistentStateComponent<MjcSettings> {
     }
 
     companion object {
+        /** Обратный слэш кодом, чтобы не плодить экранирование в исходнике. */
+        private val WINDOWS_SEPARATOR: Char = 92.toChar()
+
         fun getInstance(): MjcSettings =
             ApplicationManager.getApplication().getService(MjcSettings::class.java)
+
+        /**
+         * Порт, выведенный из пути проекта: стабильный между запусками, разный для разных
+         * проектов.
+         *
+         * Диапазон 40000–44999 выбран намеренно: ниже него плотно сидят зарегистрированные
+         * службы, а с 49152 начинается эфемерный диапазон, откуда порты раздаёт сама ОС —
+         * там наш порт рано или поздно займут.
+         */
+        fun derivePort(projectPath: String): Int {
+            var hash = 0
+            // Нормализуем форму записи пути: один и тот же проект не должен получать разные
+            // порты из-за разделителя или регистра.
+            for (ch in projectPath.replace(WINDOWS_SEPARATOR, '/').lowercase()) {
+                hash = hash * 31 + ch.code
+            }
+            return 40_000 + (hash.toLong() and 0x7fffffffL).toInt() % 5_000
+        }
 
         /** MetaJetCore -> mjc, room-plan-aid -> rpa, backend -> be. */
         fun derivePrefix(projectName: String): String {

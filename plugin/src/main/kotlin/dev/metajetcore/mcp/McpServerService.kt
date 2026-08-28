@@ -1,6 +1,10 @@
 package dev.metajetcore.mcp
 
+import com.intellij.notification.NotificationAction
+import com.intellij.notification.NotificationGroupManager
+import com.intellij.notification.NotificationType
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.ide.CopyPasteManager
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
@@ -8,6 +12,7 @@ import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
 import dev.metajetcore.settings.MjcSettings
 import dev.metajetcore.util.Json
+import java.awt.datatransfer.StringSelection
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.nio.charset.StandardCharsets
@@ -40,13 +45,54 @@ class McpServerService(private val project: Project) : Disposable {
     fun start() {
         if (server != null) return
         val settings = MjcSettings.getInstance()
+
+        // Предпочтительный порт: заданный в настройках либо выведенный из пути проекта.
+        // Он обязан быть одним и тем же при каждом запуске — иначе сохранённая конфигурация
+        // MCP начнёт указывать в пустоту.
+        val preferred = settings.mcpPort.takeIf { it != 0 }
+            ?: MjcSettings.derivePort(project.basePath.orEmpty())
+
+        if (tryStart(settings, preferred)) return
+
+        // Порт занят. Поднимаемся на свободном, но молчать нельзя: у разработчика сохранён
+        // старый URL, и без предупреждения он увидит лишь «инструментов нет».
+        if (tryStart(settings, 0)) {
+            warnPortTaken(preferred)
+            return
+        }
+        log.warn("MetaJetCore: не удалось занять ни порт $preferred, ни свободный")
+    }
+
+    /** Громкое уведомление: порт занят, URL изменился, конфигурацию надо обновить. */
+    private fun warnPortTaken(preferred: Int) {
+        val command = claudeMcpAddCommand()
+        NotificationGroupManager.getInstance()
+            .getNotificationGroup("MetaJetCore")
+            .createNotification(
+                "MetaJetCore: порт $preferred занят",
+                "MCP-сервер поднялся на $boundPort. Сохранённая конфигурация указывает на " +
+                    "старый порт — обновите её:<br/><code>$command</code>",
+                NotificationType.WARNING,
+            )
+            .also { notification ->
+                notification.addAction(
+                    NotificationAction.createSimple("Скопировать команду") {
+                        CopyPasteManager.getInstance().setContents(StringSelection(command))
+                        notification.expire()
+                    },
+                )
+            }
+            .notify(project)
+    }
+
+    private fun tryStart(settings: MjcSettings, port: Int): Boolean {
         val address = if (settings.mcpBindLoopbackOnly) {
-            InetSocketAddress(InetAddress.getLoopbackAddress(), settings.mcpPort)
+            InetSocketAddress(InetAddress.getLoopbackAddress(), port)
         } else {
-            InetSocketAddress(settings.mcpPort)
+            InetSocketAddress(port)
         }
 
-        try {
+        return try {
             val httpServer = HttpServer.create(address, BACKLOG)
             httpServer.createContext(PATH) { exchange -> handleSafely(exchange) }
             // Небольшой пул: запросы редкие, но spawn может держать поток десятки секунд.
@@ -57,8 +103,10 @@ class McpServerService(private val project: Project) : Disposable {
             server = httpServer
             boundPort = httpServer.address.port
             log.info("MetaJetCore MCP server on http://127.0.0.1:$boundPort$PATH")
+            true
         } catch (e: Exception) {
-            log.warn("MetaJetCore: cannot start MCP server", e)
+            log.info("MetaJetCore: порт $port занять не удалось (${e.message})")
+            false
         }
     }
 

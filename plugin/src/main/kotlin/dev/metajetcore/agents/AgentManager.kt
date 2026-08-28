@@ -13,6 +13,7 @@ import dev.metajetcore.shell.ShellDialect
 import dev.metajetcore.terminal.OpenTabRequest
 import dev.metajetcore.terminal.TabHandle
 import dev.metajetcore.terminal.TabPlacement
+import dev.metajetcore.terminal.TabResolver
 import dev.metajetcore.terminal.TerminalBackends
 import dev.metajetcore.terminal.TerminalShell
 import java.nio.file.Files
@@ -89,7 +90,7 @@ class AgentManager(private val project: Project) {
             )
         }
 
-        val parentTab = parentName?.let { tabs[it] }
+        val parentTab = parentName?.let { tabFor(it) }
         val handle = openTabNearParent(name, parentTab)
             ?: return SpawnResult.Manual(commandLine, "не удалось открыть вкладку терминала")
 
@@ -144,7 +145,7 @@ class AgentManager(private val project: Project) {
 
     /** Мягкое завершение: /exit, дождаться исчезновения из реестра, закрыть вкладку. */
     fun close(name: String): Boolean {
-        val handle = tabs[name]
+        val handle = tabFor(name)
         if (handle != null) {
             sendOnEdt(handle, "/exit")
             awaitSessionGone(name)
@@ -157,7 +158,7 @@ class AgentManager(private val project: Project) {
 
     /** Сброс контекста между этапами: сессия и вкладка остаются живыми. */
     fun reset(name: String, task: String?): Boolean {
-        val handle = tabs[name] ?: return false
+        val handle = tabFor(name) ?: return false
         if (!sendOnEdt(handle, "/clear")) return false
         if (!task.isNullOrBlank()) {
             val role = spawned[name]?.role
@@ -167,21 +168,36 @@ class AgentManager(private val project: Project) {
     }
 
     fun brief(name: String, text: String): Boolean {
-        val handle = tabs[name] ?: return false
+        val handle = tabFor(name) ?: return false
         return sendOnEdt(handle, text)
     }
 
     /** Что сейчас на экране вкладки агента. Для разбора «запустился, но молчит». */
     fun readScreen(name: String): String? {
-        val handle = tabs[name] ?: return null
+        val handle = tabFor(name) ?: return null
         return runOnEdt { TerminalBackends.resolve().readScreen(handle) }
+    }
+
+    /**
+     * Вкладка по имени сессии: сперва своя карта, затем поиск по дереву процессов.
+     *
+     * Второй путь нужен, чтобы запуск оркестратора оставался ровно `/orchestrate` в любой
+     * вкладке. Плагин знает только те вкладки, которые создал сам; всё остальное он
+     * доопределяет сопоставлением pid — см. [TabResolver]. Найденное запоминаем, чтобы не
+     * искать заново на каждый вызов.
+     */
+    private fun tabFor(name: String): TabHandle? {
+        tabs[name]?.let { return it }
+        val resolved = runOnEdt { TabResolver.findTabForSession(project, name) } ?: return null
+        tabs[name] = resolved
+        return resolved
     }
 
     /** Имена вкладок, которые ведёт плагин, — включая те, где спавн не доехал. */
     fun knownTabs(): Set<String> = tabs.keys.toSet()
 
     fun focus(name: String): Boolean {
-        val handle = tabs[name] ?: return false
+        val handle = tabFor(name) ?: return false
         return runOnEdt { TerminalBackends.resolve().focusTab(handle) }
     }
 
