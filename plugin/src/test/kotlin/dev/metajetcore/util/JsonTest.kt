@@ -46,6 +46,23 @@ class JsonTest {
     }
 
     @Test
+    fun keepsNumbersExactlyAsTheyWereWritten() {
+        // Мы читаем-меняем-пишем ~/.claude.json целиком. Пропусти числа через Double —
+        // и чужие штампы вернутся в файл в другом виде, а длинные ещё и с потерей точности.
+        for (literal in listOf("1787917354462", "9007199254740993", "0.1", "1e3", "-0", "3.0")) {
+            assertEquals(literal, Json.parse(literal).render())
+        }
+        val source = """{"firstStartTime":1787917354462,"ratio":0.30000000000000004}"""
+        assertEquals(source, Json.parse(source).render())
+    }
+
+    @Test
+    fun readsIntegersThroughAccessors() {
+        assertEquals(1787917354462L, Json.parse("1787917354462").asLong)
+        assertEquals(42, Json.parse("42.0").asInt)
+    }
+
+    @Test
     fun parseOrNullSwallowsMalformedInput() {
         assertNull(Json.parseOrNull("{"))
         assertNull(Json.parseOrNull("{\"a\":}"))

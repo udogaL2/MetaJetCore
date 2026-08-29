@@ -62,7 +62,7 @@ class McpServerHttpTest : BasePlatformTestCase() {
         val content = response["result"]?.get("content")?.asList
         assertNotNull(content)
         val text = content!!.first()["text"]?.asString.orEmpty()
-        assertTrue(text, text.contains("backend:"))
+        assertTrue(text, text.contains("terminal API"))
     }
 
     fun testUnknownMethodReturnsJsonRpcError() {
@@ -98,8 +98,15 @@ class McpServerHttpTest : BasePlatformTestCase() {
 
     // ------------------------------------------------------------------ http
 
+    /**
+     * Запрос уходит с постороннего потока, а тест всё это время крутит очередь событий.
+     *
+     * Иначе инструменты, которым нужен EDT (диагностика читает состояние вкладок), встают
+     * намертво: тело платформенного теста само выполняется в EDT и держит его, ожидая ответ.
+     * В проде запрос приходит с потока HTTP-сервера, а EDT свободен — здесь это и изображаем.
+     */
     private fun rpc(body: String): Json {
-        val (status, text) = raw("POST", body)
+        val (status, text) = onPooledThreadPumpingEdt { raw("POST", body) }
         assertEquals("HTTP $status, тело: $text", 200, status)
         return Json.parseOrNull(text) ?: throw AssertionError("невалидный JSON в ответе: $text")
     }

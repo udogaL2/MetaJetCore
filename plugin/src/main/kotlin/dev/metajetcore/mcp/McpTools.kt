@@ -3,17 +3,17 @@ package dev.metajetcore.mcp
 import com.intellij.openapi.project.Project
 import dev.metajetcore.agents.AgentInfo
 import dev.metajetcore.agents.AgentManager
+import dev.metajetcore.agents.BriefResult
 import dev.metajetcore.agents.SpawnResult
 import dev.metajetcore.roles.Role
 import dev.metajetcore.roles.RoleInstaller
-import dev.metajetcore.terminal.TerminalBackends
 import dev.metajetcore.util.Json
 
 /**
  * Определения и диспетчер MCP-инструментов.
  *
  * Контракт инструментов держим стабильным: он — единственное, что видит оркестратор.
- * Всё, что может меняться между версиями IDE, спрятано за AgentManager и TerminalBackends,
+ * Всё, что может меняться между версиями IDE, спрятано за AgentManager и Terminal,
  * так что смена терминального API не должна менять эти сигнатуры.
  */
 class McpTools(private val project: Project) {
@@ -57,23 +57,23 @@ class McpTools(private val project: Project) {
         ),
         tool(
             name = "brief_agent",
-            description = "Отправить текст во вкладку агента как пользовательский ввод. " +
-                "Для обычной переписки используй SendMessage, а не это.",
+            description = "АВАРИЙНЫЙ канал: впечатать текст во вкладку агента как ввод " +
+                "пользователя. Только ASCII — терминал искажает остальное, и такой вызов " +
+                "будет отклонён. Любая содержательная переписка идёт через SendMessage; это нужно " +
+                "только когда агент перестал отвечать на сообщения.",
             properties = Json.obj(
                 "name" to schema("string", "Имя агента"),
-                "text" to schema("string", "Текст"),
+                "text" to schema("string", "Текст, только ASCII"),
             ),
             required = listOf("name", "text"),
         ),
         tool(
             name = "reset_agent",
-            description = "Сбросить контекст агента (/clear) и выдать новую задачу. " +
+            description = "Сбросить контекст агента: печатает /clear в его вкладке. " +
                 "Применять при переходе между этапами, НЕ внутри этапа: сохранённый контекст " +
-                "внутри этапа — главная экономия схемы.",
-            properties = Json.obj(
-                "name" to schema("string", "Имя агента"),
-                "task" to schema("string", "Новый брифинг"),
-            ),
+                "внутри этапа — главная экономия схемы. Новую задачу после сброса отправь " +
+                "сам через SendMessage.",
+            properties = Json.obj("name" to schema("string", "Имя агента")),
             required = listOf("name"),
         ),
         tool(
@@ -98,8 +98,8 @@ class McpTools(private val project: Project) {
         ),
         tool(
             name = "diagnostics",
-            description = "Состояние плагина: какое терминальное API разрешилось, " +
-                "режим передачи роли, команда запуска. Для разбора проблем.",
+            description = "Состояние плагина: нашлось ли терминальное API, команда запуска, " +
+                "что вычищается из окружения. Для разбора проблем.",
             properties = Json.obj(),
             required = emptyList(),
         ),
@@ -158,8 +158,8 @@ class McpTools(private val project: Project) {
                     append(describe(result.agent))
                     append("\n\nСЛЕДУЮЩИЙ ШАГ, ОБЯЗАТЕЛЬНО: отправь агенту задачу через ")
                     append("SendMessage(to=\"${result.agent.name}\"). ")
-                    append("Плагин задачу не передаёт намеренно: печать текста в терминал ")
-                    append("портит не-ASCII и не нажимает Enter в TUI. ")
+                    append("Плагин задачу не передаёт намеренно: терминал искажает не-ASCII ")
+                    append("(проверено живым прогоном), а сообщения доставляются как есть. ")
                     append("Отправь ему это:\n\n")
                     append(result.pendingBriefing)
                 },
@@ -187,14 +187,30 @@ class McpTools(private val project: Project) {
     private fun briefAgent(args: Json): Json {
         val name = args["name"]?.asString ?: return textResult("ошибка: нет name", isError = true)
         val text = args["text"]?.asString ?: return textResult("ошибка: нет text", isError = true)
-        return if (manager.brief(name, text)) textResult("отправлено в '$name'")
-        else textResult("вкладка '$name' плагину неизвестна; используй SendMessage", isError = true)
+        return when (val result = manager.brief(name, text)) {
+            is BriefResult.Sent -> textResult("отправлено в '$name'")
+
+            is BriefResult.NotAscii -> textResult(
+                "не отправлено: терминал искажает не-ASCII, а в тексте есть " +
+                    "'${result.offending}'. Отправь это через SendMessage — там кодировка " +
+                    "не портится. brief_agent годится только для коротких ASCII-команд.",
+                isError = true,
+            )
+
+            is BriefResult.UnknownTab -> textResult(
+                "вкладка '$name' плагину неизвестна; используй SendMessage",
+                isError = true,
+            )
+        }
     }
 
     private fun resetAgent(args: Json): Json {
         val name = args["name"]?.asString ?: return textResult("ошибка: нет name", isError = true)
-        return if (manager.reset(name, args["task"]?.asString)) textResult("контекст '$name' сброшен")
-        else textResult("вкладка '$name' плагину неизвестна", isError = true)
+        return if (manager.reset(name)) {
+            textResult("контекст '$name' сброшен; новую задачу отправь через SendMessage")
+        } else {
+            textResult("вкладка '$name' плагину неизвестна", isError = true)
+        }
     }
 
     private fun closeAgent(args: Json): Json {
@@ -231,12 +247,11 @@ class McpTools(private val project: Project) {
                 append("команда запуска: ${settings.launchCommand}\n")
                 append("роли в: ${RoleInstaller.agentsDirectory()}\n")
                 append("режим прав агентов: ${settings.permissionMode.ifBlank { "(не задан)" }}\n")
-                append("диалект шелла: ${manager.dialectForDiagnostics()}\n")
-                append("вычищать API-ключи: ${settings.stripApiKeys}\n")
-                append(TerminalBackends.describe())
+                append("вычищаем из окружения: ${manager.inheritedMarkers().ifEmpty { listOf("(нечего)") }}\n")
+                append(manager.describeTerminal())
                 append("вкладки под управлением: ${manager.knownTabs().size}\n")
-                append("\nпример команды спавна:\n")
-                append(manager.buildCommandLine(Role.IMPLEMENTER, "${manager.prefix()}-impl", "opus"))
+                append("\nпример команды для ручного режима:\n")
+                append(manager.manualCommand(Role.IMPLEMENTER, "${manager.prefix()}-impl", "opus"))
             },
         )
     }
@@ -245,11 +260,11 @@ class McpTools(private val project: Project) {
 
     private fun describe(agent: AgentInfo): String = buildString {
         append("- ${agent.name}")
-        append("  роль=${agent.role.id}")
+        append("  роль=${agent.role?.id ?: "неизвестна"}")
         if (agent.model.isNotBlank()) append("  модель=${agent.model}")
         agent.status?.let { append("  статус=$it") }
         agent.pid?.let { append("  pid=$it") }
-        if (agent.tabId == null) append("  (вкладка не под управлением плагина)")
+        if (!agent.managed) append("  (вкладка не под управлением плагина)")
     }
 
     private fun tool(

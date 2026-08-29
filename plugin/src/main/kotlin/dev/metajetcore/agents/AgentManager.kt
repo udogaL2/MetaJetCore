@@ -10,28 +10,37 @@ import dev.metajetcore.roles.Role
 import dev.metajetcore.roles.RoleInstaller
 import dev.metajetcore.settings.MjcSettings
 import dev.metajetcore.shell.ShellDialect
-import dev.metajetcore.terminal.OpenTabRequest
 import dev.metajetcore.terminal.TabHandle
 import dev.metajetcore.terminal.TabPlacement
 import dev.metajetcore.terminal.TabResolver
-import dev.metajetcore.terminal.TerminalBackends
-import dev.metajetcore.terminal.TerminalShell
+import dev.metajetcore.terminal.Terminal
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
-import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 /** Что плагин знает про запущенного агента. */
 data class AgentInfo(
     val name: String,
-    val role: Role,
+    /** null — сессию плагин не заводил и роль из реестра не выводится. */
+    val role: Role?,
     val model: String,
     val sessionId: String?,
     val pid: Int?,
     val status: String?,
-    val tabId: String?,
+    val managed: Boolean,
 )
+
+/** Результат печати текста во вкладку. */
+sealed interface BriefResult {
+    data object Sent : BriefResult
+
+    /** Вкладки с таким именем плагин не знает и сопоставить её не смог. */
+    data object UnknownTab : BriefResult
+
+    /** В тексте есть символы, которые терминал исказит. Отправлять такое нельзя. */
+    data class NotAscii(val offending: String) : BriefResult
+}
 
 /** Результат спавна: либо агент поднят, либо команда, которую надо выполнить руками. */
 sealed interface SpawnResult {
@@ -102,43 +111,44 @@ class AgentManager(private val project: Project) {
         }
 
         val model = requestedModel?.takeIf { it.isNotBlank() } ?: role.defaultModel
-        val commandLine = buildCommandLine(role, name, model)
+        val manualCommand = manualCommand(role, name, model)
 
-        val backend = TerminalBackends.resolve()
-        if (!backend.isAvailable()) {
-            return SpawnResult.Manual(
-                command = commandLine,
-                reason = "терминальное API недоступно (backend=${backend.id})",
-            )
+        if (!runOnEdt { Terminal.isAvailable(project) }) {
+            return SpawnResult.Manual(manualCommand, "терминальное API IDE недоступно")
         }
 
         val parentTab = parentName?.let { tabFor(it) }
-        val handle = openTabNearParent(name, parentTab)
-            ?: return SpawnResult.Manual(commandLine, "не удалось открыть вкладку терминала")
+        val handle = runOnEdt {
+            Terminal.openTab(
+                project = project,
+                name = name,
+                workingDirectory = projectDirectory(),
+                env = agentEnv(role, name, model),
+            )?.also { child -> TabPlacement.placeNear(project, parentTab, child) }
+        } ?: return SpawnResult.Manual(manualCommand, "не удалось открыть вкладку терминала")
 
         tabs[name] = handle
 
-        if (!awaitTabReady(handle)) {
-            return SpawnResult.Manual(commandLine, "шелл во вкладке не поднялся за ${TAB_READY_TIMEOUT_MS / 1000} c")
+        if (!awaitTabRunning(handle)) {
+            return SpawnResult.Manual(
+                manualCommand,
+                "шелл во вкладке не поднялся за ${TAB_READY_TIMEOUT_MS / 1000} c",
+            )
         }
 
-        // Диалект берём по ФАКТИЧЕСКОМУ процессу шелла в этой вкладке, а не по настройкам.
-        // Настройка терминала у большинства пуста, и любая догадка промахивается: во вкладку
-        // с PowerShell уезжала команда в синтаксисе cmd, и он отвечал «Амперсанд не разрешен».
-        val actual = tabDialect(handle)
-        val commandForTab = if (actual == null) {
-            commandLine
-        } else {
-            buildCommandLine(role, name, model, actual)
-        }
+        // Диалект — по фактической командной строке шелла этой вкладки. Настройка терминала
+        // у большинства пуста, а окружение процесса IDE описывает не тот шелл, который IDE
+        // открывает во вкладке: раньше на этом в PowerShell уезжал синтаксис cmd.
+        val shell = ShellDialect.detect(runOnEdt { Terminal.process(handle) }?.shellCommand?.firstOrNull())
+        val line = launchLine(role, shell)
 
-        if (!sendOnEdt(handle, commandForTab)) {
-            return SpawnResult.Manual(commandLine, "вкладка открыта, но команду напечатать не удалось")
+        if (!runOnEdt { Terminal.send(handle, line, execute = true) }) {
+            return SpawnResult.Manual(manualCommand, "вкладка открыта, но команду напечатать не удалось")
         }
 
         val record = awaitSession(name)
             ?: return SpawnResult.Manual(
-                commandForTab,
+                manualCommand,
                 "сессия не появилась в реестре за ${settings.readyTimeoutSeconds} c; " +
                     "проверь команду запуска в настройках плагина",
             )
@@ -150,16 +160,12 @@ class AgentManager(private val project: Project) {
             tabs[actualName] = handle
         }
 
-        // Задачу в терминал НЕ печатаем.
+        // Задачу в терминал НЕ печатаем, хотя технически теперь можем.
         //
-        // Проверено живым прогоном: печать текста в поднявшийся TUI Claude Code даёт две
-        // проблемы. Во-первых, кодировка — виджет пишет в pty в кодировке JVM (в песочнице
-        // это была windows-1251), и кириллица приезжала кракозябрами. Во-вторых, executeCommand
-        // рассчитан на шелл, а не на TUI: текст оседал в поле ввода неотправленным.
-        //
-        // Правильный канал — межсессионный обмен: он UTF-8-безопасен, и именно им оркестратор
-        // общается с агентом дальше. Поэтому плагин печатает только команду запуска (чистый
-        // ASCII), а задачу отправляет оркестратор через SendMessage.
+        // Содержательный канал в этой схеме ровно один — межсессионные сообщения: они
+        // адресные, UTF-8-безопасные, доставляются в очередь агента и не зависят от того,
+        // что сейчас на экране вкладки. Печать в TUI осталась только для управляющих команд
+        // (/exit, /clear) и аварийного brief_agent.
         val info = AgentInfo(
             name = actualName,
             role = role,
@@ -167,47 +173,59 @@ class AgentManager(private val project: Project) {
             sessionId = record.sessionId,
             pid = record.pid,
             status = record.status,
-            tabId = handle.id,
+            managed = true,
         )
         spawned[actualName] = info
-        return SpawnResult.Started(info, pendingBriefing = buildBriefing(role, task))
+        return SpawnResult.Started(info, pendingBriefing = task)
     }
 
     // ------------------------------------------------------------- lifecycle
 
     /** Мягкое завершение: /exit, дождаться исчезновения из реестра, закрыть вкладку. */
     fun close(name: String): Boolean {
-        val handle = tabFor(name)
-        if (handle != null) {
-            sendOnEdt(handle, "/exit")
-            awaitSessionGone(name)
-            runOnEdt { TerminalBackends.resolve().closeTab(handle) }
-            tabs.remove(name)
-        }
-        spawned.remove(name)
-        return handle != null
-    }
-
-    /** Сброс контекста между этапами: сессия и вкладка остаются живыми. */
-    fun reset(name: String, task: String?): Boolean {
         val handle = tabFor(name) ?: return false
-        if (!sendOnEdt(handle, "/clear")) return false
-        if (!task.isNullOrBlank()) {
-            val role = spawned[name]?.role
-            sendOnEdt(handle, if (role == null) task else buildBriefing(role, task))
-        }
+        runOnEdt { Terminal.send(handle, "/exit", execute = true) }
+        awaitSessionGone(name)
+        runOnEdt { Terminal.closeTab(project, handle) }
+        tabs.remove(name)
+        spawned.remove(name)
         return true
     }
 
-    fun brief(name: String, text: String): Boolean {
+    /** Сброс контекста между этапами: сессия и вкладка остаются живыми. */
+    fun reset(name: String): Boolean {
         val handle = tabFor(name) ?: return false
-        return sendOnEdt(handle, text)
+        return runOnEdt { Terminal.send(handle, "/clear", execute = true) }
+    }
+
+    /**
+     * Впечатать текст во вкладку как ввод пользователя.
+     *
+     * Аварийный канал: обычная переписка идёт через SendMessage. Текст уходит вставкой
+     * (bracketed paste), поэтому многострочный текст не разъезжается по строкам ввода TUI.
+     *
+     * Только ASCII, и это не перестраховка. Живой прогон на 2026.2: отправили
+     * «Ответь ровно одним словом: ПРОБА-OK», в TUI приехало
+     * «❯ ������ ����� ����� ������: �����-OK», и агент ответил на выдуманный текст.
+     * Терминал пишет в pty не в UTF-8, а Claude Code читает stdin как UTF-8; ответ агента при
+     * этом отрисовался кириллицей верно, то есть портится именно наш ввод. Молча искажать
+     * текст хуже, чем отказаться: искажение выглядит как исполненная команда.
+     */
+    fun brief(name: String, text: String): BriefResult {
+        val nonAscii = text.filter { it.code >= 128 }
+        if (nonAscii.isNotEmpty()) return BriefResult.NotAscii(nonAscii.toSet().joinToString(""))
+        val handle = tabFor(name) ?: return BriefResult.UnknownTab
+        return if (runOnEdt { Terminal.send(handle, text, execute = true, paste = true) }) {
+            BriefResult.Sent
+        } else {
+            BriefResult.UnknownTab
+        }
     }
 
     /** Что сейчас на экране вкладки агента. Для разбора «запустился, но молчит». */
     fun readScreen(name: String): String? {
         val handle = tabFor(name) ?: return null
-        return runOnEdt { TerminalBackends.resolve().readScreen(handle) }
+        return runOnEdt { Terminal.readScreen(handle) }
     }
 
     /**
@@ -228,9 +246,44 @@ class AgentManager(private val project: Project) {
     /** Имена вкладок, которые ведёт плагин, — включая те, где спавн не доехал. */
     fun knownTabs(): Set<String> = tabs.keys.toSet()
 
+    /**
+     * Состояние терминала для диагностики.
+     *
+     * Через runOnEdt, а не напрямую: MCP-запросы приходят на своих потоках, а перечисление
+     * вкладок и выбранного редактора — это чтение UI. Мимо EDT оно в лучшем случае врёт
+     * (`currentWindow` отдавал null, из-за чего диагностика показывала «активной вкладки
+     * нет» при открытом терминале), в худшем — падает на проверке потока.
+     */
+    fun describeTerminal(): String = runOnEdt { Terminal.describe(project) }
+
+    /** Запомнить вкладку, открытую действием плагина (оркестратор). */
+    fun register(name: String, handle: TabHandle) {
+        tabs[name] = handle
+    }
+
+    /**
+     * Запустить обычную сессию Claude Code в уже открытой вкладке — без роли и без флагов.
+     *
+     * Ждать шелл приходится в фоне: действие вызывается из EDT, а между созданием вкладки и
+     * стартом процесса проходит заметное время, и напечатанная в этот промежуток строка
+     * теряется молча. Диалект берём по фактическому процессу этой вкладки — до его старта он
+     * неизвестен, а угадывать нельзя: во вкладку с PowerShell уезжал синтаксис cmd.
+     */
+    fun startPlainSession(handle: TabHandle) {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            if (!awaitTabRunning(handle)) {
+                log.warn("MetaJetCore: шелл во вкладке '${handle.name}' не поднялся, команда не напечатана")
+                return@executeOnPooledThread
+            }
+            val shell = ShellDialect.detect(runOnEdt { Terminal.process(handle) }?.shellCommand?.firstOrNull())
+            val line = shell.unsetNames(inheritedMarkers()) + settings.launchCommand
+            runOnEdt { Terminal.send(handle, line, execute = true) }
+        }
+    }
+
     fun focus(name: String): Boolean {
         val handle = tabFor(name) ?: return false
-        return runOnEdt { TerminalBackends.resolve().focusTab(handle) }
+        return runOnEdt { Terminal.focus(handle) }
     }
 
     /** Живые сессии в директории проекта, обогащённые тем, что плагин знает про вкладки. */
@@ -240,12 +293,12 @@ class AgentManager(private val project: Project) {
             val known = spawned[name]
             AgentInfo(
                 name = name,
-                role = known?.role ?: record.agent?.let { Role.fromId(it) } ?: Role.IMPLEMENTER,
+                role = known?.role ?: record.agent?.let { Role.fromId(it) },
                 model = known?.model ?: "",
                 sessionId = record.sessionId,
                 pid = record.pid,
                 status = record.status,
-                tabId = tabs[name]?.id,
+                managed = tabs.containsKey(name),
             )
         }
 
@@ -270,153 +323,98 @@ class AgentManager(private val project: Project) {
         return "$base-${System.currentTimeMillis() % 10_000}"
     }
 
-    fun dialectForDiagnostics(): ShellDialect = dialect()
-
-    private fun dialect(): ShellDialect {
-        val configured = settings.shellDialect.lowercase()
-        return when (configured) {
-            "posix" -> ShellDialect.POSIX
-            "powershell" -> ShellDialect.POWERSHELL
-            "cmd" -> ShellDialect.CMD
-            "fish" -> ShellDialect.FISH
-            // auto: спрашиваем саму IDE, какой шелл она откроет во вкладке. Переменные
-            // окружения описывают шелл процесса IDE, а это не одно и то же.
-            else -> TerminalShell.detectDialect(project)
-        }
-    }
-
     /**
-     * Сборка одной строки, которую напечатаем в терминал.
-     *
-     * Всё конфигурируемое едет здесь, а не через API терминала: env инлайном, роль флагом.
-     * Единственное исключение — режим MESSAGE, где роль уходит первым сообщением.
+     * Окружение агента. Уезжает через API терминала, а не в командной строке: так не нужны
+     * ни кавычки, ни диалекты шеллов, ни ASCII-ограничение на значения.
      */
-    /** Диалект берётся общий; вариант с явным диалектом — ниже. */
-    internal fun buildCommandLine(role: Role, name: String, model: String): String =
-        buildCommandLine(role, name, model, dialect())
-
-    // Явная перегрузка вместо параметра по умолчанию: у internal-функции Kotlin искажает имя
-    // и генерирует синтетику для дефолтов, из-за чего вызывающий код молча остаётся на старой
-    // сигнатуре и падает с NoSuchMethodError.
-    internal fun buildCommandLine(
-        role: Role,
-        name: String,
-        model: String,
-        shell: ShellDialect,
-    ): String {
-
+    internal fun agentEnv(role: Role, name: String, model: String): Map<String, String> {
         val env = LinkedHashMap<String, String>()
+        // Имя сессии — это адрес для SendMessage. Без него имя выводится платформой из имени
+        // проекта, и агентов одного проекта не различить.
         env["CLAUDE_CODE_SESSION_NAME"] = name
         env["ANTHROPIC_MODEL"] = model
-        // Метка для реестра: роль этим НЕ задаётся (проверено), но удобна для list().
+        // Метка для реестра: роль этим НЕ задаётся (проверено), но по ней list() узнаёт роль
+        // сессий, которые плагин не создавал.
         env["CLAUDE_CODE_AGENT"] = role.id
         // Каталог для развёрнутых отчётов — ВНЕ репозитория, иначе в каждом проекте
         // пришлось бы добавлять строку в .gitignore, а артефакты агентов там не нужны.
         env["MJC_REPORTS_DIR"] = reportsDirectory().toString().replace(BACKSLASH, '/')
         env.putAll(settings.extraEnv())
+        return env
+    }
 
-        // Роль — одним флагом из файла, который плагин ставит в ~/.claude/agents/ сам.
-        // Инлайновый JSON в командной строке был выброшен: под PowerShell он не передаётся
-        // вовсе, а кириллицу в промптах портит кодировка терминала (docs/ARCHITECTURE.md §2.6).
+    /**
+     * Строка, которую плагин печатает во вкладку. Только ASCII и только то, что нельзя
+     * задать окружением.
+     *
+     * Роль — флагом `--agent`: через `CLAUDE_CODE_AGENT` она пишется в реестр, но не
+     * применяется (проверено). Режим прав — флагом `--permission-mode`: `permissions.
+     * defaultMode` из настроек проекта Claude Code игнорирует, а без режима агент встанет на
+     * первом же запросе прав во вкладке, которую никто не читает.
+     */
+    internal fun launchLine(role: Role, shell: ShellDialect): String =
+        shell.unsetNames(inheritedMarkers()) + commandWithFlags(role)
+
+    private fun commandWithFlags(role: Role): String {
         val roleFlag = " --agent ${RoleInstaller.agentName(role)}"
-
-        // Без этого агент стартует в manual mode и встанет на первом запросе прав в вкладке,
-        // которую никто не смотрит. Значение — чистый ASCII, кавычек не требует.
         val modeFlag = settings.permissionMode
             .trim()
             .takeIf { it.isNotEmpty() && it.all { ch -> ch.isLetter() } }
             ?.let { " --permission-mode $it" }
             .orEmpty()
+        return settings.launchCommand + roleFlag + modeFlag
+    }
 
-        val flags = roleFlag + modeFlag
+    /**
+     * Команда для ручного режима: разработчик выполняет её сам, поэтому окружение здесь
+     * приходится вписывать в строку — API вкладки в этом сценарии не участвует.
+     *
+     * Порядок частей важен: сначала снять унаследованное, потом задать своё. Иначе
+     * присваивания достанутся команде `unset`, а до `claude` не доедут.
+     *
+     * Форма присваиваний — POSIX: команда предназначена человеку, а он выполнит её в том
+     * шелле, где ему удобно. Для полностью корректного ручного запуска есть
+     * `scripts/spawn-agent.sh`.
+     */
+    internal fun manualCommand(role: Role, name: String, model: String): String {
+        val shell = ShellDialect.detect(System.getenv("SHELL"))
+        val env = agentEnv(role, name, model)
+            .entries.joinToString(" ") { (key, value) -> "$key='$value'" }
+        return shell.unsetNames(inheritedMarkers()) + env + " " + commandWithFlags(role)
+    }
 
-        // Вычистка окружения по ПРЕФИКСУ, а не по списку имён: список устаревает молча,
-        // стоит Claude Code завести новую переменную. Подробности — в ShellDialect.purgeByPrefix.
+    /**
+     * Маркеры Claude Code, которые реально протекли в процесс IDE, — их и снимаем.
+     *
+     * Список имён здесь не зашит намеренно: он молча устарел бы, стоит Claude Code завести
+     * новую переменную. Мы вместо этого смотрим на окружение самой IDE: агент наследует
+     * именно его, значит вычистить надо ровно то, что там лежит.
+     *
+     * Зачем вообще: если IDE запущена из терминала, который сам живёт внутри сессии Claude
+     * Code, маркеры доезжают до агента по цепочке процессов. `CLAUDE_CODE_CHILD_SESSION`
+     * заставляет агента считать себя вложенным и не регистрироваться в реестре (снаружи это
+     * выглядит как «процесс есть, а в ListAgents его нет»), а `CLAUDE_CODE_MESSAGING_SOCKET`
+     * и `..._TOKEN` — это инбокс РОДИТЕЛЬСКОЙ сессии. `ANTHROPIC_API_KEY` молча уводит с
+     * подписки на API-биллинг.
+     */
+    internal fun inheritedMarkers(): List<String> {
         val prefixes = buildList {
             if (settings.stripInheritedClaudeMarkers) add("CLAUDE")
             if (settings.stripApiKeys) add("ANTHROPIC_")
         }
-        val unset = if (shell.supportsPrefixPurge) {
-            shell.purgeByPrefix(prefixes)
-        } else {
-            // cmd.exe перечислить окружение одной строкой не умеет — только поимённо.
-            shell.unsetNames(
-                buildList {
-                    if (settings.stripApiKeys) addAll(listOf("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"))
-                    if (settings.stripInheritedClaudeMarkers) addAll(INHERITED_CLAUDE_MARKERS)
-                },
-            )
-        }
-
-        return unset + shell.composeCommand(env, settings.launchCommand + flags)
-    }
-
-    /** Брифинг — это просто задача: роль агент уже получил флагом при запуске. */
-    private fun buildBriefing(role: Role, task: String): String = task
-
-    /**
-     * Открывает вкладку рядом с родительской — там же, где живёт родитель.
-     *
-     * Разработчик держит сессии не в терминальном тулвиндоу, а в editor area, поэтому правило
-     * одно: новая вкладка появляется там, где родительская. Механику см. в [TabPlacement].
-     *
-     * Размещение — best-effort. Не получилось попасть рядом — открываем обычным способом:
-     * вкладка не там, где хотелось, это косметика, а вот отсутствие вкладки — отказ спавна.
-     */
-    private fun openTabNearParent(name: String, parentTab: TabHandle?): TabHandle? {
-        val request = OpenTabRequest(
-            tabName = name,
-            workingDirectory = projectDirectory(),
-            nearTab = parentTab,
-        )
-
-        val parentWidget = parentTab?.widget
-        if (parentWidget == null) return openTabOnEdt(request)
-
-        return runOnEdt<TabHandle?> {
-            val location: TabPlacement.Location = TabPlacement.locate(parentWidget)
-            val backend = TerminalBackends.resolve()
-
-            // Сплит сам создаёт новую сессию, поэтому порядок обратный ожидаемому: не
-            // «создать вкладку и подвинуть», а «сплитнуть от родителя и забрать появившийся
-            // виджет». split() возвращает void, хендл иначе не получить.
-            var handle: TabHandle? = null
-            if (location != TabPlacement.Location.UNKNOWN) {
-                val widget: Any? = TabPlacement.splitFromParent(project, parentWidget, true)
-                if (widget != null) {
-                    handle = TabHandle(
-                        id = UUID.randomUUID().toString(),
-                        displayName = name,
-                        widget = widget,
-                        backendId = backend.id,
-                    )
-                }
-            }
-
-            if (handle == null) handle = backend.openTab(project, request)
-
-            // Родитель живёт в editor area — новую вкладку переносим туда же тем же
-            // действием, которым это делает разработчик руками.
-            val created: Any? = handle?.widget
-            if (created != null && location == TabPlacement.Location.EDITOR) {
-                TabPlacement.moveToEditor(project, created)
-            }
-            handle
-        }
-    }
-
-    /** Диалект по процессу шелла вкладки; null — определить не вышло, берём общий. */
-    private fun tabDialect(handle: TabHandle): ShellDialect? {
-        if (settings.shellDialect.lowercase() != "auto") return null
-        val pid = runOnEdt { TabResolver.shellPidOf(handle.widget) }
-        return TerminalShell.detectDialectForTab(pid)
+        if (prefixes.isEmpty()) return emptyList()
+        return System.getenv().keys
+            .filter { key -> prefixes.any { key.startsWith(it) } }
+            // Имя переменной, вставленное в командную строку, обязано быть безобидным.
+            .filter { key -> key.all { it.isLetterOrDigit() || it == '_' } }
+            .sorted()
     }
 
     /** Ждём, пока во вкладке поднимется шелл: до этого печатать бессмысленно. */
-    private fun awaitTabReady(handle: TabHandle): Boolean {
+    private fun awaitTabRunning(handle: TabHandle): Boolean {
         val deadline = System.currentTimeMillis() + TAB_READY_TIMEOUT_MS
         while (System.currentTimeMillis() < deadline) {
-            if (runOnEdt { TerminalBackends.resolve().isReady(handle) }) return true
+            if (runOnEdt { Terminal.isRunning(handle) }) return true
             Thread.sleep(POLL_INTERVAL_MS)
         }
         return false
@@ -440,14 +438,8 @@ class AgentManager(private val project: Project) {
             if (SessionRegistry.findByName(name) == null) return
             Thread.sleep(POLL_INTERVAL_MS)
         }
-        log.warn("MetaJetCore: session '$name' still in registry after /exit")
+        log.warn("MetaJetCore: сессия '$name' осталась в реестре после /exit")
     }
-
-    private fun openTabOnEdt(request: OpenTabRequest): TabHandle? =
-        runOnEdt { TerminalBackends.resolve().openTab(project, request) }
-
-    private fun sendOnEdt(handle: TabHandle, text: String): Boolean =
-        runOnEdt { TerminalBackends.resolve().sendLine(handle, text) }
 
     /**
      * Работа с терминалом обязана идти в EDT, а MCP-запросы приходят на своих потоках.
@@ -467,7 +459,7 @@ class AgentManager(private val project: Project) {
             }
         }
         failure?.let {
-            log.warn("MetaJetCore: EDT operation failed", it)
+            log.warn("MetaJetCore: операция в EDT упала", it)
             throw it
         }
         @Suppress("UNCHECKED_CAST")
@@ -475,39 +467,11 @@ class AgentManager(private val project: Project) {
     }
 
     private companion object {
-        /**
-         * Поимённый список маркеров — резервный путь ТОЛЬКО для cmd.exe, который не умеет
-         * перечислить окружение одной строкой. Во всех остальных шеллах вычистка идёт по
-         * префиксу, и список знать не требуется.
-         *
-         * Они наследуются по всей цепочке процессов. Если IDE запущена из терминала, который
-         * сам живёт внутри сессии Claude Code, маркеры доезжают до спавненного агента, и он
-         * ведёт себя как вложенный дочерний процесс: не сохраняет транскрипт и НЕ РЕГИСТРИРУЕТСЯ
-         * в ~/.claude/sessions. Снаружи это выглядит как «агент запустился, но его нет в
-         * ListAgents» — проверено живым прогоном, агент показывал
-         * «Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker».
-         *
-         * Опаснее всех три последних: сокет и токен — это инбокс РОДИТЕЛЬСКОЙ сессии, и агент
-         * принял бы его за свой, сломав межсессионный обмен непредсказуемым образом.
-         */
-        val INHERITED_CLAUDE_MARKERS = listOf(
-            "CLAUDECODE",
-            "CLAUDE_CODE_CHILD_SESSION",
-            "CLAUDE_CODE_ENTRYPOINT",
-            "CLAUDE_CODE_EXECPATH",
-            "CLAUDE_JOB_DIR",
-            "CLAUDE_PID",
-            "CLAUDE_AGENTS_SELECT",
-            "CLAUDE_EFFORT",
-            "CLAUDE_CODE_SESSION_ID",
-            "CLAUDE_CODE_MESSAGING_SOCKET",
-            "CLAUDE_CODE_MESSAGING_TOKEN",
-        )
-
         val BACKSLASH: Char = 92.toChar()
 
         const val POLL_INTERVAL_MS = 250L
         const val EXIT_TIMEOUT_MS = 15_000L
         const val TAB_READY_TIMEOUT_MS = 20_000L
+
     }
 }

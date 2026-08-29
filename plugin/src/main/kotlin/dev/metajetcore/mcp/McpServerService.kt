@@ -4,6 +4,7 @@ import com.intellij.notification.NotificationAction
 import com.intellij.notification.NotificationGroupManager
 import com.intellij.notification.NotificationType
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.ide.CopyPasteManager
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.Logger
@@ -76,6 +77,10 @@ class McpServerService(private val project: Project) : Disposable {
      * Уведомление остаётся только на случай, когда записать не удалось.
      */
     private fun registerInClaudeConfig() {
+        // В тестах проект — временный каталог, и записывать его в пользовательский
+        // ~/.claude.json незачем: он засоряется мусорными ключами проектов, которых уже нет.
+        if (ApplicationManager.getApplication().isUnitTestMode) return
+
         val url = endpoint() ?: return
         val projectPath = project.basePath ?: return
 

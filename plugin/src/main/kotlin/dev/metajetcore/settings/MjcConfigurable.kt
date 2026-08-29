@@ -21,8 +21,9 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
                     .bindText(settings::launchCommand)
                     .columns(40)
                     .comment(
-                        "Ваша обёртка вокруг claude. Режимы Inline и Flag требуют, чтобы она " +
-                            "пробрасывала \"\$@\" — проверить: scripts/check-wrapper.sh",
+                        "Ваша обёртка вокруг claude. Она обязана пробрасывать \"\$@\": иначе до " +
+                            "агента не доедут --agent и --permission-mode, и он стартует " +
+                            "безролевым в manual mode. Проверить: scripts/check-wrapper.sh",
                     )
             }
             row("Префикс имён:") {
@@ -49,11 +50,6 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
                             "из IDE, которая сама стартовала внутри сессии Claude Code, считает " +
                             "себя вложенным процессом и не регистрируется в ~/.claude/sessions.",
                     )
-            }
-            row("Диалект шелла:") {
-                comboBox(listOf("auto", "posix", "powershell", "cmd", "fish"))
-                    .bindItem(settings::shellDialect.toNullableProperty())
-                    .comment("Как записать переменные окружения в набираемой команде.")
             }
             row("Ожидание готовности, с:") {
                 intTextField(1..600).bindIntText(settings::readyTimeoutSeconds).columns(6)
@@ -82,17 +78,6 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
             row("Порт:") {
                 intTextField(0..65535).bindIntText(settings::mcpPort).columns(6)
                     .comment("0 — выбрать свободный автоматически. Изменение требует перезапуска IDE.")
-            }
-        }
-
-        group("Поведение") {
-            row {
-                checkBox("Сообщать оркестратору о зависшем агенте прямо в его терминал")
-                    .bindSelected(settings::notifyOrchestratorInTerminal)
-                    .comment(
-                        "По умолчанию выключено: каждая такая вставка стоит оркестратору " +
-                            "полного хода с полным контекстом.",
-                    )
             }
         }
     }

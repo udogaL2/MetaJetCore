@@ -19,7 +19,19 @@ enum class Role(
     ;
 
     companion object {
-        fun fromId(id: String): Role? = entries.firstOrNull { it.id.equals(id, ignoreCase = true) }
+        /**
+         * Роль по идентификатору из реестра или из вызова MCP.
+         *
+         * Префикс `mjc-` снимается намеренно. В реестре сессий поле `agent` содержит то, что
+         * реально применилось, а применяется флаг `--agent mjc-researcher`, а не переменная
+         * `CLAUDE_CODE_AGENT=researcher` — проверено живым прогоном на 2.1.251. Без этого
+         * роль сессии, которую плагин не сам заводил (например, после перезапуска IDE),
+         * не определялась вовсе.
+         */
+        fun fromId(id: String): Role? {
+            val bare = id.removePrefix(RoleInstaller.PREFIX)
+            return entries.firstOrNull { it.id.equals(bare, ignoreCase = true) }
+        }
     }
 }
 
@@ -151,13 +163,6 @@ reset_agent, и только тогда контекст сбрасываетс�
         Role.REVIEWER to listOf(
             "Read", "Grep", "Glob", "Write", "Bash", "SendMessage", "ListAgents",
         ),
-    )
-
-    private val descriptions: Map<Role, String> = mapOf(
-        Role.ORCHESTRATOR to "Метаоркестратор: координирует роли, сам код не пишет",
-        Role.IMPLEMENTER to "Пишет код в рамках выданного файлового домена",
-        Role.RESEARCHER to "Исследует кодовую базу и внешние источники, только чтение",
-        Role.REVIEWER to "Вычитывает готовый код через заданную линзу, только чтение",
     )
 
     fun promptFor(role: Role): String = prompts.getValue(role).trim()

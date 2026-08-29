@@ -11,7 +11,18 @@ package dev.metajetcore.util
 sealed interface Json {
     data object Null : Json
     data class Bool(val value: Boolean) : Json
-    data class Num(val value: Double) : Json
+
+    /**
+     * Число хранится литералом, как оно записано в исходном тексте.
+     *
+     * Иначе не обойтись: мы читаем-меняем-пишем `~/.claude.json`, который принадлежит Claude
+     * Code. Если пропустить числа через Double, миллисекундные штампы и счётчики вернутся в
+     * файл в другом виде (а всё, что длиннее 2^53, — с потерей точности), и мы молча испортим
+     * чужие данные, поменяв в файле один-единственный свой ключ.
+     */
+    data class Num(val literal: String) : Json {
+        val asDouble: Double get() = literal.toDoubleOrNull() ?: 0.0
+    }
     data class Str(val value: String) : Json
     data class Arr(val items: List<Json>) : Json
     data class Obj(val fields: Map<String, Json>) : Json
@@ -19,8 +30,8 @@ sealed interface Json {
     companion object {
         fun of(value: String?): Json = if (value == null) Null else Str(value)
         fun of(value: Boolean): Json = Bool(value)
-        fun of(value: Int): Json = Num(value.toDouble())
-        fun of(value: Long): Json = Num(value.toDouble())
+        fun of(value: Int): Json = Num(value.toString())
+        fun of(value: Long): Json = Num(value.toString())
 
         fun obj(vararg pairs: Pair<String, Json>): Obj = Obj(linkedMapOf(*pairs))
         fun arr(items: List<Json>): Arr = Arr(items)
@@ -46,8 +57,8 @@ sealed interface Json {
 
     val asString: String? get() = (this as? Str)?.value
     val asBoolean: Boolean? get() = (this as? Bool)?.value
-    val asInt: Int? get() = (this as? Num)?.value?.toInt()
-    val asLong: Long? get() = (this as? Num)?.value?.toLong()
+    val asInt: Int? get() = asLong?.toInt()
+    val asLong: Long? get() = (this as? Num)?.let { it.literal.toLongOrNull() ?: it.asDouble.toLong() }
     val asList: List<Json>? get() = (this as? Arr)?.items
     val asMap: Map<String, Json>? get() = (this as? Obj)?.fields
 
@@ -57,11 +68,8 @@ sealed interface Json {
         when (this) {
             is Null -> out.append("null")
             is Bool -> out.append(if (value) "true" else "false")
-            is Num -> {
-                val whole = value.toLong()
-                if (value == whole.toDouble() && !value.isInfinite()) out.append(whole)
-                else out.append(value)
-            }
+            // Литерал как был в исходном тексте: см. комментарий у Num.
+            is Num -> out.append(literal)
             is Str -> escape(value, out)
             is Arr -> {
                 out.append('[')
@@ -222,6 +230,7 @@ private class Parser(private val text: String) {
         if (!atEnd() && text[position] == '-') position++
         while (!atEnd() && (text[position].isDigit() || text[position] in ".eE+-")) position++
         val slice = text.substring(start, position)
-        return Json.Num(slice.toDoubleOrNull() ?: error("bad number '$slice' at offset $start"))
+        require(slice.toDoubleOrNull() != null) { "bad number '$slice' at offset $start" }
+        return Json.Num(slice)
     }
 }

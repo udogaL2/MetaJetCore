@@ -3,24 +3,21 @@ package dev.metajetcore.terminal
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
 import dev.metajetcore.registry.SessionRegistry
-import java.util.UUID
 
 /**
- * Находит вкладку терминала, в которой живёт сессия Claude Code с заданным именем — даже если
- * эту вкладку плагин не создавал.
+ * Находит вкладку, в которой живёт сессия Claude Code с заданным именем, — даже если эту
+ * вкладку плагин не создавал.
  *
- * Зачем: запуск оркестратора должен быть ровно `/orchestrate` в любой вкладке. Без этого
- * разработчику пришлось бы каждый раз открывать вкладку через действие плагина, иначе плагин
- * не знал бы, рядом с чем размещать агентов. Требовать лишний клик там, где договорились
- * обойтись одной командой, — плохой обмен.
+ * Зачем: запуск оркестратора должен оставаться просто `/orchestrate` в любой вкладке. Иначе
+ * разработчику пришлось бы каждый раз открывать вкладку действием плагина, только чтобы тот
+ * знал, рядом с чем размещать агентов.
  *
- * Как: сопоставлением по дереву процессов. Реестр сессий даёт pid процесса `claude`, а
- * терминальный виджет — pid своего шелла. Если шелл оказался среди предков claude, значит
- * сессия живёт в этой вкладке.
+ * Как: реестр сессий даёт pid процесса `claude`, а вкладка — pid своего шелла
+ * (`startupOptionsDeferred.pid`). Если шелл оказался среди предков claude, значит сессия
+ * живёт в этой вкладке. Работа с процессами — чистый JDK, от версии IDE не зависит.
  *
- * Работа с процессами — чистый JDK (`ProcessHandle`), от версии IDE не зависит. Рефлексия
- * нужна только чтобы достать pid шелла из виджета, и как везде в этом слое она мягкая:
- * не получилось — вернём null, вызывающий обойдётся без размещения.
+ * Запасной путь — сравнение с заголовком вкладки: он совпадает с именем сессии у вкладок,
+ * которые плагин создал сам, и у тех, что переименовал разработчик.
  */
 object TabResolver {
     private val log = Logger.getInstance(TabResolver::class.java)
@@ -29,31 +26,27 @@ object TabResolver {
     private const val MAX_ANCESTOR_DEPTH = 8
 
     fun findTabForSession(project: Project, sessionName: String): TabHandle? {
-        val record = SessionRegistry.findByName(sessionName) ?: run {
-            log.info("MetaJetCore: сессии '$sessionName' в реестре нет, вкладку искать не по чему")
-            return null
-        }
+        // Терминалы и тулвиндоу, и editor area: оркестратор чаще всего именно во втором,
+        // а getTabs() его не показывает (см. Terminal.handles).
+        val handles = Terminal.handles(project)
+        if (handles.isEmpty()) return null
 
-        val ancestors = ancestorPids(record.pid.toLong())
-        if (ancestors.isEmpty()) {
-            log.info("MetaJetCore: у процесса ${record.pid} не видно предков")
-            return null
-        }
-
-        for (widget in terminalWidgets(project)) {
-            val shellPid = shellPid(widget) ?: continue
-            if (shellPid in ancestors) {
-                log.info(
-                    "MetaJetCore: сессия '$sessionName' (pid ${record.pid}) живёт во вкладке " +
-                        "с шеллом $shellPid",
-                )
-                return TabHandle(
-                    id = UUID.randomUUID().toString(),
-                    displayName = sessionName,
-                    widget = widget,
-                    backendId = TerminalBackends.resolve().id,
-                )
+        val record = SessionRegistry.findByName(sessionName)
+        if (record != null) {
+            val ancestors = ancestorPids(record.pid.toLong())
+            for (handle in handles) {
+                val pid = Terminal.process(handle)?.pid ?: continue
+                if (pid in ancestors) {
+                    log.info("MetaJetCore: '$sessionName' (pid ${record.pid}) живёт во вкладке с шеллом $pid")
+                    return handle.renamed(sessionName)
+                }
             }
+        }
+
+        val byTitle = handles.firstOrNull { it.name == sessionName }
+        if (byTitle != null) {
+            log.info("MetaJetCore: '$sessionName' сопоставлен по заголовку вкладки")
+            return byTitle
         }
 
         log.info("MetaJetCore: вкладку для '$sessionName' сопоставить не удалось")
@@ -79,71 +72,5 @@ object TabResolver {
             depth++
         }
         return result
-    }
-
-    private fun terminalWidgets(project: Project): List<Any> = try {
-        val cls = Class.forName(
-            "org.jetbrains.plugins.terminal.TerminalToolWindowManager",
-            false,
-            javaClass.classLoader,
-        )
-        val instance = cls.methods
-            .firstOrNull { it.name == "getInstance" && it.parameterCount == 1 }
-            ?.invoke(null, project)
-        sequenceOf("getWidgets", "getTerminalWidgets")
-            .mapNotNull { name ->
-                instance?.javaClass?.methods
-                    ?.firstOrNull { it.name == name && it.parameterCount == 0 }
-                    ?.invoke(instance) as? Collection<*>
-            }
-            .flatMap { it.asSequence() }
-            .filterNotNull()
-            .distinct()
-            .toList()
-    } catch (e: Throwable) {
-        log.warn("MetaJetCore: не удалось перечислить вкладки терминала", e)
-        emptyList()
-    }
-
-    /**
-     * pid процесса шелла, запущенного во вкладке.
-     *
-     * Путь: виджет -> TtyConnector -> ProcessTtyConnector.getProcess() -> Process.pid().
-     * Оба звена стабильны: первое — JediTerm, второе — JDK начиная с девятой версии.
-     */
-    /** pid процесса шелла во вкладке. Публичный: по нему определяется диалект. */
-    fun shellPidOf(widget: Any?): Long? = if (widget == null) null else shellPid(widget)
-
-    private fun shellPid(widget: Any): Long? {
-        for (candidate in listOf(widget) + unwrapped(widget)) {
-            for (accessor in listOf("getProcessTtyConnector", "getTtyConnector")) {
-                try {
-                    val connector = candidate.javaClass.methods
-                        .firstOrNull { it.name == accessor && it.parameterCount == 0 }
-                        ?.invoke(candidate) ?: continue
-                    val process = connector.javaClass.methods
-                        .firstOrNull { it.name == "getProcess" && it.parameterCount == 0 }
-                        ?.invoke(connector) as? Process ?: continue
-                    return process.pid()
-                } catch (_: Throwable) {
-                    // следующий способ
-                }
-            }
-        }
-        return null
-    }
-
-    private fun unwrapped(widget: Any): List<Any> = try {
-        sequenceOf("asNewWidget", "getJBTerminalWidget", "getTerminalWidget")
-            .mapNotNull { name ->
-                widget.javaClass.methods
-                    .firstOrNull { it.name == name && it.parameterCount == 0 }
-                    ?.invoke(widget)
-            }
-            .filter { it !== widget }
-            .distinct()
-            .toList()
-    } catch (_: Throwable) {
-        emptyList()
     }
 }

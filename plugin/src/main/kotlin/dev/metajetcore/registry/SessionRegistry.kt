@@ -61,6 +61,26 @@ object SessionRegistry {
     /** Переопределяется в тестах; в проде — ~/.claude/sessions. */
     var directoryOverride: Path? = null
 
+    /**
+     * Жив ли процесс сессии. Переопределяется в тестах.
+     *
+     * Запись из реестра удаляет сама сессия при выходе, поэтому после падения (kill, обрыв
+     * питания, зависший процесс) файл остаётся. Такой «призрак» и в `list_agents` выглядит
+     * как рабочий агент, и навсегда занимает имя в [isNameTaken] — а имена глобальны на
+     * машину. Дешевле всего проверить pid: ProcessHandle — чистый JDK.
+     */
+    val defaultLivenessCheck: (Int) -> Boolean = { pid ->
+        try {
+            ProcessHandle.of(pid.toLong()).map { it.isAlive }.orElse(false)
+        } catch (_: Throwable) {
+            // Не смогли проверить — считаем живой: потерять живого агента хуже, чем
+            // показать мёртвого.
+            true
+        }
+    }
+
+    var isProcessAlive: (Int) -> Boolean = defaultLivenessCheck
+
     fun directory(): Path {
         directoryOverride?.let { return it }
         val home = System.getenv("CLAUDE_CONFIG_DIR")?.takeIf { it.isNotBlank() }
@@ -76,7 +96,7 @@ object SessionRegistry {
             Files.list(dir).use { stream ->
                 stream.filter { it.isRegularFile() && it.extension == "json" }
                     .map { path -> readRecord(path) }
-                    .filter { it != null }
+                    .filter { it != null && isProcessAlive(it.pid) }
                     .map { it!! }
                     .toList()
             }
@@ -104,7 +124,11 @@ object SessionRegistry {
     private fun readRecord(path: Path): SessionRecord? = try {
         // Файл могут переписать прямо во время чтения — тогда просто пропускаем его
         // до следующего опроса, а не роняем весь список.
-        SessionRecord.parse(Files.readString(path))
+        //
+        // BOM снимаем: JSON его не допускает, а записать файл с ним может кто угодно —
+        // например, PowerShell при `Set-Content -Encoding utf8`. Нераспарсенная запись
+        // означает невидимого агента, и разбираться в такой пропаже крайне неприятно.
+        SessionRecord.parse(Files.readString(path).removePrefix("﻿"))
     } catch (_: Exception) {
         null
     }

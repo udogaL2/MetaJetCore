@@ -14,8 +14,8 @@ import dev.metajetcore.roles.RoleInstaller
 import dev.metajetcore.settings.MjcSettings
 import dev.metajetcore.shell.ShellDialect
 import dev.metajetcore.skill.SkillInstaller
-import dev.metajetcore.terminal.OpenTabRequest
-import dev.metajetcore.terminal.TerminalBackends
+import dev.metajetcore.terminal.TabPlacement
+import dev.metajetcore.terminal.Terminal
 import java.awt.datatransfer.StringSelection
 
 private fun notify(project: Project?, text: String, type: NotificationType = NotificationType.INFORMATION) {
@@ -39,8 +39,10 @@ class CopyMcpConfigAction : AnAction() {
  * Открывает вкладку с обычной сессией Claude Code, помеченной как оркестратор.
  *
  * Роль здесь НЕ навязывается: оркестратором сессия становится по вызову /orchestrate.
- * Смысл действия — в том, чтобы вкладка попала под управление плагина и он знал, где она,
- * когда придёт spawn_agent(parent=...).
+ * Смысл действия в другом — вкладка сразу попадает под управление плагина и переезжает в
+ * editor area, поэтому агенты потом открываются рядом с ней. Запущенную руками вкладку
+ * плагин тоже находит (по дереву процессов), но разместить рядом с ней уже некуда: она в
+ * тулвиндоу.
  */
 class NewOrchestratorAction : AnAction() {
     override fun actionPerformed(event: AnActionEvent) {
@@ -53,44 +55,38 @@ class NewOrchestratorAction : AnAction() {
             .map { if (it == 0) base else "$base-${it + 1}" }
             .first { !SessionRegistry.isNameTaken(it) }
 
-        val backend = TerminalBackends.resolve()
-        val shell = ShellDialect.detect(System.getenv("SHELL") ?: System.getenv("ComSpec"))
-        val command = shell.purgeByPrefix(
-            buildList {
-                if (settings.stripInheritedClaudeMarkers) add("CLAUDE")
-                if (settings.stripApiKeys) add("ANTHROPIC_")
-            },
-        ) + shell.composeCommand(
-            mapOf("CLAUDE_CODE_SESSION_NAME" to name),
-            settings.launchCommand,
-        )
-
-        val handle = backend.openTab(
-            project,
-            OpenTabRequest(tabName = name, workingDirectory = manager.projectDirectory(), nearTab = null),
+        val handle = Terminal.openTab(
+            project = project,
+            name = name,
+            workingDirectory = manager.projectDirectory(),
+            env = mapOf("CLAUDE_CODE_SESSION_NAME" to name),
+            requestFocus = true,
         )
 
         if (handle == null) {
+            val shell = ShellDialect.detect(System.getenv("SHELL"))
+            val command = shell.unsetNames(manager.inheritedMarkers()) +
+                "CLAUDE_CODE_SESSION_NAME=$name ${settings.launchCommand}"
             CopyPasteManager.getInstance().setContents(StringSelection(command))
             notify(
                 project,
-                "Вкладку открыть не удалось (backend=${backend.id}). " +
-                    "Команда скопирована — запусти вручную.",
+                "Вкладку открыть не удалось. Команда скопирована — запусти вручную.",
                 NotificationType.WARNING,
             )
             return
         }
 
-        backend.sendLine(handle, command)
-        notify(project, "Оркестратор <b>$name</b> запущен. Вызови в нём <code>/orchestrate</code>.")
+        manager.register(name, handle)
+        TabPlacement.moveToEditor(project, handle)
+        manager.startPlainSession(handle)
+        notify(project, "Оркестратор <b>$name</b> запускается. Вызови в нём <code>/orchestrate</code>.")
     }
 }
 
-/** Диагностика: какое терминальное API разрешилось и что вообще происходит. */
+/** Диагностика: что разрешилось из терминального API и что вообще происходит. */
 class DiagnosticsAction : AnAction() {
     override fun actionPerformed(event: AnActionEvent) {
         val project = event.getData(CommonDataKeys.PROJECT)
-        TerminalBackends.invalidate()
         val settings = MjcSettings.getInstance()
         val endpoint = project?.getService(McpServerService::class.java)?.endpoint() ?: "не запущен"
         val text = buildString {
@@ -98,7 +94,7 @@ class DiagnosticsAction : AnAction() {
             append("команда запуска: ${settings.launchCommand}<br/>")
             append("реестр сессий: ${SessionRegistry.directory()}<br/>")
             append("живых сессий: ${SessionRegistry.all().size}<br/>")
-            append("<pre>${TerminalBackends.describe()}</pre>")
+            append("<pre>${Terminal.describe(project)}</pre>")
         }
         notify(project, text)
     }

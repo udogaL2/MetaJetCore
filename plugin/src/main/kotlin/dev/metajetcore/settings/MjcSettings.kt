@@ -58,9 +58,6 @@ class MjcSettings : PersistentStateComponent<MjcSettings> {
      */
     var stripInheritedClaudeMarkers: Boolean = true
 
-    /** auto | posix | powershell | cmd | fish */
-    var shellDialect: String = "auto"
-
     /**
      * Порт MCP-сервера. `0` — вывести из пути проекта (см. `MjcSettings.derivePort`).
      *
@@ -80,11 +77,6 @@ class MjcSettings : PersistentStateComponent<MjcSettings> {
     /** Дополнительные переменные окружения агентов, в формате KEY=VALUE, по одной в строке. */
     var extraEnvRaw: String = ""
 
-    /**
-     * Впечатывать ли уведомление в терминал оркестратора, когда агент завис.
-     * По умолчанию выключено: каждая инъекция стоит оркестратору полного хода.
-     */
-    var notifyOrchestratorInTerminal: Boolean = false
 
     fun extraEnv(): Map<String, String> =
         extraEnvRaw.lineSequence()

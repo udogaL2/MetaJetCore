@@ -19,11 +19,14 @@ class SessionRegistryTest {
     fun setUp() {
         dir = Files.createTempDirectory("mjc-registry")
         SessionRegistry.directoryOverride = dir
+        // Записи в тестах синтетические, их pid никому не принадлежат.
+        SessionRegistry.isProcessAlive = { true }
     }
 
     @After
     fun tearDown() {
         SessionRegistry.directoryOverride = null
+        SessionRegistry.isProcessAlive = SessionRegistry.defaultLivenessCheck
         dir.toFile().deleteRecursively()
     }
 
@@ -91,6 +94,18 @@ class SessionRegistryTest {
         assertTrue(SessionRegistry.all().isEmpty())
         assertNull(SessionRegistry.findByName("anything"))
         assertFalse(SessionRegistry.isNameTaken("anything"))
+    }
+
+    @Test
+    fun hidesRecordsWhoseProcessIsGone() {
+        // Запись удаляет сама сессия при выходе, поэтому после падения файл остаётся.
+        // Такой призрак и в list_agents выглядит живым, и навсегда занимает имя — а имена
+        // сессий глобальны на машину.
+        write("16404.json", realRecord)
+        SessionRegistry.isProcessAlive = { false }
+        assertTrue(SessionRegistry.all().isEmpty())
+        assertFalse(SessionRegistry.isNameTaken("mjc-envtest3"))
+        assertNull(SessionRegistry.findByName("mjc-envtest3"))
     }
 
     @Test

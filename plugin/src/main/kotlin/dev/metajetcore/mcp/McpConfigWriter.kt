@@ -32,6 +32,9 @@ object McpConfigWriter {
 
     private const val SERVER_NAME = "metajetcore"
 
+    /** Сколько раз перечитать файл, если его переписали параллельно. */
+    private const val WRITE_ATTEMPTS = 3
+
     fun configPath(): Path {
         val home = System.getenv("CLAUDE_CONFIG_DIR")?.takeIf { it.isNotBlank() }
             ?.let { Paths.get(it, ".claude.json") }
@@ -54,26 +57,58 @@ object McpConfigWriter {
         val path = configPath()
         val key = normalize(projectPath)
 
-        return try {
-            val root = readConfig() ?: Json.obj()
-            val updated = withServer(root, key, url)
-
-            // Атомарная подмена: файл принадлежит Claude Code, оборванная запись сделала бы
-            // его невалидным и сломала бы не только нас.
-            val temp = Files.createTempFile(path.parent ?: Paths.get("."), ".claude", ".json.tmp")
-            Files.write(temp, updated.render().toByteArray(StandardCharsets.UTF_8))
+        // Файл всё время переписывает сам Claude Code — там его счётчики, кэши и настройки
+        // проектов. Мы читаем, меняем один ключ и пишем целиком, поэтому между чтением и
+        // записью чужая правка была бы потеряна. Перед подменой перечитываем байты: если они
+        // изменились, значит писали параллельно — начинаем заново, а не затираем.
+        for (attempt in 1..WRITE_ATTEMPTS) {
             try {
-                Files.move(temp, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
-            } catch (_: Exception) {
-                // ATOMIC_MOVE поддерживают не все файловые системы.
-                Files.move(temp, path, StandardCopyOption.REPLACE_EXISTING)
+                val before = readBytes()
+                val root = before?.let { Json.parseOrNull(String(it, StandardCharsets.UTF_8)) } ?: Json.obj()
+                val updated = withServer(root, key, url).render().toByteArray(StandardCharsets.UTF_8)
+
+                val temp = Files.createTempFile(path.parent ?: Paths.get("."), ".claude", ".json.tmp")
+                Files.write(temp, updated)
+
+                val now = readBytes()
+                if (!sameBytes(before, now)) {
+                    Files.deleteIfExists(temp)
+                    log.info("MetaJetCore: $path изменился во время записи, попытка $attempt")
+                    continue
+                }
+
+                // Атомарная подмена: оборванная запись сделала бы файл невалидным и сломала
+                // бы не только нас.
+                try {
+                    Files.move(temp, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+                } catch (_: Exception) {
+                    // ATOMIC_MOVE поддерживают не все файловые системы.
+                    Files.move(temp, path, StandardCopyOption.REPLACE_EXISTING)
+                }
+                log.info("MetaJetCore: $SERVER_NAME прописан в $path для $key -> $url")
+                return true
+            } catch (e: Exception) {
+                log.warn("MetaJetCore: не удалось записать $path", e)
+                return false
             }
-            log.info("MetaJetCore: $SERVER_NAME прописан в $path для $key -> $url")
-            true
-        } catch (e: Exception) {
-            log.warn("MetaJetCore: не удалось записать $path", e)
-            false
         }
+
+        log.warn("MetaJetCore: $path переписывают параллельно, подключение не прописано")
+        return false
+    }
+
+    private fun readBytes(): ByteArray? = try {
+        val path = configPath()
+        if (Files.exists(path)) Files.readAllBytes(path) else null
+    } catch (e: Exception) {
+        log.warn("MetaJetCore: не удалось прочитать ${configPath()}", e)
+        null
+    }
+
+    private fun sameBytes(left: ByteArray?, right: ByteArray?): Boolean = when {
+        left == null && right == null -> true
+        left == null || right == null -> false
+        else -> left.contentEquals(right)
     }
 
     /** Копия конфигурации с добавленным сервером; всё остальное сохраняется как было. */

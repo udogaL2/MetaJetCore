@@ -69,5 +69,8 @@ class RolesTest {
         assertEquals(Role.IMPLEMENTER, Role.fromId("implementer"))
         assertEquals(Role.REVIEWER, Role.fromId("REVIEWER"))
         assertEquals(null, Role.fromId("nope"))
+        // В реестре сессий лежит то, что реально применилось, а применяется флаг
+        // --agent mjc-researcher, а не CLAUDE_CODE_AGENT=researcher (живой прогон, 2.1.251).
+        assertEquals(Role.RESEARCHER, Role.fromId("mjc-researcher"))
     }
 }

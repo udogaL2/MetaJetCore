@@ -16,13 +16,21 @@
     <depends>com.intellij.modules.platform</depends>
 
     <!--
-      Плагин терминала объявлен ОПЦИОНАЛЬНЫМ и без config-file.
-      Код обращается к нему только рефлексией, поэтому:
-        * плагин загрузится даже если терминал отключён или его API переехал;
-        * при недоступности терминала MetaJetCore переходит в ручной режим и отдаёт
-          оркестратору готовую команду, вместо того чтобы упасть.
+      Зависимость на МОДУЛЬ плагина терминала, а не только на сам плагин.
+      API переработанного терминала (TerminalToolWindowTabsManager, TerminalView) живёт в
+      content-модуле `intellij.terminal.frontend` с visibility="public", и без этой строки
+      classloader плагина его классов просто не видит — Class.forName вернёт null, и мы
+      навсегда останемся в ручном режиме.
+
+      Цена: зависимость обязательная, и при выключенном плагине терминала MetaJetCore не
+      загрузится. Это осознанный размен — без терминала оркестрировать нечего. Мягкая
+      деградация осталась там, где она нужна на самом деле: если API модуля изменится,
+      рефлексия вернёт null и плагин перейдёт в ручной режим вместо падения.
     -->
-    <depends optional="true">org.jetbrains.plugins.terminal</depends>
+    <dependencies>
+        <plugin id="org.jetbrains.plugins.terminal"/>
+        <module name="intellij.terminal.frontend"/>
+    </dependencies>
 
     <extensions defaultExtensionNs="com.intellij">
         <!--

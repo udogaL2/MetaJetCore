@@ -1,8 +1,8 @@
 import org.jetbrains.intellij.platform.gradle.TestFrameworkType
 
 plugins {
-    kotlin("jvm") version "2.1.0"
-    id("org.jetbrains.intellij.platform") version "2.2.1"
+    kotlin("jvm") version "2.3.21"
+    id("org.jetbrains.intellij.platform") version "2.18.1"
 }
 
 group = "dev.metajetcore"
@@ -17,13 +17,25 @@ repositories {
 
 dependencies {
     intellijPlatform {
-        // Собираем против IntelliJ IDEA Community: используются только платформенные API,
+        // Собираем против IntelliJ IDEA: используются только платформенные API,
         // поэтому плагин работает и в PyCharm, и в PhpStorm, и в остальных IDE на платформе.
-        intellijIdeaCommunity("2025.1")
+        //
+        // 2026.2 — нижняя граница, и это осознанно: плагин работает с переработанным
+        // терминалом (`TerminalToolWindowTabsManager`, `TerminalView.createSendTextBuilder`),
+        // которого в более ранних версиях просто нет. Поддерживать заодно и JediTerm-терминал
+        // значило бы тащить второй набор путей ради IDE, которыми мы не пользуемся.
+        intellijIdea("2026.2")
 
-        // Плагин терминала НАМЕРЕННО не объявлен зависимостью сборки: весь доступ к нему
-        // идёт через рефлексию (см. terminal/ReflectiveTerminalBackend.kt). Это то, что
-        // позволяет пережить смену экспериментального Terminal API между версиями IDE.
+        // Плагин терминала и его frontend-модуль нужны, чтобы тесты могли поднять настоящую
+        // вкладку: без них в тестовой IDE терминала просто нет, и весь терминальный слой
+        // остался бы непроверяемым — а он тут главный источник сюрпризов.
+        //
+        // На КОД это не влияет: обращения к терминалу по-прежнему только через рефлексию
+        // (см. terminal/Terminal.kt), импортов его классов в плагине нет. Это то, что
+        // позволяет пережить смену экспериментального API: вместо NoSuchMethodError
+        // получаем null и переход в ручной режим.
+        bundledPlugin("org.jetbrains.plugins.terminal")
+        bundledModule("intellij.terminal.frontend")
 
         testFramework(TestFrameworkType.Platform)
     }
@@ -47,7 +59,7 @@ intellijPlatform {
         version = project.version.toString()
 
         ideaVersion {
-            sinceBuild = "251"
+            sinceBuild = "262"
             // Верхней границы нет намеренно: плагин не должен отключаться при апгрейде IDE.
             // Это безопасно только потому, что нестабильные API дёргаются рефлексией и
             // деградируют, а не бросают NoClassDefFoundError.
@@ -64,7 +76,8 @@ intellijPlatform {
 
 tasks {
     wrapper {
-        gradleVersion = "8.10.2"
+        // IntelliJ Platform Gradle Plugin 2.18 требует Gradle 9+.
+        gradleVersion = "9.7.1"
     }
 
     /**
@@ -74,7 +87,7 @@ tasks {
      * согласие на сбор статистики. В автоматическом прогоне нажать на них некому, и IDE
      * зависает на старте, так и не дойдя до project-сервисов и MCP-сервера.
      */
-    val seedSandbox by registering {
+    val seedSandbox = register("seedSandbox") {
         val repoRoot = rootProject.projectDir.parentFile
         val optionsDir = layout.buildDirectory.dir("idea-sandbox").get().asFile
 

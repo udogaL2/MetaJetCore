@@ -5,6 +5,7 @@ import dev.metajetcore.agents.AgentManager
 import dev.metajetcore.mcp.McpTools
 import dev.metajetcore.roles.Role
 import dev.metajetcore.settings.MjcSettings
+import dev.metajetcore.shell.ShellDialect
 import dev.metajetcore.util.Json
 
 /**
@@ -24,64 +25,109 @@ class McpIntegrationTest : BasePlatformTestCase() {
         settings = MjcSettings.getInstance()
         settings.launchCommand = "claude"
         settings.stripApiKeys = true
-        settings.shellDialect = "posix"
+        settings.stripInheritedClaudeMarkers = true
+        settings.permissionMode = "auto"
         settings.namePrefix = "mjc"
         settings.extraEnvRaw = ""
         manager = project.getService(AgentManager::class.java)
         tools = McpTools(project)
     }
 
-    fun testCommandCarriesEverything() {
-        val line = manager.buildCommandLine(Role.IMPLEMENTER, "mjc-impl-be", "opus")
+    fun testLaunchLineCarriesOnlyWhatEnvironmentCannot() {
+        val line = manager.launchLine(Role.IMPLEMENTER, ShellDialect.POSIX)
 
-        // Вычистка идёт по префиксу, поэтому в строке не имена, а перечисление окружения.
-        assertTrue(line, line.contains("unset \$(env |"))
-        assertTrue(line, line.contains("CLAUDE|ANTHROPIC_"))
-        assertTrue(line, line.contains("CLAUDE_CODE_SESSION_NAME='mjc-impl-be'"))
-        assertTrue(line, line.contains("ANTHROPIC_MODEL='opus'"))
-        // Роль — одним флагом из файла в пользовательском скоупе.
+        // Роль — одним флагом из файла в пользовательском скоупе: через окружение она
+        // пишется в реестр, но не применяется (docs/ARCHITECTURE.md §2.2.1).
         assertTrue(line, line.contains("--agent mjc-implementer"))
-        // Инлайнового JSON в строке быть не должно: он ломался под PowerShell и портился
-        // кодировкой терминала. См. docs/ARCHITECTURE.md §2.6.
-        assertFalse(line, line.contains("--agents"))
         // Режим прав обязателен: без него агент встанет в manual mode в вкладке,
         // которую никто не читает.
         assertTrue(line, line.contains("--permission-mode auto"))
+        // Окружение теперь уезжает через API вкладки, в строке его быть не должно —
+        // именно это убирает экранирование и разницу диалектов шеллов.
+        assertFalse(line, line.contains("CLAUDE_CODE_SESSION_NAME"))
+        assertFalse(line, line.contains("ANTHROPIC_MODEL"))
+        assertFalse(line, line.contains("--agents"))
 
-        // Ключевой инвариант: вся набираемая строка — ASCII. Всё остальное портит
-        // кодировка терминала IDE.
+        // Ключевой инвариант: вся набираемая строка — ASCII.
         val nonAscii = line.filter { it.code >= 128 }
         assertTrue("в командной строке не-ASCII: '$nonAscii'", nonAscii.isEmpty())
+    }
+
+    fun testEnvironmentCarriesAddressAndModel() {
+        val env = manager.agentEnv(Role.IMPLEMENTER, "mjc-impl-be", "opus")
+        // Имя сессии — это адрес для SendMessage, без него агентов не различить.
+        assertEquals("mjc-impl-be", env["CLAUDE_CODE_SESSION_NAME"])
+        assertEquals("opus", env["ANTHROPIC_MODEL"])
+        assertEquals("implementer", env["CLAUDE_CODE_AGENT"])
+        // Отчёты — вне репозитория, иначе в каждом проекте нужна строка в .gitignore.
+        assertTrue(env.containsKey("MJC_REPORTS_DIR"))
     }
 
     fun testPurgeCanBeDisabled() {
         settings.stripApiKeys = false
         settings.stripInheritedClaudeMarkers = false
-        val line = manager.buildCommandLine(Role.IMPLEMENTER, "mjc-impl", "opus")
-        // Исчезнуть должна именно вычистка. ANTHROPIC_MODEL мы задаём сами — он остаётся.
-        assertFalse(line, line.contains("unset "))
-        assertTrue(line, line.contains("ANTHROPIC_MODEL="))
+        assertTrue(manager.inheritedMarkers().isEmpty())
+        assertFalse(manager.launchLine(Role.IMPLEMENTER, ShellDialect.POSIX).contains("unset "))
     }
 
-    fun testPurgeCoversBothFamiliesByPrefix() {
-        settings.stripApiKeys = true
-        settings.stripInheritedClaudeMarkers = true
-        val line = manager.buildCommandLine(Role.IMPLEMENTER, "mjc-impl", "opus")
-        // Префиксы, а не имена: список имён устаревал бы с каждой новой версией Claude Code.
-        assertTrue(line, line.contains("CLAUDE|ANTHROPIC_"))
-        assertFalse("вычистка не должна перечислять имена", line.contains("unset ANTHROPIC_API_KEY"))
+    fun testPurgeNamesOnlyWhatIsActuallyInherited() {
+        // Имена берутся из окружения самой IDE: агент наследует именно его, поэтому
+        // зашитый список был бы одновременно и неполным, и устаревающим.
+        val marker = "CLAUDE_CODE_MESSAGING_SOCKET"
+        val inherited = manager.inheritedMarkers()
+        for (name in inherited) {
+            assertTrue(name, name.startsWith("CLAUDE") || name.startsWith("ANTHROPIC_"))
+            assertTrue(name, System.getenv().containsKey(name))
+        }
+        if (System.getenv().containsKey(marker)) {
+            assertTrue(inherited.toString(), inherited.contains(marker))
+        }
     }
 
     fun testCustomLaunchCommandIsUsedVerbatim() {
         settings.launchCommand = "/usr/local/bin/my-claude"
-        val line = manager.buildCommandLine(Role.IMPLEMENTER, "mjc-impl", "opus")
+        val line = manager.launchLine(Role.IMPLEMENTER, ShellDialect.POSIX)
         assertTrue(line, line.contains("/usr/local/bin/my-claude"))
     }
 
     fun testExtraEnvIsIncluded() {
         settings.extraEnvRaw = "MJC_EXTRA=yes"
-        val line = manager.buildCommandLine(Role.IMPLEMENTER, "mjc-impl", "opus")
-        assertTrue(line, line.contains("MJC_EXTRA='yes'"))
+        assertEquals("yes", manager.agentEnv(Role.IMPLEMENTER, "mjc-impl", "opus")["MJC_EXTRA"])
+    }
+
+    fun testBriefRejectsNonAsciiInsteadOfCorruptingIt() {
+        // Живой прогон на 2026.2: «Ответь ровно одним словом: ПРОБА-OK» приехало в TUI как
+        // «❯ ������ ����� ����� ������: �����-OK», и агент ответил на выдуманный текст.
+        // Молчаливое искажение выглядит как выполненная команда — отказ честнее.
+        val result = tools.call(
+            Json.obj(
+                "name" to Json.of("brief_agent"),
+                "arguments" to Json.obj(
+                    "name" to Json.of("mjc-rsrch"),
+                    "text" to Json.of("Ответь ровно: ПРОБА"),
+                ),
+            ),
+        )
+        assertEquals(true, result["isError"]?.asBoolean)
+        val text = result["content"]!!.asList!!.first()["text"]!!.asString!!
+        assertTrue(text, text.contains("SendMessage"))
+    }
+
+    fun testBriefAcceptsAsciiAndFailsOnlyOnUnknownTab() {
+        // ASCII проходит проверку кодировки и упирается уже в отсутствие вкладки —
+        // значит отказ выше был именно про кодировку, а не про что-то ещё.
+        val result = tools.call(
+            Json.obj(
+                "name" to Json.of("brief_agent"),
+                "arguments" to Json.obj(
+                    "name" to Json.of("mjc-rsrch"),
+                    "text" to Json.of("/exit"),
+                ),
+            ),
+        )
+        assertEquals(true, result["isError"]?.asBoolean)
+        val text = result["content"]!!.asList!!.first()["text"]!!.asString!!
+        assertTrue(text, text.contains("неизвестна"))
     }
 
     fun testToolSchemasAreWellFormed() {
@@ -157,8 +203,8 @@ class McpIntegrationTest : BasePlatformTestCase() {
         val result = tools.call(Json.obj("name" to Json.of("diagnostics")))
         assertEquals(false, result["isError"]?.asBoolean)
         val text = result["content"]!!.asList!!.first()["text"]!!.asString!!
-        assertTrue(text, text.contains("backend:"))
-        assertTrue(text, text.contains("диалект шелла:"))
+        assertTrue(text, text.contains("terminal API"))
+        assertTrue(text, text.contains("команда запуска:"))
     }
 
     fun testListAgentsAnswersWhenNothingRuns() {

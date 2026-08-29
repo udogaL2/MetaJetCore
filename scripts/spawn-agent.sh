@@ -45,11 +45,20 @@ if [[ ! -f "$definition" ]]; then
 fi
 
 # Никогда не отдавать агенту API-ключ: он молча уводит сессию с подписки на API-биллинг.
-unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+# И снять унаследованные маркеры Claude Code: если этот терминал сам живёт внутри сессии,
+# CLAUDE_CODE_CHILD_SESSION заставит агента считать себя вложенным и не регистрироваться
+# в реестре, а CLAUDE_CODE_MESSAGING_SOCKET — это инбокс родительской сессии.
+inherited="$(env | grep -oE '^(CLAUDE|ANTHROPIC_)[A-Za-z0-9_]*' | tr '\n' ' ')"
+[[ -n "$inherited" ]] && unset $inherited
 
 export CLAUDE_CODE_SESSION_NAME="$name"
 export CLAUDE_CODE_AGENT="$role"          # только метка в реестре сессий
 export ANTHROPIC_MODEL="${model:-$default_model}"
+
+# Куда роли складывают развёрнутые отчёты. Плагин подставляет каталог проекта; в ручном
+# режиме проекта он не знает, поэтому общий. Главное — вне репозитория.
+export MJC_REPORTS_DIR="${MJC_REPORTS_DIR:-$HOME/.claude/metajetcore/manual/reports}"
+mkdir -p "$MJC_REPORTS_DIR"
 
 printf '\033]0;%s\007' "$name"            # заголовок вкладки терминала
 
