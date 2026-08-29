@@ -63,6 +63,46 @@ class McpIntegrationTest : BasePlatformTestCase() {
         assertTrue(env.containsKey("MJC_REPORTS_DIR"))
     }
 
+    fun testEnvironmentCarriesTheOrchestratorName() {
+        // Связь «агент → его оркестратор» знает только плагин и только в момент спавна:
+        // в реестре Claude Code такого поля нет. Сторонние наблюдатели иначе вынуждены
+        // угадывать её по общему префиксу имени, а это разваливается на двух командах
+        // в одном проекте.
+        val env = manager.agentEnv(Role.IMPLEMENTER, "mjc-impl-be", "opus", "mjc-orc")
+        assertEquals("mjc-orc", env["MJC_PARENT"])
+    }
+
+    fun testEnvironmentOmitsParentWhenThereIsNone() {
+        // Именно отсутствие ключа, а не пустая строка: пустое значение получатель принял бы
+        // за настоящее имя и построил бы дерево с несуществующим родителем.
+        val env = manager.agentEnv(Role.IMPLEMENTER, "mjc-impl-be", "opus", null)
+        assertFalse(env.toString(), env.containsKey("MJC_PARENT"))
+        assertFalse(manager.agentEnv(Role.IMPLEMENTER, "mjc-impl", "opus", "  ").containsKey("MJC_PARENT"))
+    }
+
+    fun testParentNameIsTrimmedToTheLengthReceiverExpects() {
+        val long = "o".repeat(120)
+        val env = manager.agentEnv(Role.IMPLEMENTER, "mjc-impl", "opus", long)
+        assertEquals(64, env["MJC_PARENT"]?.length)
+    }
+
+    fun testManualCommandCarriesTheParent() {
+        // Ручной режим — деградация, но дерево команды и в нём должно получаться верным.
+        val command = manager.manualCommand(Role.IMPLEMENTER, "mjc-impl-be", "opus", "mjc-orc")
+        assertTrue(command, command.contains("MJC_PARENT='mjc-orc'"))
+        assertFalse(
+            manager.manualCommand(Role.IMPLEMENTER, "mjc-impl-be", "opus", null).contains("MJC_PARENT"),
+        )
+    }
+
+    fun testOrchestratorTabIsMarkedWithItsRole() {
+        // Роль этой переменной не задаётся — она метка (§2.2.1). Нужна, чтобы оркестратора
+        // было видно снаружи: иначе он опознаётся только по имени, а имя произвольное.
+        val env = manager.orchestratorEnv("mjc-orc")
+        assertEquals("mjc-orc", env["CLAUDE_CODE_SESSION_NAME"])
+        assertEquals("orchestrator", env["CLAUDE_CODE_AGENT"])
+    }
+
     fun testPurgeCanBeDisabled() {
         settings.stripApiKeys = false
         settings.stripInheritedClaudeMarkers = false

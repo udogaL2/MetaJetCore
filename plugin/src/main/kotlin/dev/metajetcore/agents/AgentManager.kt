@@ -111,7 +111,7 @@ class AgentManager(private val project: Project) {
         }
 
         val model = requestedModel?.takeIf { it.isNotBlank() } ?: role.defaultModel
-        val manualCommand = manualCommand(role, name, model)
+        val manualCommand = manualCommand(role, name, model, parentName)
 
         if (!runOnEdt { Terminal.isAvailable(project) }) {
             return SpawnResult.Manual(manualCommand, "терминальное API IDE недоступно")
@@ -123,7 +123,7 @@ class AgentManager(private val project: Project) {
                 project = project,
                 name = name,
                 workingDirectory = projectDirectory(),
-                env = agentEnv(role, name, model),
+                env = agentEnv(role, name, model, parentName),
             )?.also { child -> TabPlacement.placeNear(project, parentTab, child) }
         } ?: return SpawnResult.Manual(manualCommand, "не удалось открыть вкладку терминала")
 
@@ -327,7 +327,12 @@ class AgentManager(private val project: Project) {
      * Окружение агента. Уезжает через API терминала, а не в командной строке: так не нужны
      * ни кавычки, ни диалекты шеллов, ни ASCII-ограничение на значения.
      */
-    internal fun agentEnv(role: Role, name: String, model: String): Map<String, String> {
+    internal fun agentEnv(
+        role: Role,
+        name: String,
+        model: String,
+        parentName: String? = null,
+    ): Map<String, String> {
         val env = LinkedHashMap<String, String>()
         // Имя сессии — это адрес для SendMessage. Без него имя выводится платформой из имени
         // проекта, и агентов одного проекта не различить.
@@ -339,9 +344,29 @@ class AgentManager(private val project: Project) {
         // Каталог для развёрнутых отчётов — ВНЕ репозитория, иначе в каждом проекте
         // пришлось бы добавлять строку в .gitignore, а артефакты агентов там не нужны.
         env["MJC_REPORTS_DIR"] = reportsDirectory().toString().replace(BACKSLASH, '/')
+        // Имя оркестратора, который завёл этого агента. Плагин знает его только здесь и
+        // сейчас: карта вкладок родителя не хранит, а в реестре Claude Code такого поля нет
+        // вовсе. Читают переменную сторонние наблюдатели, чтобы построить дерево команды
+        // точно, а не догадкой по общему префиксу имени — она разваливается на двух командах
+        // в одном проекте. Имя передаём как есть: получатель сравнивает его с именем сессии
+        // из реестра, и любая нормализация здесь сломала бы сопоставление.
+        parentName?.takeIf { it.isNotBlank() }?.let { env["MJC_PARENT"] = it.take(MAX_PARENT_NAME) }
         env.putAll(settings.extraEnv())
         return env
     }
+
+    /**
+     * Окружение вкладки оркестратора.
+     *
+     * Роль здесь только меткой: `CLAUDE_CODE_AGENT` её НЕ применяет (§2.2.1), оркестратором
+     * сессия становится по вызову `/orchestrate`. Метка нужна, чтобы оркестратора было видно
+     * снаружи — и нам в `list_agents`, и сторонним наблюдателям. Без неё его опознают только
+     * по имени вида `<префикс>-orc`, а имя разработчик волен задать любое.
+     */
+    internal fun orchestratorEnv(name: String): Map<String, String> = linkedMapOf(
+        "CLAUDE_CODE_SESSION_NAME" to name,
+        "CLAUDE_CODE_AGENT" to Role.ORCHESTRATOR.id,
+    )
 
     /**
      * Строка, которую плагин печатает во вкладку. Только ASCII и только то, что нельзя
@@ -376,9 +401,14 @@ class AgentManager(private val project: Project) {
      * шелле, где ему удобно. Для полностью корректного ручного запуска есть
      * `scripts/spawn-agent.sh`.
      */
-    internal fun manualCommand(role: Role, name: String, model: String): String {
+    internal fun manualCommand(
+        role: Role,
+        name: String,
+        model: String,
+        parentName: String? = null,
+    ): String {
         val shell = ShellDialect.detect(System.getenv("SHELL"))
-        val env = agentEnv(role, name, model)
+        val env = agentEnv(role, name, model, parentName)
             .entries.joinToString(" ") { (key, value) -> "$key='$value'" }
         return shell.unsetNames(inheritedMarkers()) + env + " " + commandWithFlags(role)
     }
@@ -468,6 +498,9 @@ class AgentManager(private val project: Project) {
 
     private companion object {
         val BACKSLASH: Char = 92.toChar()
+
+        /** Длина, по которой имя родителя режет приёмник; режем сами, чтобы совпадало. */
+        const val MAX_PARENT_NAME = 64
 
         const val POLL_INTERVAL_MS = 250L
         const val EXIT_TIMEOUT_MS = 15_000L

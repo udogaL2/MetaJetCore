@@ -59,14 +59,16 @@ class NewOrchestratorAction : AnAction() {
             project = project,
             name = name,
             workingDirectory = manager.projectDirectory(),
-            env = mapOf("CLAUDE_CODE_SESSION_NAME" to name),
+            env = manager.orchestratorEnv(name),
             requestFocus = true,
         )
 
         if (handle == null) {
             val shell = ShellDialect.detect(System.getenv("SHELL"))
+            val env = manager.orchestratorEnv(name)
+                .entries.joinToString(" ") { (key, value) -> "$key='$value'" }
             val command = shell.unsetNames(manager.inheritedMarkers()) +
-                "CLAUDE_CODE_SESSION_NAME=$name ${settings.launchCommand}"
+                env + " " + settings.launchCommand
             CopyPasteManager.getInstance().setContents(StringSelection(command))
             notify(
                 project,

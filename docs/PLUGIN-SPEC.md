@@ -51,6 +51,7 @@ spawn_agent(
    ANTHROPIC_MODEL          = <model>
    CLAUDE_CODE_AGENT        = <role>      # только метка в реестре, роль НЕ задаёт
    MJC_REPORTS_DIR          = <каталог отчётов вне репозитория>
+   MJC_PARENT               = <parent>    # имя оркестратора; ключа нет, если родителя нет
    ```
 3. Если вкладка родителя живёт в editor area — открыть новую рядом с ней
    (`TerminalInEditorSupport.openInEditor`), иначе оставить в тулвиндоу.
