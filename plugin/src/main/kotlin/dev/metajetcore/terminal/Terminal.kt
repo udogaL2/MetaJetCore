@@ -348,19 +348,17 @@ object Terminal {
      * по командной строке определяется диалект шелла для строки вычистки окружения.
      */
     fun process(handle: TabHandle): TabProcess? = try {
-        val deferred = call(handle.view, "getStartupOptionsDeferred")
-        val completed = deferred?.let { call(it, "isCompleted") as? Boolean } ?: false
-        if (!completed) {
+        // isCompleted проверяется до getCompleted: на незавершённом deferred тот бросает,
+        // а процесс вкладки стартует заметно позже самой вкладки.
+        val options = call(handle.view, "getStartupOptionsDeferred")
+            ?.takeIf { call(it, "isCompleted") == true }
+            ?.let { call(it, "getCompleted") }
+        if (options == null) {
             null
         } else {
-            val options = call(deferred!!, "getCompleted")
-            if (options == null) {
-                null
-            } else {
-                @Suppress("UNCHECKED_CAST")
-                val command = (call(options, "getShellCommand") as? List<String>).orEmpty()
-                TabProcess(pid = call(options, "getPid") as? Long, shellCommand = command)
-            }
+            @Suppress("UNCHECKED_CAST")
+            val command = (call(options, "getShellCommand") as? List<String>).orEmpty()
+            TabProcess(pid = call(options, "getPid") as? Long, shellCommand = command)
         }
     } catch (e: Throwable) {
         log.debug("MetaJetCore: startupOptions недоступны", e)
