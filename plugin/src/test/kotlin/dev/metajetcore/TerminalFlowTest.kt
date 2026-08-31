@@ -2,6 +2,7 @@ package dev.metajetcore
 
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import dev.metajetcore.agents.AgentManager
+import dev.metajetcore.agents.CloseResult
 import dev.metajetcore.agents.SpawnResult
 import dev.metajetcore.registry.SessionRegistry
 import dev.metajetcore.roles.Role
@@ -92,8 +93,13 @@ class TerminalFlowTest : BasePlatformTestCase() {
         // Экран вкладки читается — это единственный способ увидеть зависшего агента.
         assertNotNull("экран не прочитан", onPooledThreadPumpingEdt { manager.readScreen(name) })
 
-        // Закрытие: /exit доезжает, агент убирает свою запись, вкладка закрывается.
-        assertTrue("close не прошёл", onPooledThreadPumpingEdt { manager.close(name) })
+        // Закрытие: /exit доезжает, агент убирает свою запись, шелл гаснет вместе с ним,
+        // вкладка закрывается без модального вопроса про запущенный процесс.
+        assertEquals(
+            "close не прошёл",
+            CloseResult.Closed,
+            onPooledThreadPumpingEdt { manager.close(name) },
+        )
         assertNull("запись осталась в реестре", SessionRegistry.findByName(name))
         assertFalse("вкладка осталась под управлением", manager.knownTabs().contains(name))
     }
@@ -155,6 +161,37 @@ class TerminalFlowTest : BasePlatformTestCase() {
             SessionRegistry.findByName("mjc-manual-session") == null
         }
         Terminal.closeTab(project, tab)
+    }
+
+    fun testTabWithLivingProcessIsNotClosedBehindAModalDialog() {
+        // Вкладка, которую плагин не запускал: хвостового выхода из шелла в ней нет, и
+        // процесс переживает /exit. Закрывать такую нельзя — платформа спросит
+        // подтверждение модальным диалогом, а зовём мы закрытие под invokeAndWait, то есть
+        // диалог подвесит поток MCP-запроса до ответа человека. Ровно на этом close_agent
+        // и висел: «сессия закрылась, а вкладка ресерчера осталась».
+        val tab = Terminal.openTab(
+            project = project,
+            name = "mjc-stuck",
+            workingDirectory = manager.projectDirectory(),
+            env = emptyMap(),
+        ) ?: throw AssertionError("вкладка не создалась")
+        awaitPumpingEdt("шелл поднялся") { Terminal.isRunning(tab) }
+        manager.register("mjc-stuck", tab)
+
+        // Ждать полный продовый таймаут тесту незачем: процесс здесь не умрёт никогда.
+        val timeout = manager.tabDeadTimeoutMs
+        manager.tabDeadTimeoutMs = 2_000L
+        try {
+            val result = onPooledThreadPumpingEdt { manager.close("mjc-stuck") }
+            assertTrue("ожидался TabLeftOpen, получено $result", result is CloseResult.TabLeftOpen)
+            // Вкладка остаётся под управлением: её экран — единственное объяснение того,
+            // почему процесс не завершился, и read_tab по ней должен работать.
+            assertTrue("вкладка выпала из управления", manager.knownTabs().contains("mjc-stuck"))
+            assertFalse("процесс во вкладке не должен был умереть", Terminal.isTerminated(tab))
+        } finally {
+            manager.tabDeadTimeoutMs = timeout
+            Terminal.closeTab(project, tab)
+        }
     }
 
     /** Всё, что лежит в тестовом реестре: имя в записи важнее самого факта её наличия. */

@@ -41,6 +41,25 @@ class ShellDialectTest {
     }
 
     @Test
+    fun `every dialect can exit the shell after the agent`() {
+        for (dialect in ShellDialect.entries) {
+            val tail = dialect.exitWhenDone()
+            // Хвост приписывается к готовой команде, поэтому обязан начинаться с
+            // разделителя: без него он склеился бы с последним аргументом запуска.
+            assertTrue("$dialect: $tail", tail.startsWith(";") || tail.startsWith(" &"))
+            assertTrue("$dialect: $tail", tail.endsWith("exit"))
+        }
+    }
+
+    @Test
+    fun `cmd separates commands with an ampersand`() {
+        assertEquals("; exit", ShellDialect.POSIX.exitWhenDone())
+        assertEquals("; exit", ShellDialect.POWERSHELL.exitWhenDone())
+        assertEquals("; exit", ShellDialect.FISH.exitWhenDone())
+        assertEquals(" & exit", ShellDialect.CMD.exitWhenDone())
+    }
+
+    @Test
     fun `detects dialect from shell path`() {
         assertEquals(ShellDialect.POSIX, ShellDialect.detect("/bin/bash"))
         assertEquals(ShellDialect.POSIX, ShellDialect.detect("/usr/bin/zsh"))

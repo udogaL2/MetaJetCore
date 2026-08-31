@@ -47,6 +47,9 @@ class McpIntegrationTest : BasePlatformTestCase() {
         assertFalse(line, line.contains("CLAUDE_CODE_SESSION_NAME"))
         assertFalse(line, line.contains("ANTHROPIC_MODEL"))
         assertFalse(line, line.contains("--agents"))
+        // Хвостовой выход из шелла: без него процесс вкладки переживает /exit, и её
+        // закрытие упирается в модальный вопрос платформы (docs/ARCHITECTURE.md §2).
+        assertTrue(line, line.trimEnd().endsWith("; exit"))
 
         // Ключевой инвариант: вся набираемая строка — ASCII.
         val nonAscii = line.filter { it.code >= 128 }

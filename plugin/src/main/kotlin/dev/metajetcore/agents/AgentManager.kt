@@ -42,6 +42,26 @@ sealed interface BriefResult {
     data class NotAscii(val offending: String) : BriefResult
 }
 
+/**
+ * Результат закрытия агента.
+ *
+ * Boolean тут не хватало: «вкладку не закрыли» и «вкладки не знаем» — разные новости для
+ * оркестратора, и в первом случае агент всё-таки завершён.
+ */
+sealed interface CloseResult {
+    /** Сессия завершена, вкладка закрыта. */
+    data object Closed : CloseResult
+
+    /** Вкладки с таким именем плагин не знает. */
+    data object UnknownTab : CloseResult
+
+    /**
+     * Сессия завершена, но во вкладке остался живой процесс, поэтому вкладку не закрывали:
+     * платформа спросила бы подтверждение модальным диалогом.
+     */
+    data class TabLeftOpen(val reason: String) : CloseResult
+}
+
 /** Результат спавна: либо агент поднят, либо команда, которую надо выполнить руками. */
 sealed interface SpawnResult {
     /**
@@ -64,6 +84,14 @@ class AgentManager(private val project: Project) {
     private val spawned = ConcurrentHashMap<String, AgentInfo>()
 
     private val settings get() = MjcSettings.getInstance()
+
+    /**
+     * Сколько ждать смерти процесса вкладки перед её закрытием.
+     *
+     * `var` ради теста негативного пути: там процесс не умирает никогда, и с продовым
+     * значением тест просто стоял бы полный таймаут.
+     */
+    internal var tabDeadTimeoutMs: Long = EXIT_TIMEOUT_MS
 
     fun projectDirectory(): Path =
         project.basePath?.let { Paths.get(it) } ?: Paths.get(System.getProperty("user.dir"))
@@ -181,15 +209,41 @@ class AgentManager(private val project: Project) {
 
     // ------------------------------------------------------------- lifecycle
 
-    /** Мягкое завершение: /exit, дождаться исчезновения из реестра, закрыть вкладку. */
-    fun close(name: String): Boolean {
-        val handle = tabFor(name) ?: return false
+    /**
+     * Мягкое завершение: `/exit`, дождаться исчезновения из реестра, дождаться смерти
+     * процесса вкладки и только тогда её закрыть.
+     *
+     * Последний шаг не перестраховка. `closeTab` на вкладке с живым процессом показывает
+     * модальный вопрос «в терминале что-то запущено, точно закрыть?», а вызываем мы его под
+     * `invokeAndWait` — то есть диалог блокирует поток MCP-запроса, и оркестратор ждёт не
+     * IDE, а человека. Поэтому закрытие зовётся только там, где спрашивать не о чем.
+     *
+     * Нормальный путь до диалога не доходит: строка запуска содержит хвостовой выход из
+     * шелла (`ShellDialect.exitWhenDone`), так что вместе с агентом умирает и процесс
+     * вкладки. Ветка [CloseResult.TabLeftOpen] остаётся для вкладок, которые плагин не
+     * запускал (подхваченных по дереву процессов, перезапущенных руками), и для агента,
+     * оставившего после себя живого потомка.
+     */
+    fun close(name: String): CloseResult {
+        val handle = tabFor(name) ?: return CloseResult.UnknownTab
         runOnEdt { Terminal.send(handle, "/exit", execute = true) }
         awaitSessionGone(name)
+        // Управлять больше нечем: сессии нет. Дальше речь только об уборке вкладки.
+        spawned.remove(name)
+
+        if (!awaitTabDead(handle)) {
+            // Вкладку намеренно оставляем под управлением: read_tab по ней ещё работает, а
+            // именно её экран объясняет, почему процесс не завершился.
+            return CloseResult.TabLeftOpen(
+                "сессия '$name' завершена, но во вкладке остался живой процесс, поэтому " +
+                    "вкладка не закрыта: IDE спросила бы подтверждение. Посмотри её экран " +
+                    "(read_tab) и закрой вкладку руками",
+            )
+        }
+
         runOnEdt { Terminal.closeTab(project, handle) }
         tabs.remove(name)
-        spawned.remove(name)
-        return true
+        return CloseResult.Closed
     }
 
     /** Сброс контекста между этапами: сессия и вкладка остаются живыми. */
@@ -263,6 +317,11 @@ class AgentManager(private val project: Project) {
 
     /**
      * Запустить обычную сессию Claude Code в уже открытой вкладке — без роли и без флагов.
+     *
+     * Хвостового выхода из шелла (`ShellDialect.exitWhenDone`) здесь намеренно нет, хотя в
+     * строке запуска агентов он есть. Это вкладка оркестратора: её закрывает человек, а не
+     * `close_agent`, и после выхода из claude он обычно остаётся в шелле — например чтобы
+     * запустить сессию заново.
      *
      * Ждать шелл приходится в фоне: действие вызывается из EDT, а между созданием вкладки и
      * стартом процесса проходит заметное время, и напечатанная в этот промежуток строка
@@ -378,7 +437,7 @@ class AgentManager(private val project: Project) {
      * первом же запросе прав во вкладке, которую никто не читает.
      */
     internal fun launchLine(role: Role, shell: ShellDialect): String =
-        shell.unsetNames(inheritedMarkers()) + commandWithFlags(role)
+        shell.unsetNames(inheritedMarkers()) + commandWithFlags(role) + shell.exitWhenDone()
 
     private fun commandWithFlags(role: Role): String {
         val roleFlag = " --agent ${RoleInstaller.agentName(role)}"
@@ -400,6 +459,9 @@ class AgentManager(private val project: Project) {
      * Форма присваиваний — POSIX: команда предназначена человеку, а он выполнит её в том
      * шелле, где ему удобно. Для полностью корректного ручного запуска есть
      * `scripts/spawn-agent.sh`.
+     *
+     * Хвостового выхода из шелла здесь тоже нет: он существует ради автоматического
+     * закрытия вкладки, а человеку закрыл бы его собственный шелл.
      */
     internal fun manualCommand(
         role: Role,
@@ -460,6 +522,27 @@ class AgentManager(private val project: Project) {
             Thread.sleep(POLL_INTERVAL_MS)
         }
         return null
+    }
+
+    /**
+     * Ждём, пока во вкладке не останется живого процесса: ни самой сессии, ни её потомков.
+     *
+     * Признак основной — состояние сессии вкладки. `hasChildProcesses` добавлен как второй:
+     * агент мог оставить после себя живой процесс, и тогда платформа спросит подтверждение
+     * даже при мёртвой сессии. Недоступный признак (null) не считаем отрицательным ответом —
+     * решает тогда состояние сессии.
+     */
+    private fun awaitTabDead(handle: TabHandle): Boolean {
+        val deadline = System.currentTimeMillis() + tabDeadTimeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val dead = runOnEdt {
+                Terminal.isTerminated(handle) && Terminal.hasChildProcesses(handle) != true
+            }
+            if (dead) return true
+            Thread.sleep(POLL_INTERVAL_MS)
+        }
+        log.warn("MetaJetCore: во вкладке '${handle.name}' остался живой процесс после /exit")
+        return false
     }
 
     private fun awaitSessionGone(name: String) {

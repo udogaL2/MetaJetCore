@@ -4,6 +4,7 @@ import com.intellij.openapi.project.Project
 import dev.metajetcore.agents.AgentInfo
 import dev.metajetcore.agents.AgentManager
 import dev.metajetcore.agents.BriefResult
+import dev.metajetcore.agents.CloseResult
 import dev.metajetcore.agents.SpawnResult
 import dev.metajetcore.roles.Role
 import dev.metajetcore.roles.RoleInstaller
@@ -215,8 +216,15 @@ class McpTools(private val project: Project) {
 
     private fun closeAgent(args: Json): Json {
         val name = args["name"]?.asString ?: return textResult("ошибка: нет name", isError = true)
-        return if (manager.close(name)) textResult("'$name' завершён, вкладка закрыта")
-        else textResult("вкладка '$name' плагину неизвестна", isError = true)
+        return when (val result = manager.close(name)) {
+            is CloseResult.Closed -> textResult("'$name' завершён, вкладка закрыта")
+            is CloseResult.UnknownTab ->
+                textResult("вкладка '$name' плагину неизвестна", isError = true)
+            // Не ошибка: агент завершён, то есть инструмент своё дело сделал. Ошибкой это
+            // выглядело бы как «закрыть не удалось», и оркестратор пошёл бы повторять вызов
+            // на уже мёртвой сессии.
+            is CloseResult.TabLeftOpen -> textResult(result.reason)
+        }
     }
 
     private fun focusAgent(args: Json): Json {

@@ -201,6 +201,26 @@ object Terminal {
 
     fun isRunning(handle: TabHandle): Boolean = state(handle) == "Running"
 
+    /** Процесс во вкладке завершился. Вкладка при этом остаётся: см. openTab. */
+    fun isTerminated(handle: TabHandle): Boolean = state(handle) == "Terminated"
+
+    /**
+     * Остались ли во вкладке живые дочерние процессы.
+     *
+     * Нужно перед закрытием вкладки: платформа предупреждает «в терминале что-то запущено»
+     * не только про сам процесс вкладки, но и про его детей, а предупреждение это
+     * модальное — см. `ShellDialect.exitWhenDone`.
+     *
+     * null — признак недоступен (метода нет в этой версии API). Трактовать его как «детей
+     * нет» нельзя: это ровно тот случай, когда мы не знаем, и решает тогда состояние
+     * сессии.
+     */
+    fun hasChildProcesses(handle: TabHandle): Boolean? = try {
+        call(handle.view, "hasChildProcesses") as? Boolean
+    } catch (_: Throwable) {
+        null
+    }
+
     /**
      * Поднялась ли интеграция с шеллом.
      *
