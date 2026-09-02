@@ -65,6 +65,17 @@ class RolesTest {
     }
 
     @Test
+    fun orchestratorIsToldToCheckLiveAgentsBeforeSpawning() {
+        // Единственный рычаг против «новая задача — новый агент»: плагин отличить дубль от
+        // штатной параллельной работы не может, он видит роль и не видит участок
+        // (docs/ARCHITECTURE.md §8.1). Значит правило живёт только здесь, и молча пропасть
+        // при следующей правке промпта оно не должно.
+        val prompt = Roles.promptFor(Role.ORCHESTRATOR)
+        assertTrue(prompt, prompt.contains("list_agents"))
+        assertTrue(prompt, prompt.contains("участок"))
+    }
+
+    @Test
     fun rolesResolveById() {
         assertEquals(Role.IMPLEMENTER, Role.fromId("implementer"))
         assertEquals(Role.REVIEWER, Role.fromId("REVIEWER"))

@@ -17,8 +17,32 @@ cd plugin
 ```
 
 Версии инструментов связаны и меняются вместе: IntelliJ Platform Gradle Plugin 2.18 требует
-Gradle 9+, Gradle 9 — Kotlin 2.2+. Артефакт платформы — `intellijIdea("2026.2")`: Community
+Gradle 9+, Gradle 9 — Kotlin 2.2+, а он — foojay-resolver 1.0+ (на 0.8.0 сборка падает с
+`NoSuchFieldError: IBM_SEMERU`). Артефакт платформы — `intellijIdea("2026.2")`: Community
 (`IC`) с 2025.3 больше не публикуется.
+
+**Если ничего не скачивается** — `download.jetbrains.com` отвечает 451, `cache-redirector`
+даёт `Read timed out`, — первым делом проверьте прокси. **JVM не читает `HTTP_PROXY` и
+`HTTPS_PROXY` из окружения**: curl через прокси ходит, а Gradle идёт напрямую и упирается в
+блокировку. Лечится строками в `~/.gradle/gradle.properties`:
+
+```properties
+systemProp.https.proxyHost=<хост>
+systemProp.https.proxyPort=<порт>
+systemProp.https.proxyUser=<логин>
+systemProp.https.proxyPassword=<пароль>
+systemProp.http.nonProxyHosts=127.0.0.1|localhost
+```
+
+Второй путь, если платформу всё равно не достать, — собирать против уже установленной
+IDE 262+:
+
+```bash
+MJC_LOCAL_IDE=~/.local/share/JetBrains/Toolbox/apps/phpstorm ./gradlew buildPlugin
+```
+
+То же значение можно положить свойством `mjcLocalIde` в `~/.gradle/gradle.properties`.
+В репозитории пути к чужим машинам не хранятся, поэтому источник платформы задаётся снаружи.
 
 ## Релизы
 

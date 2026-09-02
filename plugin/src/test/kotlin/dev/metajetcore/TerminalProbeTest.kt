@@ -13,6 +13,16 @@ import java.nio.file.Paths
  */
 class TerminalProbeTest : BasePlatformTestCase() {
 
+    override fun tearDown() {
+        try {
+            // Вкладку тест закрывает сам, но релиз её редактора асинхронный —
+            // см. awaitEditorsReleased.
+            awaitEditorsReleased()
+        } finally {
+            super.tearDown()
+        }
+    }
+
     fun testShellAcceptsALongCommand() {
         // Гипотеза: ломается длина. Наша команда запуска несёт снятие унаследованных
         // маркеров, и на десяти переменных в синтаксисе PowerShell это ~900 символов.

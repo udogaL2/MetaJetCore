@@ -24,7 +24,15 @@ dependencies {
         // терминалом (`TerminalToolWindowTabsManager`, `TerminalView.createSendTextBuilder`),
         // которого в более ранних версиях просто нет. Поддерживать заодно и JediTerm-терминал
         // значило бы тащить второй набор путей ради IDE, которыми мы не пользуемся.
-        intellijIdea("2026.2")
+        //
+        // Дистрибутив по умолчанию скачивается, но download.jetbrains.com доступен не
+        // отовсюду (отвечает 451), а без него не собирается вообще ничего. Поэтому источник
+        // платформы можно подменить уже установленной IDE 262+: свойство `mjcLocalIde` в
+        // ~/.gradle/gradle.properties или переменная MJC_LOCAL_IDE. В репозитории пути к
+        // чужим машинам не место, отсюда и внешнее свойство.
+        val localIde = providers.gradleProperty("mjcLocalIde")
+            .orElse(providers.environmentVariable("MJC_LOCAL_IDE"))
+        if (localIde.isPresent) local(localIde) else intellijIdea("2026.2")
 
         // Плагин терминала и его frontend-модуль нужны, чтобы тесты могли поднять настоящую
         // вкладку: без них в тестовой IDE терминала просто нет, и весь терминальный слой

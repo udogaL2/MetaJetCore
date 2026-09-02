@@ -44,3 +44,24 @@ fun awaitPumpingEdt(what: String, timeoutMs: Long = 60_000, condition: () -> Boo
     }
     throw AssertionError("не дождались: $what")
 }
+
+/**
+ * Дождаться, пока платформа дорелизит редакторы, созданные вкладками терминала.
+ *
+ * Терминал 2026.2 — это редактор, и `closeTab` возвращается раньше, чем он освобождён:
+ * релиз доезжает следующими событиями EDT. Проверка `checkEditorsReleased` в teardown
+ * фикстуры этого не ждёт, поэтому «Editor hasn't been released» прилетало в случайный
+ * тест — тот, чей teardown оказался первым после утечки, а не тот, который её создал.
+ * Изолированно класс проходил целиком, в общем прогоне падал то один тест, то другой.
+ *
+ * Утверждения здесь нет намеренно: если редактор действительно потерян, пусть падает сама
+ * проверка фикстуры — у неё есть стектрейс создания, которого нам взять неоткуда.
+ */
+fun awaitEditorsReleased(timeoutMs: Long = 30_000) {
+    val deadline = System.currentTimeMillis() + timeoutMs
+    while (System.currentTimeMillis() < deadline) {
+        if (com.intellij.openapi.editor.EditorFactory.getInstance().allEditors.isEmpty()) return
+        PlatformTestUtil.dispatchAllEventsInIdeEventQueue()
+        Thread.sleep(20)
+    }
+}

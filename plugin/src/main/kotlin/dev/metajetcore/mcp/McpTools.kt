@@ -27,6 +27,9 @@ class McpTools(private val project: Project) {
             description =
                 "Открыть новую вкладку с полноценной сессией Claude Code в этой IDE. Это НЕ " +
                     "субагент: отдельный процесс, свой контекст, свой адрес для SendMessage. " +
+                    "СНАЧАЛА посмотри list_agents: если агент нужной роли уже работает над " +
+                    "этим же участком, новый не нужен — отдай задачу ему через SendMessage, " +
+                    "у него уже набран контекст. Новый заводи, когда участок другой. " +
                     "Задачу инструмент НЕ передаёт — после успешного спавна отправь её сам " +
                     "через SendMessage на возвращённое имя.",
             properties = Json.obj(
@@ -157,6 +160,18 @@ class McpTools(private val project: Project) {
                 buildString {
                     append("Агент запущен.\n")
                     append(describe(result.agent))
+                    // Дублирование роли не запрещаем: несколько имплементеров по разным
+                    // доменам — штатная схема. Но назвать уже живых обязаны: оркестратор
+                    // сам на них не смотрит (живой прогон: четыре имплементера подряд), а
+                    // после спавна ещё не поздно отдать задачу тому, кто в теме.
+                    if (result.siblings.isNotEmpty()) {
+                        append("\n\nВНИМАНИЕ: этой же роли в проекте уже работают ")
+                        append(result.siblings.joinToString(", ") { it.name })
+                        append(". Если задача про их участок — отдай её им через SendMessage, ")
+                        append("а этого закрой через close_agent: у них набран контекст, ")
+                        append("новый агент входит в задачу с нуля. Если участок другой — ")
+                        append("всё верно, продолжай.")
+                    }
                     append("\n\nСЛЕДУЮЩИЙ ШАГ, ОБЯЗАТЕЛЬНО: отправь агенту задачу через ")
                     append("SendMessage(to=\"${result.agent.name}\"). ")
                     append("Плагин задачу не передаёт намеренно: терминал искажает не-ASCII ")
@@ -182,7 +197,12 @@ class McpTools(private val project: Project) {
     private fun listAgents(): Json {
         val agents = manager.list()
         if (agents.isEmpty()) return textResult("В этом проекте нет живых сессий Claude Code.")
-        return textResult(agents.joinToString("\n") { describe(it) })
+        return textResult(
+            agents.joinToString("\n") { describe(it) } +
+                "\n\nАгент с ролью — это готовая к работе сессия с набранным контекстом. " +
+                "Задачу по участку, который агент уже вёл, отправляй ему через SendMessage: " +
+                "новый агент на то же место входит в задачу с нуля.",
+        )
     }
 
     private fun briefAgent(args: Json): Json {

@@ -3,10 +3,13 @@ package dev.metajetcore
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import dev.metajetcore.agents.AgentManager
 import dev.metajetcore.mcp.McpTools
+import dev.metajetcore.registry.SessionRegistry
 import dev.metajetcore.roles.Role
 import dev.metajetcore.settings.MjcSettings
 import dev.metajetcore.shell.ShellDialect
 import dev.metajetcore.util.Json
+import java.nio.file.Files
+import java.nio.file.Path
 
 /**
  * Интеграционные проверки на настоящем Project из платформенной фикстуры.
@@ -20,8 +23,20 @@ class McpIntegrationTest : BasePlatformTestCase() {
     private lateinit var manager: AgentManager
     private lateinit var tools: McpTools
 
+    /**
+     * Свой реестр на каждый прогон.
+     *
+     * Без подмены тесты читают ~/.claude/sessions разработчика: занятость имени, состав
+     * агентов и сам факт «в проекте кто-то работает» приезжали бы из чужих живых сессий,
+     * а часть проверок молча меняла бы смысл.
+     */
+    private lateinit var registryDir: Path
+
     override fun setUp() {
         super.setUp()
+        registryDir = Files.createTempDirectory("mjc-mcp-registry")
+        SessionRegistry.directoryOverride = registryDir
+        SessionRegistry.isProcessAlive = { true }
         settings = MjcSettings.getInstance()
         settings.launchCommand = "claude"
         settings.stripApiKeys = true
@@ -31,6 +46,70 @@ class McpIntegrationTest : BasePlatformTestCase() {
         settings.extraEnvRaw = ""
         manager = project.getService(AgentManager::class.java)
         tools = McpTools(project)
+    }
+
+    override fun tearDown() {
+        try {
+            SessionRegistry.directoryOverride = null
+            SessionRegistry.isProcessAlive = SessionRegistry.defaultLivenessCheck
+            registryDir.toFile().deleteRecursively()
+        } finally {
+            super.tearDown()
+        }
+    }
+
+    /** Живая сессия в директории этого проекта — как её видит плагин. */
+    private fun registerLiveSession(pid: Int, name: String, agent: String, sessionId: String = "s-$pid") {
+        val cwd = manager.projectDirectory().toString().replace("\\", "\\\\")
+        Files.writeString(
+            registryDir.resolve("$pid.json"),
+            """{"pid":$pid,"sessionId":"$sessionId","cwd":"$cwd",
+               "kind":"interactive","name":"$name","agent":"$agent","status":"idle"}""",
+        )
+    }
+
+    private fun spawnCall(vararg extra: Pair<String, Json>): String {
+        val arguments = Json.obj(
+            "role" to Json.of("implementer"),
+            "task" to Json.of("правка"),
+            "parent" to Json.of("mjc-orc"),
+            *extra,
+        )
+        val result = tools.call(
+            Json.obj("name" to Json.of("spawn_agent"), "arguments" to arguments),
+        )
+        return result["content"]!!.asList!!.first()["text"]!!.asString!!
+    }
+
+    fun testLiveAgentsOfTheSameRoleAreListedForTheOrchestrator() {
+        // Живой прогон дал четырёх имплементеров подряд: оркестратор на уже работающих не
+        // смотрит. Запрещать нельзя — параллельные домены это штатная схема, — поэтому
+        // плагин обязан хотя бы назвать их, и список снимается ДО открытия вкладки, иначе
+        // в него попал бы сам новичок.
+        registerLiveSession(4242, "mjc-impl-be", "mjc-implementer")
+        registerLiveSession(4243, "mjc-impl-fe", "mjc-implementer")
+
+        val names = manager.reusable(Role.IMPLEMENTER).map { it.name }.toSet()
+        assertEquals(setOf("mjc-impl-be", "mjc-impl-fe"), names)
+    }
+
+    fun testAgentsOfOtherRolesAreNotCountedAsSiblings() {
+        registerLiveSession(4242, "mjc-rsrch", "mjc-researcher")
+        assertTrue(manager.reusable(Role.IMPLEMENTER).isEmpty())
+        // Оркестратор не заменяем и в список никогда не попадает.
+        registerLiveSession(4244, "mjc-orc", "mjc-orchestrator")
+        assertTrue(manager.reusable(Role.ORCHESTRATOR).isEmpty())
+    }
+
+    fun testLiveAgentOfTheSameRoleDoesNotBlockSpawn() {
+        // Ключевое: несколько имплементеров по разным доменам — нормальная работа, и спавн
+        // из-за живого однорольца не отменяется. Имя просим заведомо занятое, чтобы вызов
+        // упёрся в проверку имени сразу после места, где раньше стоял отказ, и при этом не
+        // открывал настоящую вкладку терминала — она в этом тесте ни при чём.
+        registerLiveSession(4242, "mjc-impl-be", "mjc-implementer")
+
+        val text = spawnCall("name" to Json.of("mjc-impl-be"), "domain" to Json.of("fe"))
+        assertTrue(text, text.contains("уже занято"))
     }
 
     fun testLaunchLineCarriesOnlyWhatEnvironmentCannot() {
@@ -66,6 +145,86 @@ class McpIntegrationTest : BasePlatformTestCase() {
         assertTrue(env.containsKey("MJC_REPORTS_DIR"))
     }
 
+    fun testParentNameLosesTheRefSuffixListAgentsPrints() {
+        // ListAgents печатает `слитие мастера [815818]` и велит копировать имя дословно,
+        // оркестратор так и делает. Хвост — ref платформы, в реестре его нет; пока он не
+        // снимался, вкладка родителя не находилась (агент открывался в тулвиндоу), а
+        // MJC_PARENT приезжал наблюдателю несопоставимым — дерево команды не собиралось.
+        assertEquals("слитие мастера", manager.canonicalName("слитие мастера [815818]"))
+        assertEquals("mjc-orc", manager.canonicalName("mjc-orc [ebe653]"))
+        // Пробел перед скобкой не обязателен, а вокруг строки может быть что угодно.
+        assertEquals("mjc-orc", manager.canonicalName("  mjc-orc[0f4bf4]  "))
+    }
+
+    fun testNamesWithoutRefSuffixArePassedThrough() {
+        assertEquals("mjc-orc", manager.canonicalName("mjc-orc"))
+        // Скобки не с шестнадцатеричным содержимым — часть имени, а не ref.
+        assertEquals("релиз [прод]", manager.canonicalName("релиз [прод]"))
+        assertEquals("", manager.canonicalName("   "))
+    }
+
+    fun testParentIsIdentifiedBySessionIdNotByName() {
+        // Ключ связи «агент → оркестратор» — sessionId, а не имя: имя задаёт человек, оно
+        // не уникально и меняется по ходу работы. Имя остаётся рядом, но только справочно.
+        registerLiveSession(7001, "слитие мастера", "", sessionId = "0ba88519")
+
+        val env = manager.agentEnv(
+            Role.IMPLEMENTER,
+            "mjc-impl-be",
+            "opus",
+            "слитие мастера",
+            manager.parentSessionId("слитие мастера"),
+        )
+        assertEquals("0ba88519", env["MJC_PARENT_SESSION"])
+        assertEquals("слитие мастера", env["MJC_PARENT"])
+    }
+
+    fun testResumedSessionIsStillOneParent() {
+        // Три записи реестра с одним именем и одним sessionId — это одна сессия, поднятая
+        // заново (замер на живом стенде: pid 290774/300159/313131, sessionId один).
+        // Развязывать тут нечего, связь определена.
+        registerLiveSession(290774, "слитие мастера", "", sessionId = "0ba88519")
+        registerLiveSession(300159, "слитие мастера", "", sessionId = "0ba88519")
+        registerLiveSession(313131, "слитие мастера", "", sessionId = "0ba88519")
+
+        assertEquals("0ba88519", manager.parentSessionId("слитие мастера"))
+    }
+
+    fun testAmbiguousParentNameYieldsNoLinkAtAll() {
+        // Два РАЗНЫХ оркестратора с одинаковым именем. Выбрать наугад нельзя: наблюдатель
+        // покажет чужую команду, и понять это по экрану будет невозможно. Честный ответ —
+        // связи нет.
+        registerLiveSession(7001, "orc", "", sessionId = "aaa")
+        registerLiveSession(7002, "orc", "", sessionId = "bbb")
+
+        assertNull(manager.parentSessionId("orc"))
+        val env = manager.agentEnv(Role.IMPLEMENTER, "mjc-impl", "opus", "orc", manager.parentSessionId("orc"))
+        assertFalse(env.toString(), env.containsKey("MJC_PARENT_SESSION"))
+        // Имя при этом уезжает: человеку оно всё ещё говорит, откуда агент.
+        assertEquals("orc", env["MJC_PARENT"])
+    }
+
+    fun testMatchedRecordWinsOverAmbiguousName() {
+        // Вкладку родителя нашли сопоставлением pid — значит известен конкретный процесс,
+        // и тёзки больше не мешают. Эта запись сильнее любого перебора по имени.
+        registerLiveSession(7001, "orc", "", sessionId = "aaa")
+        registerLiveSession(7002, "orc", "", sessionId = "bbb")
+
+        val matched = SessionRegistry.byName("orc").first { it.pid == 7002 }
+        assertEquals("bbb", manager.parentSessionId("orc", matched))
+    }
+
+    fun testSpawnUsesTheCanonicalParentNameInEnvironment() {
+        // Проверка сквозная: то, что доедет до MJC_PARENT, не должно содержать ref.
+        val env = manager.agentEnv(
+            Role.IMPLEMENTER,
+            "mjc-impl-be",
+            "opus",
+            manager.canonicalName("слитие мастера [815818]"),
+        )
+        assertEquals("слитие мастера", env["MJC_PARENT"])
+    }
+
     fun testEnvironmentCarriesTheOrchestratorName() {
         // Связь «агент → его оркестратор» знает только плагин и только в момент спавна:
         // в реестре Claude Code такого поля нет. Сторонние наблюдатели иначе вынуждены
@@ -90,9 +249,11 @@ class McpIntegrationTest : BasePlatformTestCase() {
     }
 
     fun testManualCommandCarriesTheParent() {
-        // Ручной режим — деградация, но дерево команды и в нём должно получаться верным.
-        val command = manager.manualCommand(Role.IMPLEMENTER, "mjc-impl-be", "opus", "mjc-orc")
+        // Ручной режим — деградация, но дерево команды и в нём должно получаться верным,
+        // то есть по sessionId, а не по имени.
+        val command = manager.manualCommand(Role.IMPLEMENTER, "mjc-impl-be", "opus", "mjc-orc", "sid-1")
         assertTrue(command, command.contains("MJC_PARENT='mjc-orc'"))
+        assertTrue(command, command.contains("MJC_PARENT_SESSION='sid-1'"))
         assertFalse(
             manager.manualCommand(Role.IMPLEMENTER, "mjc-impl-be", "opus", null).contains("MJC_PARENT"),
         )

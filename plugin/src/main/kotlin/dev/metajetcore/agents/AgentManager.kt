@@ -12,6 +12,7 @@ import dev.metajetcore.settings.MjcSettings
 import dev.metajetcore.shell.ShellDialect
 import dev.metajetcore.terminal.TabHandle
 import dev.metajetcore.terminal.TabPlacement
+import dev.metajetcore.terminal.SessionTab
 import dev.metajetcore.terminal.TabResolver
 import dev.metajetcore.terminal.Terminal
 import java.nio.file.Files
@@ -67,8 +68,16 @@ sealed interface SpawnResult {
     /**
      * @param pendingBriefing текст, который оркестратор обязан отправить агенту через
      *   SendMessage. Плагин его не печатает: см. комментарий в [AgentManager.spawn].
+     * @param siblings агенты той же роли, которые уже работали в проекте на момент вызова.
+     *   Непустой список — не ошибка: несколько имплементеров по непересекающимся доменам
+     *   это штатная схема. Но оркестратор обязан увидеть, что он только что продублировал
+     *   роль, — сам он этого не проверяет (см. комментарий в [AgentManager.spawn]).
      */
-    data class Started(val agent: AgentInfo, val pendingBriefing: String) : SpawnResult
+    data class Started(
+        val agent: AgentInfo,
+        val pendingBriefing: String,
+        val siblings: List<AgentInfo> = emptyList(),
+    ) : SpawnResult
 
     /** Терминал недоступен или сессия не поднялась. Оркестратор попросит разработчика. */
     data class Manual(val command: String, val reason: String) : SpawnResult
@@ -131,6 +140,27 @@ class AgentManager(private val project: Project) {
         requestedModel: String?,
         domain: String?,
     ): SpawnResult {
+        // Имя родителя приводим к тому, как сессия называется в реестре: оркестратор
+        // копирует его из ListAgents вместе с ref-хвостом (см. canonicalName).
+        val parent = parentName?.takeIf { it.isNotBlank() }?.let { canonicalName(it) }
+
+        // Кто этой роли уже работает — снимаем ДО открытия вкладки, иначе в списке окажется
+        // и сам новичок. Спавн этим не отменяется: несколько имплементеров по
+        // непересекающимся доменам — штатная схема, и запрещать её значило бы ломать
+        // нормальную работу ради борьбы с дублями. Но в ответе список будет: живой прогон
+        // дал четырёх имплементеров подряд, то есть сам оркестратор на живых не смотрит.
+        val siblings = reusable(role)
+
+        // Родителя разрешаем один раз: нужна и вкладка (чтобы открыть агента рядом), и
+        // запись реестра (чтобы отдать наружу sessionId вместо неуникального имени).
+        val parentTab = parent?.let { resolveParent(it) }
+        if (parent != null && parentTab?.handle == null) {
+            // Не отказ: агент нужнее, чем его место на экране. Но в логе это должно быть
+            // видно — иначе «вкладка снова упала вниз» разбирается вслепую.
+            log.info("MetaJetCore: вкладка родителя '$parent' не найдена, агент откроется в тулвиндоу")
+        }
+        val parentSession = parent?.let { parentSessionId(it, parentTab?.record) }
+
         val name = requestedName?.takeIf { it.isNotBlank() } ?: generateName(role, domain)
         if (SessionRegistry.isNameTaken(name)) {
             return SpawnResult.Failed(
@@ -139,20 +169,19 @@ class AgentManager(private val project: Project) {
         }
 
         val model = requestedModel?.takeIf { it.isNotBlank() } ?: role.defaultModel
-        val manualCommand = manualCommand(role, name, model, parentName)
+        val manualCommand = manualCommand(role, name, model, parent, parentSession)
 
         if (!runOnEdt { Terminal.isAvailable(project) }) {
             return SpawnResult.Manual(manualCommand, "терминальное API IDE недоступно")
         }
 
-        val parentTab = parentName?.let { tabFor(it) }
         val handle = runOnEdt {
             Terminal.openTab(
                 project = project,
                 name = name,
                 workingDirectory = projectDirectory(),
-                env = agentEnv(role, name, model, parentName),
-            )?.also { child -> TabPlacement.placeNear(project, parentTab, child) }
+                env = agentEnv(role, name, model, parent, parentSession),
+            )?.also { child -> TabPlacement.placeNear(project, parentTab?.handle, child) }
         } ?: return SpawnResult.Manual(manualCommand, "не удалось открыть вкладку терминала")
 
         tabs[name] = handle
@@ -204,7 +233,7 @@ class AgentManager(private val project: Project) {
             managed = true,
         )
         spawned[actualName] = info
-        return SpawnResult.Started(info, pendingBriefing = task)
+        return SpawnResult.Started(info, pendingBriefing = task, siblings = siblings)
     }
 
     // ------------------------------------------------------------- lifecycle
@@ -224,7 +253,10 @@ class AgentManager(private val project: Project) {
      * запускал (подхваченных по дереву процессов, перезапущенных руками), и для агента,
      * оставившего после себя живого потомка.
      */
-    fun close(name: String): CloseResult {
+    fun close(rawName: String): CloseResult {
+        // Имя нормализуем один раз здесь: дальше оно уходит и в реестр, и в обе карты,
+        // и расхождение между ними означало бы вкладку-сироту.
+        val name = canonicalName(rawName)
         val handle = tabFor(name) ?: return CloseResult.UnknownTab
         runOnEdt { Terminal.send(handle, "/exit", execute = true) }
         awaitSessionGone(name)
@@ -247,8 +279,8 @@ class AgentManager(private val project: Project) {
     }
 
     /** Сброс контекста между этапами: сессия и вкладка остаются живыми. */
-    fun reset(name: String): Boolean {
-        val handle = tabFor(name) ?: return false
+    fun reset(rawName: String): Boolean {
+        val handle = tabFor(rawName) ?: return false
         return runOnEdt { Terminal.send(handle, "/clear", execute = true) }
     }
 
@@ -265,10 +297,10 @@ class AgentManager(private val project: Project) {
      * этом отрисовался кириллицей верно, то есть портится именно наш ввод. Молча искажать
      * текст хуже, чем отказаться: искажение выглядит как исполненная команда.
      */
-    fun brief(name: String, text: String): BriefResult {
+    fun brief(rawName: String, text: String): BriefResult {
         val nonAscii = text.filter { it.code >= 128 }
         if (nonAscii.isNotEmpty()) return BriefResult.NotAscii(nonAscii.toSet().joinToString(""))
-        val handle = tabFor(name) ?: return BriefResult.UnknownTab
+        val handle = tabFor(rawName) ?: return BriefResult.UnknownTab
         return if (runOnEdt { Terminal.send(handle, text, execute = true, paste = true) }) {
             BriefResult.Sent
         } else {
@@ -277,8 +309,8 @@ class AgentManager(private val project: Project) {
     }
 
     /** Что сейчас на экране вкладки агента. Для разбора «запустился, но молчит». */
-    fun readScreen(name: String): String? {
-        val handle = tabFor(name) ?: return null
+    fun readScreen(rawName: String): String? {
+        val handle = tabFor(rawName) ?: return null
         return runOnEdt { Terminal.readScreen(handle) }
     }
 
@@ -290,11 +322,79 @@ class AgentManager(private val project: Project) {
      * доопределяет сопоставлением pid — см. [TabResolver]. Найденное запоминаем, чтобы не
      * искать заново на каждый вызов.
      */
-    private fun tabFor(name: String): TabHandle? {
+    private fun tabFor(rawName: String): TabHandle? {
+        val name = canonicalName(rawName)
         tabs[name]?.let { return it }
         val resolved = runOnEdt { TabResolver.findTabForSession(project, name) } ?: return null
         tabs[name] = resolved
         return resolved
+    }
+
+    /**
+     * Вкладка родителя вместе с его записью в реестре.
+     *
+     * Отдельно от [tabFor] ради записи: карта вкладок её не хранит, а для связи
+     * «агент → оркестратор» нужна именно она — см. [parentSessionId].
+     */
+    private fun resolveParent(name: String): SessionTab? {
+        val resolved = runOnEdt { TabResolver.resolve(project, name) } ?: return null
+        tabs[name] = resolved.handle
+        return resolved
+    }
+
+    /**
+     * `sessionId` оркестратора — то, чем связь «агент → его оркестратор» задаётся на самом
+     * деле.
+     *
+     * Имя для этого не годится, и это не придирка: имя задаёт человек, оно не уникально
+     * (замер: три живые записи реестра с именем «слитие мастера») и меняется по ходу работы.
+     * `sessionId` уникален и переживает resume — у тех же трёх записей он один и тот же.
+     *
+     * Источник по убыванию надёжности:
+     *
+     *  1. Запись, по которой нашлась вкладка родителя. Она получена сопоставлением pid, то
+     *     есть привязана к конкретному процессу `claude`, — единственный способ развести
+     *     тёзок.
+     *  2. Реестр по имени, но **только если ответ однозначен**: все записи с этим именем
+     *     дают один `sessionId`. Иначе — null: отсутствие связи честнее, чем связь наугад,
+     *     потому что наугад означает чужую команду на экране наблюдателя.
+     */
+    internal fun parentSessionId(name: String, matched: SessionRecord? = null): String? {
+        matched?.sessionId?.takeIf { it.isNotBlank() }?.let { return it }
+        val ids = SessionRegistry.byName(name).map { it.sessionId }.filter { it.isNotBlank() }.distinct()
+        return if (ids.size == 1) {
+            ids.first()
+        } else {
+            if (ids.size > 1) {
+                log.info("MetaJetCore: имя '$name' носят ${ids.size} разные сессии, родитель не определён")
+            }
+            null
+        }
+    }
+
+    /**
+     * Имя сессии из строки, которую дал оркестратор.
+     *
+     * `ListAgents` печатает каждую сессию как `слитие мастера [815818]`, и его контракт велит
+     * копировать имя ровно так, как напечатано, — оркестратор так и делает. Но хвост в
+     * скобках это ref платформы, а не часть имени: в реестре сессия называется
+     * «слитие мастера». Ref ниоткуда не выводится — ни из pid, ни из sessionId (замер:
+     * сессия `metajetcore-df`, sessionId `6e65d7ec-…`, ref `ebe653`), — то есть опознать по
+     * нему нечего, его можно только снять.
+     *
+     * Пока хвост не снимался, ломалось всё, что опирается на имя, и ломалось молча: вкладка
+     * родителя не находилась, поэтому агент открывался в тулвиндоу вместо места рядом с
+     * оркестратором, а `MJC_PARENT` уезжал наблюдателю в виде, который тот не сопоставит ни
+     * с одной живой сессией — дерево команды не собиралось вовсе.
+     *
+     * Снимаем только тогда, когда имени с хвостом в реестре нет: сессия вправе называть себя
+     * как угодно, включая скобки на конце.
+     */
+    internal fun canonicalName(raw: String): String {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty() || SessionRegistry.isNameTaken(trimmed)) return trimmed
+        val bare = REF_SUFFIX.replace(trimmed, "").trim()
+        return bare.ifEmpty { trimmed }
     }
 
     /** Имена вкладок, которые ведёт плагин, — включая те, где спавн не доехал. */
@@ -340,10 +440,21 @@ class AgentManager(private val project: Project) {
         }
     }
 
-    fun focus(name: String): Boolean {
-        val handle = tabFor(name) ?: return false
+    fun focus(rawName: String): Boolean {
+        val handle = tabFor(rawName) ?: return false
         return runOnEdt { Terminal.focus(handle) }
     }
+
+    /**
+     * Живые агенты этой роли в проекте — те, кому задачу можно отдать вместо нового спавна.
+     *
+     * Оркестратор в списке не участвует: он один и не заменяем. Занятость агента тоже не
+     * смотрим — `busy` означает «сейчас думает», а не «занят другой задачей»: сообщение всё
+     * равно встанет в его очередь.
+     */
+    fun reusable(role: Role): List<AgentInfo> =
+        if (role == Role.ORCHESTRATOR) emptyList()
+        else list().filter { it.role == role }
 
     /** Живые сессии в директории проекта, обогащённые тем, что плагин знает про вкладки. */
     fun list(): List<AgentInfo> =
@@ -391,6 +502,7 @@ class AgentManager(private val project: Project) {
         name: String,
         model: String,
         parentName: String? = null,
+        parentSessionId: String? = null,
     ): Map<String, String> {
         val env = LinkedHashMap<String, String>()
         // Имя сессии — это адрес для SendMessage. Без него имя выводится платформой из имени
@@ -403,13 +515,21 @@ class AgentManager(private val project: Project) {
         // Каталог для развёрнутых отчётов — ВНЕ репозитория, иначе в каждом проекте
         // пришлось бы добавлять строку в .gitignore, а артефакты агентов там не нужны.
         env["MJC_REPORTS_DIR"] = reportsDirectory().toString().replace(BACKSLASH, '/')
-        // Имя оркестратора, который завёл этого агента. Плагин знает его только здесь и
-        // сейчас: карта вкладок родителя не хранит, а в реестре Claude Code такого поля нет
-        // вовсе. Читают переменную сторонние наблюдатели, чтобы построить дерево команды
-        // точно, а не догадкой по общему префиксу имени — она разваливается на двух командах
-        // в одном проекте. Имя передаём как есть: получатель сравнивает его с именем сессии
-        // из реестра, и любая нормализация здесь сломала бы сопоставление.
+        // Кто завёл этого агента. Связь знает только плагин и только здесь: в реестре Claude
+        // Code поля «родитель» нет вовсе, а сторонним наблюдателям дерево команды иначе
+        // приходится угадывать по общему префиксу имени — на двух командах в одном проекте
+        // догадка разваливается.
+        //
+        // Две переменные, и это не дубль. `MJC_PARENT_SESSION` — настоящий ключ: sessionId
+        // уникален и переживает resume. `MJC_PARENT` — имя, оно для человека и для старых
+        // получателей; **ключом оно быть не может**, потому что не уникально (замер: три
+        // живые записи реестра с именем «слитие мастера») и меняется по ходу работы.
+        //
+        // Ключа может не быть, даже когда имя есть: родителя не удалось определить
+        // однозначно (см. parentSessionId). Тогда наблюдатель обязан считать связь
+        // неизвестной, а не достраивать её по имени.
         parentName?.takeIf { it.isNotBlank() }?.let { env["MJC_PARENT"] = it.take(MAX_PARENT_NAME) }
+        parentSessionId?.takeIf { it.isNotBlank() }?.let { env["MJC_PARENT_SESSION"] = it }
         env.putAll(settings.extraEnv())
         return env
     }
@@ -468,9 +588,10 @@ class AgentManager(private val project: Project) {
         name: String,
         model: String,
         parentName: String? = null,
+        parentSessionId: String? = null,
     ): String {
         val shell = ShellDialect.detect(System.getenv("SHELL"))
-        val env = agentEnv(role, name, model, parentName)
+        val env = agentEnv(role, name, model, parentName, parentSessionId)
             .entries.joinToString(" ") { (key, value) -> "$key='$value'" }
         return shell.unsetNames(inheritedMarkers()) + env + " " + commandWithFlags(role)
     }
@@ -589,5 +710,12 @@ class AgentManager(private val project: Project) {
         const val EXIT_TIMEOUT_MS = 15_000L
         const val TAB_READY_TIMEOUT_MS = 20_000L
 
+        /**
+         * Хвост, которым `ListAgents` дописывает к имени сессии её ref: `имя [815818]`.
+         *
+         * Ref — шестнадцатеричный, длину не фиксируем: она может подрасти, когда одного
+         * префикса перестанет хватать на различение.
+         */
+        val REF_SUFFIX = Regex("""\s*\[[0-9a-fA-F]{4,32}]${'$'}""")
     }
 }

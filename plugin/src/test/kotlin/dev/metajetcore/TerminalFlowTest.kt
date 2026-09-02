@@ -43,6 +43,9 @@ class TerminalFlowTest : BasePlatformTestCase() {
 
     override fun tearDown() {
         try {
+            // Вкладки закрыты телом теста, но их редакторы освобождаются следующими
+            // событиями EDT — см. awaitEditorsReleased.
+            awaitEditorsReleased()
             SessionRegistry.directoryOverride = null
             SessionRegistry.isProcessAlive = SessionRegistry.defaultLivenessCheck
             settings.launchCommand = "claude"
