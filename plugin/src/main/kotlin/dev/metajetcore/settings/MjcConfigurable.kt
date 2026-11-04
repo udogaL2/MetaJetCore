@@ -3,8 +3,21 @@ package dev.metajetcore.settings
 import com.intellij.openapi.options.BoundConfigurable
 import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.DialogPanel
+import com.intellij.icons.AllIcons
+import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.ui.popup.JBPopupFactory
+import com.intellij.ui.components.fields.ExtendableTextComponent
+import com.intellij.ui.components.fields.ExtendableTextField
+import com.intellij.openapi.application.ModalityState
+import com.intellij.openapi.project.ProjectManager
+import com.intellij.ui.ColoredListCellRenderer
 import com.intellij.ui.SimpleListCellRenderer
-import com.intellij.ui.components.JBTextField
+import com.intellij.ui.SimpleTextAttributes
+import com.intellij.util.ui.JBUI
+import dev.metajetcore.harness.ModelCatalog
+import dev.metajetcore.shell.ShellDialect
+import javax.swing.JLabel
+import javax.swing.JList
 import com.intellij.ui.dsl.builder.AlignX
 import com.intellij.ui.dsl.builder.RowLayout
 import com.intellij.ui.dsl.builder.bindIntText
@@ -84,18 +97,20 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
                         )
                         // Оркестратор — всегда Claude Code: на нём держится SendMessage.
                         .enabled(role != Role.ORCHESTRATOR && choices.size > 1)
-                    val model = textField()
+                    val box = ModelField(role)
+                    modelBoxes += box to harness.component
+                    cell(box)
                         .bindText(
                             { settings.roleModel[role.id].orEmpty() },
                             { value -> settings.roleModel[role.id] = value.trim() },
                         )
-                        .columns(12)
-                        .validationOnInput { field -> modelWarning(field.text, harness.component.item) }
-                    // Подсказка в пустом поле — модель, которая реально поедет, а не «по умолчанию»:
-                    // так видно, что оставить пусто — тоже осознанный выбор.
-                    fun refreshPlaceholder() = placeholder(model.component, role, harness.component)
-                    refreshPlaceholder()
-                    harness.component.addActionListener { refreshPlaceholder() }
+                        .validationOnInput { modelWarning(it.text, harness.component.item) }
+                        .validationOnApply { modelWarning(it.text, harness.component.item) }
+                    box.show(harness.component.item, models[harness.component.item].orEmpty())
+                    harness.component.addActionListener {
+                        val picked = harness.component.item ?: Harness.CLAUDE
+                        box.show(picked, models[picked].orEmpty())
+                    }
                     comment(ROLE_HINTS.getValue(role))
                 }.layout(RowLayout.PARENT_GRID)
             }
@@ -105,6 +120,13 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
                     else "Codex появится в списке, когда IDE увидит его среди агентов терминала.",
                 )
             }
+            row {
+                label("").applyToComponent {
+                    foreground = JBUI.CurrentTheme.ContextHelp.FOREGROUND
+                    statusLabel = this
+                }
+            }
+            loadModels(offered)
         }
 
         val codexUsed = Role.entries.any { settings.harnessFor(it) == Harness.CODEX }
@@ -165,12 +187,106 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
         label.icon = value?.let { Terminal.agentIcon(it.key) }
     }
 
-    private fun placeholder(field: JBTextField, role: Role, harness: ComboBox<Harness>) {
-        field.emptyText.text = when (harness.item) {
-            Harness.CODEX -> "из конфига Codex"
-            else -> role.defaultModel
+    // ------------------------------------------------------------- модели
+
+    /** Списки моделей по харнесам: сначала запасные, потом — что ответил CLI. */
+    private val models = HashMap<Harness, List<ModelCatalog.Model>>()
+    private val modelStatus = LinkedHashMap<Harness, String>()
+    private val modelBoxes = mutableListOf<Pair<ModelField, ComboBox<Harness>>>()
+    private var statusLabel: JLabel? = null
+
+    /**
+     * Спрашивает списки у CLI в фоне: экран открывается сразу, списки доезжают, когда доедут.
+     * Ответ приходит, пока открыт модальный диалог настроек, поэтому `ModalityState.any()` —
+     * с модальностью по умолчанию обновление ждало бы закрытия окна.
+     */
+    private fun loadModels(harnesses: List<Harness>) {
+        // Шелл — тот же, что у вкладок агентов. Настройки общие на IDE, проект берём любой
+        // открытый: настройка шелла терминала у них обычно одна.
+        val shellPath = ProjectManager.getInstance().openProjects.firstOrNull()
+            ?.let { Terminal.configuredShellPath(it) } ?: ShellDialect.defaultShell()
+        for (harness in harnesses) {
+            val command = commandOf(harness)
+            val cached = ModelCatalog.cached(harness, command)
+            models[harness] = cached ?: ModelCatalog.fallback(harness)
+            if (cached != null) {
+                modelStatus[harness] = "${harness.displayName}: ${cached.size} моделей"
+                continue
+            }
+            modelStatus[harness] = "${harness.displayName}: спрашиваю список моделей…"
+            ModelCatalog.load(harness, command, shellPath).thenAccept { loaded ->
+                ApplicationManager.getApplication().invokeLater({
+                    if (loaded != null) models[harness] = loaded
+                    modelStatus[harness] = if (loaded != null) "${harness.displayName}: ${loaded.size} моделей"
+                    else "${harness.displayName}: список не получен — впишите модель вручную"
+                    refreshModels()
+                }, ModalityState.any())
+            }
         }
-        field.repaint()
+        refreshModels()
+    }
+
+    private fun refreshModels() {
+        for ((box, harness) in modelBoxes) {
+            val picked = harness.item ?: Harness.CLAUDE
+            box.show(picked, models[picked].orEmpty())
+        }
+        statusLabel?.text = modelStatus.values.joinToString("   ·   ")
+    }
+
+    private fun commandOf(harness: Harness) = when (harness) {
+        Harness.CLAUDE -> settings.launchCommand
+        Harness.CODEX -> settings.codexLaunchCommand
+    }.trim().ifEmpty { if (harness == Harness.CLAUDE) "claude" else "codex" }
+
+    /**
+     * Модель роли: свободный ввод плюс список от харнеса по стрелке.
+     *
+     * Текстовое поле, а не редактируемый комбобокс: `ComboBox` платформы оборачивает чужой
+     * редактор, и редактор с подсказкой в пустом поле в него не встаёт (проверено: компонент
+     * редактора не добавлялся, раскладка падала с NPE). Свободный ввод обязателен: CLI может не
+     * ответить, а модель — быть новее списка. Хранится короткий id (`sonnet`, `gpt-6-luna`) —
+     * то, что уходит в `--model`/`ANTHROPIC_MODEL`; название видно только в списке.
+     */
+    private class ModelField(private val role: Role) : ExtendableTextField(12) {
+        private var models: List<ModelCatalog.Model> = emptyList()
+
+        init {
+            addExtension(
+                ExtendableTextComponent.Extension.create(
+                    AllIcons.General.ArrowDown, AllIcons.General.ArrowDown, "Выбрать модель",
+                ) { showPopup() },
+            )
+        }
+
+        /** Подставить список харнеса, не трогая введённое. */
+        fun show(harness: Harness?, list: List<ModelCatalog.Model>) {
+            models = list
+            // Подсказка — модель, которая реально поедет, а не «по умолчанию»: так видно, что
+            // оставить поле пустым — тоже осознанный выбор.
+            emptyText.text = if (harness == Harness.CODEX) "из конфига Codex" else role.defaultModel
+            repaint()
+        }
+
+        private fun showPopup() {
+            if (models.isEmpty()) return
+            JBPopupFactory.getInstance()
+                .createPopupChooserBuilder(models)
+                .setRenderer(object : ColoredListCellRenderer<ModelCatalog.Model>() {
+                    override fun customizeCellRenderer(
+                        list: JList<out ModelCatalog.Model>, value: ModelCatalog.Model?, index: Int,
+                        selected: Boolean, focus: Boolean,
+                    ) {
+                        value ?: return
+                        append(value.displayName)
+                        if (value.displayName != value.id) append("  " + value.id, SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                        if (value.description.isNotBlank()) append("  " + value.description, SimpleTextAttributes.GRAYED_SMALL_ATTRIBUTES)
+                    }
+                })
+                .setItemChosenCallback { text = it.id }
+                .createPopup()
+                .showUnderneathOf(this)
+        }
     }
 
     /**
