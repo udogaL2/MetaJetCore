@@ -58,7 +58,7 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
                 )
             }
             row("Режим прав агентов:") {
-                comboBox(PERMISSION_MODES.keys.toList(), SimpleListCellRenderer.create("") { PERMISSION_MODES[it] ?: it })
+                comboBox(PERMISSION_MODES.keys.toList(), textRenderer { PERMISSION_MODES[it] ?: it })
                     .bindItem(settings::permissionMode.toNullableProperty())
                 contextHelp(
                     "Агента без режима прав никто не разблокирует: его вкладку не читают, и он " +
@@ -224,9 +224,19 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
         }
     }
 
-    private fun harnessRenderer() = SimpleListCellRenderer.create<Harness?> { label, value, _ ->
-        label.text = value?.displayName.orEmpty()
-        label.icon = value?.let { Terminal.agentIcon(it.key) }
+    // Подкласс, а не фабрика SimpleListCellRenderer.create: фабрики помечены устаревшими и
+    // уйдут из платформы, а customize — обычный абстрактный метод, его не тронут.
+    private fun harnessRenderer() = object : SimpleListCellRenderer<Harness?>() {
+        override fun customize(list: JList<out Harness?>, value: Harness?, index: Int, selected: Boolean, hasFocus: Boolean) {
+            text = value?.displayName.orEmpty()
+            icon = value?.let { Terminal.agentIcon(it.key) }
+        }
+    }
+
+    private fun textRenderer(text: (String) -> String) = object : SimpleListCellRenderer<String?>() {
+        override fun customize(list: JList<out String?>, value: String?, index: Int, selected: Boolean, hasFocus: Boolean) {
+            this.text = value?.let(text).orEmpty()
+        }
     }
 
     // ------------------------------------------------------------- модели
