@@ -20,19 +20,20 @@ dependencies {
         // Собираем против IntelliJ IDEA: используются только платформенные API,
         // поэтому плагин работает и в PyCharm, и в PhpStorm, и в остальных IDE на платформе.
         //
-        // 2026.2 — нижняя граница, и это осознанно: плагин работает с переработанным
+        // 2026.3 — нижняя граница, и это осознанно. Плагин работает с переработанным
         // терминалом (`TerminalToolWindowTabsManager`, `TerminalView.createSendTextBuilder`),
-        // которого в более ранних версиях просто нет. Поддерживать заодно и JediTerm-терминал
-        // значило бы тащить второй набор путей ради IDE, которыми мы не пользуемся.
+        // а список харнесов берёт у самой IDE (`TerminalAgent`, `terminalAgentProvider`) —
+        // этого API в 2026.2 нет. Держать заодно 262 значило бы вести второй набор путей:
+        // статический список харнесов, вкладки без `restoreOnProjectReopen` и т.п.
         //
         // Дистрибутив по умолчанию скачивается, но download.jetbrains.com доступен не
         // отовсюду (отвечает 451), а без него не собирается вообще ничего. Поэтому источник
-        // платформы можно подменить уже установленной IDE 262+: свойство `mjcLocalIde` в
+        // платформы можно подменить уже установленной IDE 263+: свойство `mjcLocalIde` в
         // ~/.gradle/gradle.properties или переменная MJC_LOCAL_IDE. В репозитории пути к
         // чужим машинам не место, отсюда и внешнее свойство.
         val localIde = providers.gradleProperty("mjcLocalIde")
             .orElse(providers.environmentVariable("MJC_LOCAL_IDE"))
-        if (localIde.isPresent) local(localIde) else intellijIdea("2026.2")
+        if (localIde.isPresent) local(localIde) else intellijIdea("2026.3")
 
         // Плагин терминала и его frontend-модуль нужны, чтобы тесты могли поднять настоящую
         // вкладку: без них в тестовой IDE терминала просто нет, и весь терминальный слой
@@ -67,7 +68,7 @@ intellijPlatform {
         version = project.version.toString()
 
         ideaVersion {
-            sinceBuild = "262"
+            sinceBuild = "263"
             // Верхней границы нет намеренно: плагин не должен отключаться при апгрейде IDE.
             // Это безопасно только потому, что нестабильные API дёргаются рефлексией и
             // деградируют, а не бросают NoClassDefFoundError.
