@@ -41,22 +41,38 @@ class ShellDialectTest {
     }
 
     @Test
-    fun `every dialect can exit the shell after the agent`() {
-        for (dialect in ShellDialect.entries) {
-            val tail = dialect.exitWhenDone()
-            // Хвост приписывается к готовой команде, поэтому обязан начинаться с
-            // разделителя: без него он склеился бы с последним аргументом запуска.
-            assertTrue("$dialect: $tail", tail.startsWith(";") || tail.startsWith(" &"))
-            assertTrue("$dialect: $tail", tail.endsWith("exit"))
-        }
+    fun `posix runs a simple command through exec in a login shell`() {
+        assertEquals(
+            listOf("/bin/zsh", "-l", "-i", "-c", "unset A; exec claude --agent mjc-impl"),
+            ShellDialect.POSIX.argv("/bin/zsh", "unset A; ", "claude --agent mjc-impl"),
+        )
     }
 
     @Test
-    fun `cmd separates commands with an ampersand`() {
-        assertEquals("; exit", ShellDialect.POSIX.exitWhenDone())
-        assertEquals("; exit", ShellDialect.POWERSHELL.exitWhenDone())
-        assertEquals("; exit", ShellDialect.FISH.exitWhenDone())
-        assertEquals(" & exit", ShellDialect.CMD.exitWhenDone())
+    fun `compound command is not prefixed with exec`() {
+        // exec приклеился бы к первой части, и `claude` не запустился бы вовсе.
+        val argv = ShellDialect.POSIX.argv("/bin/bash", "", "nvm use 20 && claude")
+        assertEquals("nvm use 20 && claude", argv.last())
+    }
+
+    @Test
+    fun `powershell and cmd get their own switches`() {
+        assertEquals(
+            listOf("pwsh", "-NoLogo", "-Command", "claude"),
+            ShellDialect.POWERSHELL.argv("pwsh", "", "claude"),
+        )
+        assertEquals(
+            listOf("cmd.exe", "/c", "set A= & claude"),
+            ShellDialect.CMD.argv("cmd.exe", "set A= & ", "claude"),
+        )
+    }
+
+    @Test
+    fun `simple command detection is conservative`() {
+        assertTrue(ShellDialect.isSimple("claude --agent mjc-impl --permission-mode acceptEdits"))
+        for (compound in listOf("a; b", "a && b", "a | b", "\$HOME/bin/claude", "a > log", "")) {
+            assertTrue(compound, !ShellDialect.isSimple(compound))
+        }
     }
 
     @Test

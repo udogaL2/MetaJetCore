@@ -31,23 +31,38 @@ class TabHandle(
     @Volatile
     var editorFile: VirtualFile? = null
 
+    /**
+     * Процесс вкладки — сам агент, запущенный плагином (NON_SHELL, см. [Terminal.openTab]).
+     *
+     * От этого зависит, можно ли его добить при закрытии. Агента, которого запустил плагин,
+     * — можно и нужно: окно не должно висеть. Вкладку, подхваченную по дереву процессов, —
+     * нельзя: её процесс это шелл разработчика, а не наш агент.
+     */
+    @Volatile
+    var ownsProcess: Boolean = false
+
     /** Тот же терминал под именем сессии, которую в нём нашли. */
     fun renamed(newName: String): TabHandle =
-        TabHandle(newName, tab, view, content).also { it.editorFile = editorFile }
+        TabHandle(newName, tab, view, content).also {
+            it.editorFile = editorFile
+            it.ownsProcess = ownsProcess
+        }
 }
 
 /** Что известно про процесс во вкладке: pid шелла и командная строка запуска. */
 data class TabProcess(val pid: Long?, val shellCommand: List<String>)
 
 /**
- * Терминал IDE, начиная с 2026.2 (переработанный движок).
+ * Терминал IDE, начиная с 2026.3 (переработанный движок).
  *
  * Работаем через `com.intellij.terminal.frontend.toolwindow.TerminalToolWindowTabsManager` —
  * это и есть API нового терминала. Поколения G1/G2 (JediTerm-виджеты `ShellTerminalWidget`,
  * `TerminalToolWindowManager.createLocalShellWidget`) выброшены: в 2026.2 первый путь бросает
  * `toShellJediTermWidgetOrThrow`, а второй отдаёт виджет, в который нечем печатать.
+ * Нижняя граница — 2026.3: там появились API агентов терминала и NON_SHELL-вкладки с
+ * `restoreOnProjectReopen`, на которых держится запуск агентов.
  *
- * Почему рефлексия, если плагин и так собирается против 2026.2: классы модуля помечены
+ * Почему рефлексия, если плагин и так собирается против 2026.3: классы модуля помечены
  * `@ApiStatus.Experimental`, сигнатуры между версиями меняются. Прямой вызов при смене
  * сигнатуры даёт NoSuchMethodError в рантайме, рефлексия — null и переход в ручной режим.
  * Зависимость на модуль в plugin.xml нужна только чтобы classloader вообще видел эти классы.
@@ -60,6 +75,9 @@ object Terminal {
     private const val TABS_MANAGER = "com.intellij.terminal.frontend.toolwindow.TerminalToolWindowTabsManager"
     private const val VIEW_KT = "com.intellij.terminal.frontend.view.TerminalViewKt"
     private const val TERMINAL_VIEW_FILE = "com.intellij.terminal.frontend.editor.TerminalViewVirtualFile"
+    private const val PROCESS_TYPE = "org.jetbrains.plugins.terminal.startup.TerminalProcessType"
+    private const val TERMINAL_AGENT = "org.jetbrains.plugins.terminal.agent.TerminalAgent"
+    private const val OPTIONS_PROVIDER = "org.jetbrains.plugins.terminal.TerminalOptionsProvider"
 
     /** Сколько символов экрана отдаём наружу: больше оркестратору не нужно, а контекст дорог. */
     private const val SCREEN_LIMIT = 4_000L
@@ -67,11 +85,25 @@ object Terminal {
     fun isAvailable(project: Project): Boolean = manager(project) != null
 
     /**
-     * Новая вкладка с шеллом.
+     * Новая вкладка терминала.
      *
      * Переменные окружения уезжают через API билдера, а не внутри печатаемой строки: так
-     * отпадают экранирование, кавычки и разница диалектов шеллов. В командной строке остаётся
-     * только то, что окружением задать нельзя, — роль и режим прав.
+     * отпадают экранирование, кавычки и разница диалектов шеллов.
+     *
+     * [command] задан — вкладка запускает **этот процесс вместо интерактивного шелла**
+     * (`processType(NON_SHELL)` + `shellCommand`). Ровно так 2026.3 сама открывает Claude Code и
+     * Codex из меню терминала (`TerminalAgentsSupportKt.launchTerminalAgent`), и это решает
+     * сразу три старые беды:
+     *  - argv уходит в API создания процесса, а не печатается в pty — кодировка JVM его не
+     *    портит, ограничение «только ASCII» для строки запуска снимается;
+     *  - процесс вкладки — сам агент: он умер — вкладка закрылась (`closeOnProcessTermination`),
+     *    и в тулвиндоу, и в editor area (`TerminalViewFileEditor` закрывает себя сам ровно по
+     *    этому флагу вкладки; при `false` окно редактора висело с мёртвым терминалом);
+     *  - нет шелла, который пережил бы агента, значит нет и модального «в терминале что-то
+     *    запущено» при закрытии.
+     *
+     * [command] не задан — обычная вкладка с шеллом (оркестратор, ручной режим): её закрывает
+     * человек, и после выхода из claude он обычно остаётся в шелле.
      */
     fun openTab(
         project: Project,
@@ -79,27 +111,100 @@ object Terminal {
         workingDirectory: Path,
         env: Map<String, String>,
         requestFocus: Boolean = false,
+        command: List<String>? = null,
     ): TabHandle? {
         val manager = manager(project) ?: return null
         return try {
             val builder = call(manager, "createTabBuilder") ?: return null
             chain(builder, "tabName", String::class.java, name)
+            // Иначе заголовок вкладки переписывается заголовком процесса (claude ставит свой),
+            // а по заголовку мы находим вкладку, когда она не в нашей карте.
+            chain(builder, "userDefinedName", java.lang.Boolean.TYPE, true)
             chain(builder, "workingDirectory", String::class.java, workingDirectory.toString())
             chain(builder, "envVariables", Map::class.java, env)
             chain(builder, "requestFocus", java.lang.Boolean.TYPE, requestFocus)
             // Сессия должна стартовать сразу: мы ждём появления записи в реестре, а вкладка
             // может быть не показана, если разработчик смотрит в другую.
             chain(builder, "deferSessionStartUntilUiShown", java.lang.Boolean.TYPE, false)
-            // Вкладка остаётся после выхода claude: иначе при падении агента исчезнет и текст
-            // ошибки, а именно он нужен для разбора.
-            chain(builder, "closeOnProcessTermination", java.lang.Boolean.TYPE, false)
+            if (command != null) {
+                processType("NON_SHELL")?.let { chain(builder, "processType", it.javaClass, it) }
+                chain(builder, "shellCommand", List::class.java, command)
+                chain(builder, "closeOnProcessTermination", java.lang.Boolean.TYPE, true)
+                // 2026.3 восстанавливает вкладки при повторном открытии проекта. Агента это не
+                // вернёт — вернётся пустой процесс без сессии и роли, то есть мусор на экране.
+                chain(builder, "restoreOnProjectReopen", java.lang.Boolean.TYPE, false)
+            } else {
+                chain(builder, "closeOnProcessTermination", java.lang.Boolean.TYPE, false)
+            }
 
             val tab = call(builder, "createTab") ?: return null
-            handleOf(name, tab)
+            handleOf(name, tab)?.also { it.ownsProcess = command != null }
         } catch (e: Throwable) {
             log.warn("MetaJetCore: не удалось открыть вкладку терминала", e)
             null
         }
+    }
+
+    /** Константа enum `TerminalProcessType` по имени; null — в этой версии API её нет. */
+    private fun processType(name: String): Any? =
+        loadClass(PROCESS_TYPE)?.enumConstants?.firstOrNull { (it as Enum<*>).name == name }
+
+    /**
+     * Иконка агента на вкладке — та же, что ставит сама IDE (`TerminalAgent.icon`).
+     *
+     * Список агентов терминала — API 2026.3 (`terminalAgentProvider`). Не нашёлся агент или
+     * API сменилось — вкладка просто останется без иконки. Ключ — `agentKey` IDE:
+     * `claude_code`, `codex`.
+     */
+    fun setAgentIcon(handle: TabHandle, agentKey: String) {
+        try {
+            val agent = terminalAgents().firstOrNull { agentKeyOf(it) == agentKey } ?: return
+            val icon = call(agent, "getIcon") as? javax.swing.Icon ?: return
+            handle.content?.icon = icon
+        } catch (e: Throwable) {
+            log.debug("MetaJetCore: иконку агента '$agentKey' поставить не вышло", e)
+        }
+    }
+
+    /** Агенты, которых знает терминал IDE. Пусто — API сменилось. */
+    fun terminalAgents(): List<Any> = try {
+        loadClass(TERMINAL_AGENT)?.methods
+            ?.firstOrNull { it.name == "getAllTerminalAgents" && it.parameterCount == 0 }
+            ?.invoke(null)
+            .let { (it as? Collection<*>)?.filterNotNull() ?: emptyList() }
+    } catch (e: Throwable) {
+        log.debug("MetaJetCore: список агентов терминала недоступен", e)
+        emptyList()
+    }
+
+    /**
+     * `agentKey` агента. Это Kotlin value class, поэтому геттер в байткоде с суффиксом
+     * манглинга (`getAgentKey-LamVg8w`) и возвращает уже распакованную строку. Суффикс между
+     * версиями может смениться — ищем по префиксу.
+     */
+    fun agentKeyOf(agent: Any): String? = try {
+        agent.javaClass.methods
+            .firstOrNull { it.name.startsWith("getAgentKey") && it.parameterCount == 0 }
+            ?.also { it.isAccessible = true }
+            ?.invoke(agent)?.toString()
+    } catch (_: Throwable) {
+        null
+    }
+
+    /**
+     * Шелл, который IDE открывает во вкладках, — из настроек терминала.
+     *
+     * Пустая настройка — обычное дело: тогда IDE берёт `$SHELL`, и мы тоже.
+     */
+    fun configuredShellPath(project: Project): String? = try {
+        val cls = loadClass(OPTIONS_PROVIDER)
+        val provider = cls?.methods?.firstOrNull { it.name == "getInstance" && it.parameterCount == 0 }
+            ?.invoke(null)
+            ?: cls?.let { c -> runCatching { c.getField("Companion").get(null) }.getOrNull() }
+                ?.let { call(it, "getInstance") }
+        (provider?.let { call(it, "getShellPath") } as? String)?.takeIf { it.isNotBlank() }
+    } catch (_: Throwable) {
+        null
     }
 
     /** Хендл по объекту вкладки платформы. */
@@ -123,23 +228,22 @@ object Terminal {
      * Editor плагин переставал видеть её вовсе). Между тем именно там по дизайну живёт
      * оркестратор — то есть без этого мы не находим ровно того, кого ищем чаще всего.
      *
-     * Терминал в редакторе — это `TerminalViewVirtualFile` с публичным `getTerminalView()`,
-     * поэтому перечисляем открытые файлы и забираем view оттуда.
+     * Терминал в редакторе — это `TerminalViewVirtualFile`, за которым стоит та же вкладка
+     * платформы (`getTab()`), поэтому перечисляем открытые файлы и берём вкладку оттуда.
+     * Одна вкладка не должна попасть в список дважды — отсюда дедупликация по объекту.
      */
     fun handles(project: Project): List<TabHandle> {
         val result = ArrayList<TabHandle>()
-        for (tab in tabs(project)) {
-            handleOf(titleOf(tab).orEmpty(), tab)?.let { result.add(it) }
-        }
-        for ((file, view) in editorViews(project)) {
-            val handle = TabHandle(
-                name = file.name,
-                tab = null,
-                view = view,
-                content = null,
-            )
+        val seen = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<Any, Boolean>())
+        for ((file, tab) in editorTabs(project)) {
+            val handle = handleOf(file.name, tab) ?: continue
             handle.editorFile = file
+            seen.add(tab)
             result.add(handle)
+        }
+        for (tab in tabs(project)) {
+            if (tab in seen) continue
+            handleOf(titleOf(tab).orEmpty(), tab)?.let { result.add(it) }
         }
         return result
     }
@@ -155,7 +259,15 @@ object Terminal {
         null
     }
 
-    private fun editorViews(project: Project): List<Pair<VirtualFile, Any>> {
+    /**
+     * Терминалы, открытые в editor area: файл редактора и вкладка платформы за ним.
+     *
+     * `TerminalViewVirtualFile` отдаёт вкладку методом `getTab()` — и только им. Прежний код
+     * искал `getTerminalView()`, которого нет ни в 2026.2, ни в 2026.3 (сверено по jar-ам), поэтому
+     * терминалы в редакторе плагин не видел вовсе: оркестратор, перенесённый туда руками, не
+     * находился, и агент уезжал в тулвиндоу вместо соседней вкладки.
+     */
+    private fun editorTabs(project: Project): List<Pair<VirtualFile, Any>> {
         val files = try {
             FileEditorManager.getInstance(project).openFiles
         } catch (e: Throwable) {
@@ -163,13 +275,42 @@ object Terminal {
             return emptyList()
         }
         return files.mapNotNull { file ->
-            if (file.javaClass.name != TERMINAL_VIEW_FILE) {
-                null
-            } else {
-                call(file, "getTerminalView")?.let { view -> file to view }
-            }
+            if (file.javaClass.name != TERMINAL_VIEW_FILE) null
+            else call(file, "getTab")?.let { tab -> file to tab }
         }
     }
+
+    /**
+     * Файл editor area, под которым сейчас открыта вкладка, или null — она в тулвиндоу.
+     *
+     * Ищем по самой вкладке, а не по выбранному редактору после переноса: выбор к этому
+     * моменту мог уйти куда угодно (мы сами возвращаем его на оркестратора).
+     */
+    fun editorFileOf(project: Project, handle: TabHandle): VirtualFile? {
+        if (handle.tab == null) return handle.editorFile
+        return editorTabs(project).firstOrNull { isSameTab(it.second, handle) }?.first
+    }
+
+    /**
+     * Открыта ли вкладка где-нибудь — в тулвиндоу или в editor area.
+     *
+     * Присутствие в тулвиндоу смотрим по `Content` в его менеджере, а не по списку
+     * `getTabs()`: сверка с этим списком по объекту вкладки на 263 не срабатывала, и
+     * вкладка считалась закрытой, оставаясь на экране.
+     */
+    fun isOpen(project: Project, handle: TabHandle): Boolean {
+        val content = handle.content
+        if (content != null) {
+            val manager = content.manager
+            if (manager != null && manager.getIndexOfContent(content) >= 0) return true
+        }
+        if (editorFileOf(project, handle) != null) return true
+        return handle.tab == null && handle.editorFile?.let { FileEditorManager.getInstance(project).isFileOpen(it) } == true
+    }
+
+    /** Та же вкладка: по объекту или по её view — обёртки платформы бывают разными объектами. */
+    private fun isSameTab(candidate: Any, handle: TabHandle): Boolean =
+        candidate === handle.tab || call(candidate, "getView") === handle.view
 
     /**
      * Swing-компонент вкладки. По нему находится окно editor area, в котором она показана:
@@ -201,24 +342,40 @@ object Terminal {
 
     fun isRunning(handle: TabHandle): Boolean = state(handle) == "Running"
 
-    /** Процесс во вкладке завершился. Вкладка при этом остаётся: см. openTab. */
+    /**
+     * Процесс во вкладке завершился. Вкладка с шеллом при этом остаётся, вкладка агента
+     * закрывается сама — см. [openTab].
+     */
     fun isTerminated(handle: TabHandle): Boolean = state(handle) == "Terminated"
 
     /**
-     * Остались ли во вкладке живые дочерние процессы.
+     * Жив ли процесс вкладки или кто-то из его потомков.
      *
-     * Нужно перед закрытием вкладки: платформа предупреждает «в терминале что-то запущено»
-     * не только про сам процесс вкладки, но и про его детей, а предупреждение это
-     * модальное — см. `ShellDialect.exitWhenDone`.
-     *
-     * null — признак недоступен (метода нет в этой версии API). Трактовать его как «детей
-     * нет» нельзя: это ровно тот случай, когда мы не знаем, и решает тогда состояние
-     * сессии.
+     * Через `ProcessHandle` JDK, а не `TerminalView.hasChildProcesses`: тот — suspend-функция,
+     * рефлексией без continuation не вызывается, и прежняя проверка всегда возвращала null.
+     * null — pid вкладки неизвестен.
      */
-    fun hasChildProcesses(handle: TabHandle): Boolean? = try {
-        call(handle.view, "hasChildProcesses") as? Boolean
-    } catch (_: Throwable) {
-        null
+    fun isProcessTreeAlive(handle: TabHandle): Boolean? {
+        val pid = process(handle)?.pid ?: return null
+        val root = ProcessHandle.of(pid).orElse(null) ?: return false
+        return root.isAlive || root.descendants().anyMatch { it.isAlive }
+    }
+
+    /**
+     * Добить процесс вкладки вместе с потомками: сначала мягко, потом принудительно.
+     *
+     * Только для процессов, которые запустил плагин ([TabHandle.ownsProcess]): после `/exit`
+     * сессия уже ушла из реестра, и висящее окно — это хвост вроде зависшего потомка.
+     */
+    fun killProcessTree(handle: TabHandle, graceMs: Long): Boolean {
+        val pid = process(handle)?.pid ?: return false
+        val root = ProcessHandle.of(pid).orElse(null) ?: return true
+        val all = root.descendants().toList() + root
+        all.forEach { it.destroy() }
+        val deadline = System.currentTimeMillis() + graceMs
+        while (System.currentTimeMillis() < deadline && all.any { it.isAlive }) Thread.sleep(100)
+        all.filter { it.isAlive }.forEach { it.destroyForcibly() }
+        return all.none { it.isAlive }
     }
 
     /**
@@ -304,26 +461,29 @@ object Terminal {
         null
     }
 
+    /**
+     * Закрыть вкладку, где бы она ни была.
+     *
+     * Сначала editor area, потом тулвиндоу, и порядок важен: вкладку, перенесённую в
+     * редактор, `closeTab` менеджера не убирает — окно редактора оставалось висеть с мёртвым
+     * терминалом. Это и был симптом «агент завершился, а окно осталось».
+     */
     fun closeTab(project: Project, handle: TabHandle): Boolean = try {
+        val file = editorFileOf(project, handle)
+        if (file != null) {
+            FileEditorManager.getInstance(project).closeFile(file)
+        }
         val tab = handle.tab
-        val file = handle.editorFile
         val manager = manager(project)
-        val close = manager?.javaClass?.methods?.firstOrNull {
-            it.name == "closeTab" && it.parameterCount == 1
+        // Вкладку тулвиндоу закрываем, если файлом редактора она не закрылась: после
+        // closeFile её Content уже снят, и второй вызов был бы лишним.
+        if (tab != null && manager != null && (file == null || isOpen(project, handle))) {
+            manager.javaClass.methods
+                .firstOrNull { it.name == "closeTab" && it.parameterCount == 1 }
+                ?.also { it.isAccessible = true }
+                ?.invoke(manager, tab)
         }
-        when {
-            tab != null && close != null -> {
-                close.isAccessible = true
-                close.invoke(manager, tab)
-                true
-            }
-            // Терминал в editor area — это открытый файл, и закрывается он как файл.
-            file != null -> {
-                FileEditorManager.getInstance(project).closeFile(file)
-                true
-            }
-            else -> false
-        }
+        file != null || tab != null
     } catch (e: Throwable) {
         log.warn("MetaJetCore: не удалось закрыть вкладку '${handle.name}'", e)
         false

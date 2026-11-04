@@ -175,40 +175,41 @@ class AgentManager(private val project: Project) {
             return SpawnResult.Manual(manualCommand, "терминальное API IDE недоступно")
         }
 
+        // Агент — сам процесс вкладки, а не строка, напечатанная в шелл (см. Terminal.openTab).
+        // Поэтому ни ожидания приглашения шелла, ни печати: argv уходит в API создания
+        // процесса, вкладка закроется сама, когда агент завершится.
+        val argv = runOnEdt { launchArgv(role) }
         val handle = runOnEdt {
             Terminal.openTab(
                 project = project,
                 name = name,
                 workingDirectory = projectDirectory(),
                 env = agentEnv(role, name, model, parent, parentSession),
-            )?.also { child -> TabPlacement.placeNear(project, parentTab?.handle, child) }
+                command = argv,
+            )?.also { child ->
+                Terminal.setAgentIcon(child, CLAUDE_AGENT_KEY)
+                TabPlacement.placeNear(project, parentTab?.handle, child)
+            }
         } ?: return SpawnResult.Manual(manualCommand, "не удалось открыть вкладку терминала")
 
         tabs[name] = handle
 
-        if (!awaitTabRunning(handle)) {
-            return SpawnResult.Manual(
-                manualCommand,
-                "шелл во вкладке не поднялся за ${TAB_READY_TIMEOUT_MS / 1000} c",
-            )
-        }
-
-        // Диалект — по фактической командной строке шелла этой вкладки. Настройка терминала
-        // у большинства пуста, а окружение процесса IDE описывает не тот шелл, который IDE
-        // открывает во вкладке: раньше на этом в PowerShell уезжал синтаксис cmd.
-        val shell = ShellDialect.detect(runOnEdt { Terminal.process(handle) }?.shellCommand?.firstOrNull())
-        val line = launchLine(role, shell)
-
-        if (!runOnEdt { Terminal.send(handle, line, execute = true) }) {
-            return SpawnResult.Manual(manualCommand, "вкладка открыта, но команду напечатать не удалось")
-        }
-
-        val record = awaitSession(name)
-            ?: return SpawnResult.Manual(
+        val record = when (val ready = awaitSession(name, handle)) {
+            is Readiness.Ready -> ready.record
+            Readiness.Exited -> {
+                tabs.remove(name)
+                return SpawnResult.Manual(
+                    manualCommand,
+                    "процесс агента завершился до регистрации сессии; проверь команду запуска " +
+                        "в настройках плагина (запускалось: ${argv.joinToString(" ")})",
+                )
+            }
+            Readiness.Timeout -> return SpawnResult.Manual(
                 manualCommand,
                 "сессия не появилась в реестре за ${settings.readyTimeoutSeconds} c; " +
-                    "проверь команду запуска в настройках плагина",
+                    "посмотри экран вкладки (read_tab) и команду запуска в настройках плагина",
             )
+        }
 
         // Имя могло измениться: при коллизии Claude Code переименовывает сессию в вариант.
         val actualName = record.name ?: name
@@ -239,31 +240,38 @@ class AgentManager(private val project: Project) {
     // ------------------------------------------------------------- lifecycle
 
     /**
-     * Мягкое завершение: `/exit`, дождаться исчезновения из реестра, дождаться смерти
-     * процесса вкладки и только тогда её закрыть.
+     * Мягкое завершение: `/exit`, дождаться исчезновения из реестра и закрытия вкладки.
      *
-     * Последний шаг не перестраховка. `closeTab` на вкладке с живым процессом показывает
-     * модальный вопрос «в терминале что-то запущено, точно закрыть?», а вызываем мы его под
-     * `invokeAndWait` — то есть диалог блокирует поток MCP-запроса, и оркестратор ждёт не
-     * IDE, а человека. Поэтому закрытие зовётся только там, где спрашивать не о чем.
+     * Вкладка агента, запущенного плагином, закрывается сама: её процесс — сам агент, и
+     * вкладка создана с `closeOnProcessTermination` (см. `Terminal.openTab`). Дальше только
+     * страховка, и порядок в ней важен:
+     *  1. процесс не умер за таймаут — добиваем дерево процессов. Сессия к этому моменту
+     *     уже ушла из реестра, значит висит хвост, а не работа;
+     *  2. вкладка ещё на экране — закрываем явно, и в editor area, и в тулвиндоу. Процесс
+     *     мёртв, поэтому модального «в терминале что-то запущено» не будет: под
+     *     `invokeAndWait` такой диалог заблокировал бы поток MCP-запроса.
      *
-     * Нормальный путь до диалога не доходит: строка запуска содержит хвостовой выход из
-     * шелла (`ShellDialect.exitWhenDone`), так что вместе с агентом умирает и процесс
-     * вкладки. Ветка [CloseResult.TabLeftOpen] остаётся для вкладок, которые плагин не
-     * запускал (подхваченных по дереву процессов, перезапущенных руками), и для агента,
-     * оставившего после себя живого потомка.
+     * Вкладку, которую плагин не запускал (подхвачена по дереву процессов), не добиваем: там
+     * процесс — шелл разработчика. Если он жив, отвечаем [CloseResult.TabLeftOpen].
      */
     fun close(rawName: String): CloseResult {
         // Имя нормализуем один раз здесь: дальше оно уходит и в реестр, и в обе карты,
         // и расхождение между ними означало бы вкладку-сироту.
         val name = canonicalName(rawName)
         val handle = tabFor(name) ?: return CloseResult.UnknownTab
-        runOnEdt { Terminal.send(handle, "/exit", execute = true) }
+        if (runOnEdt { Terminal.isOpen(project, handle) }) {
+            runOnEdt { Terminal.send(handle, "/exit", execute = true) }
+        }
         awaitSessionGone(name)
         // Управлять больше нечем: сессии нет. Дальше речь только об уборке вкладки.
         spawned.remove(name)
 
-        if (!awaitTabDead(handle)) {
+        var dead = awaitTabDead(handle)
+        if (!dead && handle.ownsProcess) {
+            log.warn("MetaJetCore: процесс агента '$name' не завершился после /exit — завершаем дерево")
+            dead = Terminal.killProcessTree(handle, KILL_GRACE_MS)
+        }
+        if (!dead) {
             // Вкладку намеренно оставляем под управлением: read_tab по ней ещё работает, а
             // именно её экран объясняет, почему процесс не завершился.
             return CloseResult.TabLeftOpen(
@@ -273,7 +281,9 @@ class AgentManager(private val project: Project) {
             )
         }
 
-        runOnEdt { Terminal.closeTab(project, handle) }
+        // Сама вкладка закрывается асинхронно, вслед за смертью процесса. Даём ей это
+        // сделать, а если не успела — закрываем сами: процесса уже нет, спрашивать не о чем.
+        if (!awaitTabClosed(handle)) runOnEdt { Terminal.closeTab(project, handle) }
         tabs.remove(name)
         return CloseResult.Closed
     }
@@ -398,7 +408,26 @@ class AgentManager(private val project: Project) {
     }
 
     /** Имена вкладок, которые ведёт плагин, — включая те, где спавн не доехал. */
-    fun knownTabs(): Set<String> = tabs.keys.toSet()
+    fun knownTabs(): Set<String> {
+        forgetClosedTabs()
+        return tabs.keys.toSet()
+    }
+
+    /**
+     * Забыть вкладки агентов, которые закрылись сами — агент вышел по `/exit` изнутри или
+     * упал. Вкладка в этом случае исчезает без нашего участия (`closeOnProcessTermination`),
+     * и держать на неё ссылку значило бы показывать в `list_agents` «управляемого» агента,
+     * которого нет. Вкладки с шеллом (оркестратор) не трогаем: их закрывает человек.
+     */
+    private fun forgetClosedTabs() {
+        val owned = tabs.filterValues { it.ownsProcess }
+        if (owned.isEmpty()) return
+        val closed = runOnEdt { owned.filterValues { !Terminal.isOpen(project, it) }.keys }
+        for (name in closed) {
+            tabs.remove(name)
+            spawned.remove(name)
+        }
+    }
 
     /**
      * Состояние терминала для диагностики.
@@ -418,8 +447,8 @@ class AgentManager(private val project: Project) {
     /**
      * Запустить обычную сессию Claude Code в уже открытой вкладке — без роли и без флагов.
      *
-     * Хвостового выхода из шелла (`ShellDialect.exitWhenDone`) здесь намеренно нет, хотя в
-     * строке запуска агентов он есть. Это вкладка оркестратора: её закрывает человек, а не
+     * Агенты запускаются процессом вкладки (NON_SHELL), а оркестратор — строкой в обычном
+     * шелле, и намеренно. Это вкладка оркестратора: её закрывает человек, а не
      * `close_agent`, и после выхода из claude он обычно остаётся в шелле — например чтобы
      * запустить сессию заново.
      *
@@ -457,8 +486,9 @@ class AgentManager(private val project: Project) {
         else list().filter { it.role == role }
 
     /** Живые сессии в директории проекта, обогащённые тем, что плагин знает про вкладки. */
-    fun list(): List<AgentInfo> =
-        SessionRegistry.inDirectory(projectDirectory()).map { record ->
+    fun list(): List<AgentInfo> {
+        forgetClosedTabs()
+        return SessionRegistry.inDirectory(projectDirectory()).map { record ->
             val name = record.name.orEmpty()
             val known = spawned[name]
             AgentInfo(
@@ -471,6 +501,7 @@ class AgentManager(private val project: Project) {
                 managed = tabs.containsKey(name),
             )
         }
+    }
 
     // ------------------------------------------------------------- internals
 
@@ -548,16 +579,23 @@ class AgentManager(private val project: Project) {
     )
 
     /**
-     * Строка, которую плагин печатает во вкладку. Только ASCII и только то, что нельзя
-     * задать окружением.
+     * argv процесса вкладки агента: шелл IDE, который снимет унаследованные маркеры и
+     * запустит команду с флагами (см. [ShellDialect.argv]).
+     *
+     * Шелл — из настроек терминала IDE, а не из окружения процесса IDE: вкладку, в которой
+     * разработчик набрал бы команду сам, IDE открыла бы именно им. Раньше диалект брали из
+     * `ComSpec`, и в PowerShell уезжал синтаксис cmd.
      *
      * Роль — флагом `--agent`: через `CLAUDE_CODE_AGENT` она пишется в реестр, но не
      * применяется (проверено). Режим прав — флагом `--permission-mode`: `permissions.
      * defaultMode` из настроек проекта Claude Code игнорирует, а без режима агент встанет на
      * первом же запросе прав во вкладке, которую никто не читает.
      */
-    internal fun launchLine(role: Role, shell: ShellDialect): String =
-        shell.unsetNames(inheritedMarkers()) + commandWithFlags(role) + shell.exitWhenDone()
+    internal fun launchArgv(role: Role): List<String> {
+        val shellPath = Terminal.configuredShellPath(project) ?: ShellDialect.defaultShell()
+        val dialect = ShellDialect.detect(shellPath)
+        return dialect.argv(shellPath, dialect.unsetNames(inheritedMarkers()), commandWithFlags(role))
+    }
 
     private fun commandWithFlags(role: Role): String {
         val roleFlag = " --agent ${RoleInstaller.agentName(role)}"
@@ -579,9 +617,6 @@ class AgentManager(private val project: Project) {
      * Форма присваиваний — POSIX: команда предназначена человеку, а он выполнит её в том
      * шелле, где ему удобно. Для полностью корректного ручного запуска есть
      * `scripts/spawn-agent.sh`.
-     *
-     * Хвостового выхода из шелла здесь тоже нет: он существует ради автоматического
-     * закрытия вкладки, а человеку закрыл бы его собственный шелл.
      */
     internal fun manualCommand(
         role: Role,
@@ -623,7 +658,7 @@ class AgentManager(private val project: Project) {
             .sorted()
     }
 
-    /** Ждём, пока во вкладке поднимется шелл: до этого печатать бессмысленно. */
+    /** Ждём, пока во вкладке поднимется шелл: до этого печатать бессмысленно. Для вкладки с шеллом. */
     private fun awaitTabRunning(handle: TabHandle): Boolean {
         val deadline = System.currentTimeMillis() + TAB_READY_TIMEOUT_MS
         while (System.currentTimeMillis() < deadline) {
@@ -633,36 +668,61 @@ class AgentManager(private val project: Project) {
         return false
     }
 
-    private fun awaitSession(name: String): SessionRecord? {
+    private sealed interface Readiness {
+        data class Ready(val record: SessionRecord) : Readiness
+        data object Exited : Readiness
+        data object Timeout : Readiness
+    }
+
+    /**
+     * Ждём запись сессии в реестре — либо смерти процесса вкладки, что раньше.
+     *
+     * Появление записи означает, что claude поднялся и забиндил inbox-сокет, то есть готов
+     * и к вводу, и к межсессионным сообщениям. Таймер вместо этого признака флакует: обёртка
+     * может стартовать долго. Смерть процесса до регистрации — это ошибка запуска (команды
+     * нет, обёртка упала), и ждать полный таймаут ради неё незачем.
+     */
+    private fun awaitSession(name: String, handle: TabHandle): Readiness {
         val deadline = System.currentTimeMillis() + settings.readyTimeoutSeconds * 1000L
         while (System.currentTimeMillis() < deadline) {
-            SessionRegistry.findByName(name)?.let { return it }
-            // Появление записи в реестре означает, что claude поднялся и забиндил
-            // inbox-сокет, то есть готов и к вводу, и к межсессионным сообщениям.
-            // Таймер вместо этого признака флакует: обёртка может стартовать долго.
+            SessionRegistry.findByName(name)?.let { return Readiness.Ready(it) }
+            val exited = runOnEdt { Terminal.isTerminated(handle) || !Terminal.isOpen(project, handle) }
+            if (exited) {
+                // Запись могла появиться в последний момент: агент поднялся и сразу вышел.
+                return SessionRegistry.findByName(name)?.let { Readiness.Ready(it) } ?: Readiness.Exited
+            }
             Thread.sleep(POLL_INTERVAL_MS)
         }
-        return null
+        return Readiness.Timeout
     }
 
     /**
      * Ждём, пока во вкладке не останется живого процесса: ни самой сессии, ни её потомков.
      *
-     * Признак основной — состояние сессии вкладки. `hasChildProcesses` добавлен как второй:
-     * агент мог оставить после себя живой процесс, и тогда платформа спросит подтверждение
-     * даже при мёртвой сессии. Недоступный признак (null) не считаем отрицательным ответом —
-     * решает тогда состояние сессии.
+     * Признак основной — состояние сессии вкладки. Дерево процессов по pid — второй:
+     * агент мог оставить после себя живого потомка, и тогда платформа спросит подтверждение
+     * даже при мёртвой сессии. Неизвестный pid (null) не считаем живым — решает тогда
+     * состояние сессии.
      */
     private fun awaitTabDead(handle: TabHandle): Boolean {
         val deadline = System.currentTimeMillis() + tabDeadTimeoutMs
         while (System.currentTimeMillis() < deadline) {
-            val dead = runOnEdt {
-                Terminal.isTerminated(handle) && Terminal.hasChildProcesses(handle) != true
-            }
+            val dead = runOnEdt { Terminal.isTerminated(handle) } &&
+                Terminal.isProcessTreeAlive(handle) != true
             if (dead) return true
             Thread.sleep(POLL_INTERVAL_MS)
         }
         log.warn("MetaJetCore: во вкладке '${handle.name}' остался живой процесс после /exit")
+        return false
+    }
+
+    /** Вкладка агента закрывается сама вслед за процессом — но не мгновенно. */
+    private fun awaitTabClosed(handle: TabHandle): Boolean {
+        val deadline = System.currentTimeMillis() + TAB_CLOSE_TIMEOUT_MS
+        while (System.currentTimeMillis() < deadline) {
+            if (!runOnEdt { Terminal.isOpen(project, handle) }) return true
+            Thread.sleep(POLL_INTERVAL_MS)
+        }
         return false
     }
 
@@ -709,6 +769,11 @@ class AgentManager(private val project: Project) {
         const val POLL_INTERVAL_MS = 250L
         const val EXIT_TIMEOUT_MS = 15_000L
         const val TAB_READY_TIMEOUT_MS = 20_000L
+        const val TAB_CLOSE_TIMEOUT_MS = 3_000L
+        const val KILL_GRACE_MS = 3_000L
+
+        /** `agentKey` Claude Code в списке агентов терминала IDE — для иконки вкладки. */
+        const val CLAUDE_AGENT_KEY = "claude_code"
 
         /**
          * Хвост, которым `ListAgents` дописывает к имени сессии её ref: `имя [815818]`.

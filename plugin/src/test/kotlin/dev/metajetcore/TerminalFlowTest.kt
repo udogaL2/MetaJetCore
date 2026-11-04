@@ -1,5 +1,7 @@
 package dev.metajetcore
 
+import com.intellij.openapi.ui.TestDialog
+import com.intellij.openapi.ui.TestDialogManager
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import dev.metajetcore.agents.AgentManager
 import dev.metajetcore.agents.CloseResult
@@ -38,6 +40,12 @@ class TerminalFlowTest : BasePlatformTestCase() {
         manager = project.getService(AgentManager::class.java)
 
         FlowSupport.registerTerminalToolWindow(project, testRootDisposable)
+        // Вкладки с шеллом (проба, «руками запущенная», «застрявшая») тест закрывает при
+        // живом шелле. Если у шелла есть фоновый потомок — у zsh с плагинами это обычное
+        // дело, — платформа спрашивает «завершить процесс?», а тестовый диалог по умолчанию
+        // на это бросает. Отвечаем так, как ответил бы человек. Код плагина этот диалог не
+        // встречает: вкладку с живым чужим процессом он не закрывает (см. TabLeftOpen).
+        TestDialogManager.setTestDialog(TestDialog.OK)
         agent = FlowSupport.useFakeAgent(project)
     }
 
@@ -49,6 +57,7 @@ class TerminalFlowTest : BasePlatformTestCase() {
             SessionRegistry.directoryOverride = null
             SessionRegistry.isProcessAlive = SessionRegistry.defaultLivenessCheck
             settings.launchCommand = "claude"
+            TestDialogManager.setTestDialog(TestDialog.DEFAULT)
         } finally {
             super.tearDown()
         }
@@ -96,8 +105,8 @@ class TerminalFlowTest : BasePlatformTestCase() {
         // Экран вкладки читается — это единственный способ увидеть зависшего агента.
         assertNotNull("экран не прочитан", onPooledThreadPumpingEdt { manager.readScreen(name) })
 
-        // Закрытие: /exit доезжает, агент убирает свою запись, шелл гаснет вместе с ним,
-        // вкладка закрывается без модального вопроса про запущенный процесс.
+        // Закрытие: /exit доезжает, агент убирает свою запись и завершается, вкладка
+        // закрывается вместе с ним без модального вопроса про запущенный процесс.
         assertEquals(
             "close не прошёл",
             CloseResult.Closed,
@@ -105,6 +114,45 @@ class TerminalFlowTest : BasePlatformTestCase() {
         )
         assertNull("запись осталась в реестре", SessionRegistry.findByName(name))
         assertFalse("вкладка осталась под управлением", manager.knownTabs().contains(name))
+    }
+
+    fun testTabClosesWhenTheAgentExitsByItself() {
+        // Агент вышел сам — по /exit изнутри или упал. Процесс вкладки и есть агент, поэтому
+        // вкладка обязана закрыться без close_agent, а плагин — забыть её: иначе на экране
+        // висит окно с мёртвым терминалом, а list_agents врёт про «управляемого» агента.
+        val name = spawnResearcher("self")
+        val handle = Terminal.handles(project).firstOrNull { it.name == name }
+        // Выход «изнутри»: строка уходит прямо во вкладку, мимо close_agent.
+        assertEquals(
+            dev.metajetcore.agents.BriefResult.Sent,
+            onPooledThreadPumpingEdt { manager.brief(name, "/exit") },
+        )
+        awaitPumpingEdt("вкладка закрылась сама") { !manager.knownTabs().contains(name) }
+        if (handle != null) assertFalse("вкладка осталась на экране", Terminal.isOpen(project, handle))
+    }
+
+    fun testHungAgentIsKilledAndItsTabClosed() {
+        if (dev.metajetcore.shell.ShellDialect.isWindows()) return
+        // Сессия ушла из реестра, а процесс остался — висящее окно, ради которого всё и
+        // затевалось. Процесс запустил плагин, значит плагин его и добивает.
+        settings.launchCommand = agent.command + " " + FakeAgent.LINGER_FLAG
+        val name = spawnResearcher("hung")
+        val timeout = manager.tabDeadTimeoutMs
+        manager.tabDeadTimeoutMs = 2_000L
+        try {
+            assertEquals(CloseResult.Closed, onPooledThreadPumpingEdt { manager.close(name) })
+            assertFalse("вкладка осталась под управлением", manager.knownTabs().contains(name))
+        } finally {
+            manager.tabDeadTimeoutMs = timeout
+        }
+    }
+
+    private fun spawnResearcher(domain: String): String {
+        val result = onPooledThreadPumpingEdt {
+            manager.spawn(Role.RESEARCHER, "задача", null, null, null, domain)
+        }
+        return (result as? SpawnResult.Started)?.agent?.name
+            ?: throw AssertionError("агент не поднялся: $result\nошибка агента: ${agentError()}\nреестр:\n${registryDump()}")
     }
 
     fun testSpawnSurvivesWhenThereIsNoEditorArea() {
@@ -167,8 +215,8 @@ class TerminalFlowTest : BasePlatformTestCase() {
     }
 
     fun testTabWithLivingProcessIsNotClosedBehindAModalDialog() {
-        // Вкладка, которую плагин не запускал: хвостового выхода из шелла в ней нет, и
-        // процесс переживает /exit. Закрывать такую нельзя — платформа спросит
+        // Вкладка, которую плагин не запускал: её процесс — шелл разработчика, он
+        // переживает /exit, и добивать его плагин не вправе. Закрывать такую нельзя — платформа спросит
         // подтверждение модальным диалогом, а зовём мы закрытие под invokeAndWait, то есть
         // диалог подвесит поток MCP-запроса до ответа человека. Ровно на этом close_agent
         // и висел: «сессия закрылась, а вкладка ресерчера осталась».

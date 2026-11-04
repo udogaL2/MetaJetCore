@@ -6,7 +6,6 @@ import dev.metajetcore.mcp.McpTools
 import dev.metajetcore.registry.SessionRegistry
 import dev.metajetcore.roles.Role
 import dev.metajetcore.settings.MjcSettings
-import dev.metajetcore.shell.ShellDialect
 import dev.metajetcore.util.Json
 import java.nio.file.Files
 import java.nio.file.Path
@@ -113,7 +112,7 @@ class McpIntegrationTest : BasePlatformTestCase() {
     }
 
     fun testLaunchLineCarriesOnlyWhatEnvironmentCannot() {
-        val line = manager.launchLine(Role.IMPLEMENTER, ShellDialect.POSIX)
+        val line = manager.launchArgv(Role.IMPLEMENTER).last()
 
         // Роль — одним флагом из файла в пользовательском скоупе: через окружение она
         // пишется в реестр, но не применяется (docs/ARCHITECTURE.md §2.2.1).
@@ -126,9 +125,8 @@ class McpIntegrationTest : BasePlatformTestCase() {
         assertFalse(line, line.contains("CLAUDE_CODE_SESSION_NAME"))
         assertFalse(line, line.contains("ANTHROPIC_MODEL"))
         assertFalse(line, line.contains("--agents"))
-        // Хвостовой выход из шелла: без него процесс вкладки переживает /exit, и её
-        // закрытие упирается в модальный вопрос платформы (docs/ARCHITECTURE.md §2).
-        assertTrue(line, line.trimEnd().endsWith("; exit"))
+        // Хвостового выхода из шелла больше нет: шелл с -c завершается вместе с агентом.
+        assertFalse(line, line.trimEnd().endsWith("exit"))
 
         // Ключевой инвариант: вся набираемая строка — ASCII.
         val nonAscii = line.filter { it.code >= 128 }
@@ -271,7 +269,7 @@ class McpIntegrationTest : BasePlatformTestCase() {
         settings.stripApiKeys = false
         settings.stripInheritedClaudeMarkers = false
         assertTrue(manager.inheritedMarkers().isEmpty())
-        assertFalse(manager.launchLine(Role.IMPLEMENTER, ShellDialect.POSIX).contains("unset "))
+        assertFalse(manager.launchArgv(Role.IMPLEMENTER).last().contains("unset "))
     }
 
     fun testPurgeNamesOnlyWhatIsActuallyInherited() {
@@ -290,7 +288,7 @@ class McpIntegrationTest : BasePlatformTestCase() {
 
     fun testCustomLaunchCommandIsUsedVerbatim() {
         settings.launchCommand = "/usr/local/bin/my-claude"
-        val line = manager.launchLine(Role.IMPLEMENTER, ShellDialect.POSIX)
+        val line = manager.launchArgv(Role.IMPLEMENTER).last()
         assertTrue(line, line.contains("/usr/local/bin/my-claude"))
     }
 

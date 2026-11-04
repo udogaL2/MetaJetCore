@@ -4,7 +4,6 @@ import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.fileEditor.ex.FileEditorManagerEx
 import com.intellij.openapi.fileEditor.impl.EditorWindow
 import com.intellij.openapi.project.Project
-import com.intellij.ui.content.Content
 import javax.swing.SwingUtilities
 
 /**
@@ -51,9 +50,9 @@ object TabPlacement {
             } ?: return false
             method.isAccessible = true
             method.invoke(support, content, window)
-            // Файл берём из того окна, куда клали: currentWindow тут ненадёжен по той же
-            // причине, что и выше.
-            handle.editorFile = window.selectedComposite?.file
+            // Файл ищем по самой вкладке, а не по выбранному в окне редактору: выбор мы сразу
+            // возвращаем на оркестратора, и «выбранный» файл оказался бы чужим.
+            handle.editorFile = Terminal.editorFileOf(project, handle)
             log.info("MetaJetCore: вкладка '${handle.name}' перенесена в editor area (${handle.editorFile?.name})")
             true
         } catch (e: Throwable) {
@@ -76,14 +75,22 @@ object TabPlacement {
      * разработчик всегда может сам. Группировка при этом сохраняется: агенты лежат в том же
      * окне, что и их оркестратор, а не в общей куче.
      *
-     * Работает, только если родитель уже живёт в editor area — иначе «рядом» означает
-     * «в том же тулвиндоу», где вкладка и так появилась.
+     * Родитель не найден или живёт в тулвиндоу — агент всё равно уходит в editor area
+     * (текущее окно или первое): ради места под длинный вывод плагин и задуман, а внизу
+     * вкладка агента теряется среди обычных терминалов. В тулвиндоу агент остаётся, только
+     * если окон редактора нет вовсе.
      */
     fun placeNear(project: Project, parent: TabHandle?, child: TabHandle) {
-        if (parent == null) return
-        val parentWindow = windowOf(project, parent)
+        val parentWindow = parent?.let { windowOf(project, it) }
         if (parentWindow == null) {
-            log.info("MetaJetCore: родитель '${parent.name}' не в editor area, размещение пропущено")
+            if (parent != null) {
+                log.info("MetaJetCore: родитель '${parent.name}' не в editor area, агент — в текущее окно редактора")
+            }
+            val editors = FileEditorManagerEx.getInstanceEx(project)
+            val window = editors.currentWindow ?: editors.windows.firstOrNull()
+            val selected = window?.selectedComposite
+            moveToEditor(project, child, window)
+            restoreSelection(window, selected, parent?.name)
             return
         }
 
@@ -94,13 +101,15 @@ object TabPlacement {
         val selected = parentWindow.selectedComposite
 
         moveToEditor(project, child, parentWindow)
+        restoreSelection(parentWindow, selected, parent.name)
+    }
 
-        if (selected != null) {
-            try {
-                parentWindow.setSelectedComposite(selected, true)
-            } catch (e: Throwable) {
-                log.info("MetaJetCore: вернуть выбор на '${parent.name}' не вышло: ${e.message}")
-            }
+    private fun restoreSelection(window: EditorWindow?, selected: com.intellij.openapi.fileEditor.impl.EditorComposite?, who: String?) {
+        if (window == null || selected == null) return
+        try {
+            window.setSelectedComposite(selected, true)
+        } catch (e: Throwable) {
+            log.info("MetaJetCore: вернуть выбор на '${who ?: selected.file.name}' не вышло: ${e.message}")
         }
     }
 
@@ -124,18 +133,6 @@ object TabPlacement {
             }
         }
         return null
-    }
-
-    /** Есть ли вкладка в editor area прямо сейчас. */
-    fun isInEditor(project: Project, content: Content): Boolean = try {
-        val support = support()
-        val method = support?.javaClass?.methods?.firstOrNull {
-            it.name == "canOpenInEditor" && it.parameterCount == 2
-        }
-        // canOpenInEditor == false означает, что переносить уже некуда: вкладка там.
-        if (method == null) false else !(method.invoke(support, project, content) as? Boolean ?: true)
-    } catch (_: Throwable) {
-        false
     }
 
     private fun support(): Any? = try {

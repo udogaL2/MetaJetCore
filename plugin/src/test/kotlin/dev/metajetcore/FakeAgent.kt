@@ -22,6 +22,9 @@ import java.nio.file.Path
  */
 object FakeAgent {
 
+    /** Флаг в команде запуска: после `/exit` процесс не завершается (только POSIX). */
+    const val LINGER_FLAG = "--fake-linger"
+
     /** Готовый к печати в терминал вызов подставного агента. */
     class Installed(val command: String, val registryDirectory: Path)
 
@@ -93,5 +96,10 @@ object FakeAgent {
             esac
         done
         rm -f "${'$'}FILE"
+        # Режим «завис после выхода»: сессия из реестра ушла, а процесс остался — так
+        # выглядит агент, оставивший живого потомка. Плагин обязан добить такое дерево сам.
+        for ARG in "${'$'}@"; do
+            if [ "${'$'}ARG" = "$LINGER_FLAG" ]; then sleep 600; fi
+        done
     """.trimIndent()
 }
