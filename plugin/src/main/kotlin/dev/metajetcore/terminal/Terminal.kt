@@ -157,13 +157,17 @@ object Terminal {
      * `claude_code`, `codex`.
      */
     fun setAgentIcon(handle: TabHandle, agentKey: String) {
-        try {
-            val agent = terminalAgents().firstOrNull { agentKeyOf(it) == agentKey } ?: return
-            val icon = call(agent, "getIcon") as? javax.swing.Icon ?: return
-            handle.content?.icon = icon
-        } catch (e: Throwable) {
-            log.debug("MetaJetCore: иконку агента '$agentKey' поставить не вышло", e)
-        }
+        val icon = agentIcon(agentKey) ?: return
+        handle.content?.icon = icon
+    }
+
+    /** Иконка агента терминала IDE по ключу; null — агента нет или API сменилось. */
+    fun agentIcon(agentKey: String): javax.swing.Icon? = try {
+        terminalAgents().firstOrNull { agentKeyOf(it) == agentKey }
+            ?.let { call(it, "getIcon") as? javax.swing.Icon }
+    } catch (e: Throwable) {
+        log.debug("MetaJetCore: иконку агента '$agentKey' получить не вышло", e)
+        null
     }
 
     /** Агенты, которых знает терминал IDE. Пусто — API сменилось. */
