@@ -837,7 +837,8 @@ class AgentManager(private val project: Project) {
             append(role.shortName)
             if (!domain.isNullOrBlank()) {
                 append('-')
-                append(domain.lowercase().filter { it.isLetterOrDigit() || it == '-' }.take(12))
+                // 16 — чтобы влез слот состава ревью: `review-claude-2`.
+                append(domain.lowercase().filter { it.isLetterOrDigit() || it == '-' }.take(16))
             }
         }
         if (!SessionRegistry.isNameTaken(base)) return base

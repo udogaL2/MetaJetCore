@@ -11,6 +11,7 @@ import dev.metajetcore.harness.Harness
 import dev.metajetcore.agents.SpawnResult
 import dev.metajetcore.roles.Role
 import dev.metajetcore.roles.RoleInstaller
+import dev.metajetcore.settings.MjcSettings
 import dev.metajetcore.util.Json
 
 /**
@@ -51,7 +52,9 @@ class McpTools(private val project: Project) {
                 "model" to schema("string", "Переопределить модель роли"),
                 "domain" to schema(
                     "string",
-                    "Короткий суффикс имени: участок агента — be, fe, p1, tests, sec. Различает агентов одной роли.",
+                    "Короткий суффикс имени: участок агента — be, fe, p1, tests, sec. Различает агентов одной роли. " +
+                        "reviewer + review — итоговое ревью: откроется весь состав ревьюверов из настроек " +
+                        "плагина (например Claude и Codex), ответ назовёт всех и скажет, кто сводит отчёты.",
                 ),
                 "harness" to schema(
                     "string",
@@ -194,50 +197,31 @@ class McpTools(private val project: Project) {
             )
         }
 
+        val requestedName = args["name"]?.asString
+        val requestedModel = args["model"]?.asString
+        val domain = args["domain"]?.asString
+        val panel = MjcSettings.getInstance().reviewPanelMembers()
+        // Итоговое ревью разворачивается в состав из настроек одним вызовом: оркестратору не
+        // нужно знать настройки, и второго ревьювера не «забыть». Явный harness или name —
+        // просьба об одном конкретном агенте, её уважаем.
+        if (role == Role.REVIEWER && harness == null && requestedName.isNullOrBlank() &&
+            domain?.trim().equals(REVIEW_DOMAIN, ignoreCase = true) && panel.isNotEmpty()
+        ) {
+            return spawnReviewPanel(panel, task, parent, requestedModel)
+        }
+
         return when (
             val result = manager.spawn(
                 role = role,
                 task = task,
                 parentName = parent,
-                requestedName = args["name"]?.asString,
-                requestedModel = args["model"]?.asString,
-                domain = args["domain"]?.asString,
+                requestedName = requestedName,
+                requestedModel = requestedModel,
+                domain = domain,
                 requestedHarness = harness,
             )
         ) {
-            is SpawnResult.Started -> textResult(
-                buildString {
-                    append("Агент запущен.\n")
-                    append(describe(result.agent))
-                    // Дублирование роли не запрещаем: несколько имплементеров по разным
-                    // доменам — штатная схема. Но назвать уже живых обязаны: оркестратор
-                    // сам на них не смотрит (живой прогон: четыре имплементера подряд), а
-                    // после спавна ещё не поздно отдать задачу тому, кто в теме.
-                    if (result.siblings.isNotEmpty()) {
-                        append("\n\nВНИМАНИЕ: этой же роли в проекте уже работают ")
-                        append(result.siblings.joinToString(", ") { it.name })
-                        append(". Если задача про их участок — отдай её им через SendMessage, ")
-                        append("а этого закрой через close_agent: у них набран контекст, ")
-                        append("новый агент входит в задачу с нуля. Если участок другой — ")
-                        append("всё верно, продолжай.")
-                    }
-                    if (result.taskDelivered) {
-                        // Codex: без первого сообщения его сессия не создаётся, поэтому задача
-                        // ушла аргументом при старте. Повторно слать её нельзя — будет два хода.
-                        append("\n\nЗадача УЖЕ передана агенту при старте — повторно не отправляй. ")
-                        append("Это агент ${result.agent.harness.displayName}: SendMessage ему не ")
-                        append("доставляет. Ответ забери через await_messages(names=[\"${result.agent.name}\"]), ")
-                        append("следующие задачи — через send_to_agent.")
-                    } else {
-                        append("\n\nСЛЕДУЮЩИЙ ШАГ, ОБЯЗАТЕЛЬНО: отправь агенту задачу через ")
-                        append("SendMessage(to=\"${result.agent.name}\"). ")
-                        append("Плагин задачу не передаёт намеренно: терминал искажает не-ASCII ")
-                        append("(проверено живым прогоном), а сообщения доставляются как есть. ")
-                        append("Отправь ему это:\n\n")
-                        append(result.pendingBriefing)
-                    }
-                },
-            )
+            is SpawnResult.Started -> textResult("Агент запущен.\n" + describeStarted(result))
 
             is SpawnResult.Manual -> textResult(
                 buildString {
@@ -250,6 +234,94 @@ class McpTools(private val project: Project) {
 
             is SpawnResult.Failed -> textResult("не удалось: ${result.reason}", isError = true)
         }
+    }
+
+    private fun describeStarted(result: SpawnResult.Started, skipSiblings: Set<String> = emptySet()): String =
+        buildString {
+            append(describe(result.agent))
+            // Дублирование роли не запрещаем: несколько имплементеров по разным
+            // доменам — штатная схема. Но назвать уже живых обязаны: оркестратор
+            // сам на них не смотрит (живой прогон: четыре имплементера подряд), а
+            // после спавна ещё не поздно отдать задачу тому, кто в теме.
+            val siblings = result.siblings.filter { it.name !in skipSiblings }
+            if (siblings.isNotEmpty()) {
+                append("\n\nВНИМАНИЕ: этой же роли в проекте уже работают ")
+                append(siblings.joinToString(", ") { it.name })
+                append(". Если задача про их участок — отдай её им через SendMessage, ")
+                append("а этого закрой через close_agent: у них набран контекст, ")
+                append("новый агент входит в задачу с нуля. Если участок другой — ")
+                append("всё верно, продолжай.")
+            }
+            if (result.taskDelivered) {
+                // Codex: без первого сообщения его сессия не создаётся, поэтому задача
+                // ушла аргументом при старте. Повторно слать её нельзя — будет два хода.
+                append("\n\nЗадача УЖЕ передана агенту при старте — повторно не отправляй. ")
+                append("Это агент ${result.agent.harness.displayName}: SendMessage ему не ")
+                append("доставляет. Ответ забери через await_messages(names=[\"${result.agent.name}\"]), ")
+                append("следующие задачи — через send_to_agent.")
+            } else {
+                append("\n\nСЛЕДУЮЩИЙ ШАГ, ОБЯЗАТЕЛЬНО: отправь агенту задачу через ")
+                append("SendMessage(to=\"${result.agent.name}\"). ")
+                append("Плагин задачу не передаёт намеренно: терминал искажает не-ASCII ")
+                append("(проверено живым прогоном), а сообщения доставляются как есть. ")
+                append("Отправь ему это:\n\n")
+                append(result.pendingBriefing)
+            }
+        }
+
+    /**
+     * Итоговое ревью составом: по агенту на участника, каждый — со своим файлом отчёта.
+     *
+     * Отказ одного участника не отменяет остальных: ревью одним харнесом лучше, чем никакого,
+     * а оркестратор увидит, кого не хватает. Сводит отчёты первый Claude-участник, а не
+     * оркестратор: тому писать файлы нельзя (ARCHITECTURE §5.1), а у ревьювера уже есть
+     * контекст ветки.
+     */
+    private fun spawnReviewPanel(
+        members: List<MjcSettings.PanelMember>,
+        task: String,
+        parent: String?,
+        requestedModel: String?,
+    ): Json {
+        val started = mutableListOf<SpawnResult.Started>()
+        val sections = mutableListOf<String>()
+        for (member in members) {
+            val memberTask = if (members.size > 1) task + panelNote(members.size, member.slot) else task
+            val title = "${member.harness.displayName} (${member.slot})"
+            sections += when (
+                val result = manager.spawn(
+                    role = Role.REVIEWER,
+                    task = memberTask,
+                    parentName = parent,
+                    requestedName = null,
+                    requestedModel = member.model ?: requestedModel,
+                    domain = member.slot,
+                    requestedHarness = member.harness,
+                )
+            ) {
+                is SpawnResult.Started -> {
+                    started += result
+                    "— $title\n" + describeStarted(result, skipSiblings = started.map { it.agent.name }.toSet())
+                }
+                is SpawnResult.Manual ->
+                    "— $title: открыть вкладку не вышло (${result.reason}). Команда для ручного запуска:\n${result.command}"
+                is SpawnResult.Failed -> "— $title: не удалось — ${result.reason}"
+            }
+        }
+        val text = buildString {
+            append("Итоговое ревью — состав из настроек плагина: ${members.size}, запущено: ${started.size}.\n\n")
+            append(sections.joinToString("\n\n"))
+            if (started.size > 1) {
+                val merger = started.firstOrNull { it.agent.harness == Harness.CLAUDE } ?: started.first()
+                val channel = if (merger.agent.harness == Harness.CLAUDE) "SendMessage" else "send_to_agent"
+                append("\n\nСВЕДЕНИЕ. Каждый пишет свой файл отчёта (суффикс слота к пути из задачи). ")
+                append("Когда ответят все, отправь ${merger.agent.name} ($channel) пути отчётов остальных и ")
+                append("попроси свести их в итоговый файл по исходному пути из задачи: находки объединить, ")
+                append("дубли схлопнуть, расхождения между ревьюверами отметить, STATUS: FAIL, если FAIL хотя ")
+                append("бы у одного. Повторное ревью дельты — всем участникам, тем же агентам.")
+            }
+        }
+        return textResult(text, isError = started.isEmpty())
     }
 
     private fun listAgents(): Json {
@@ -425,10 +497,6 @@ class McpTools(private val project: Project) {
         return Json.Obj(fields)
     }
 
-    private companion object {
-        const val DEFAULT_AWAIT_S = 45L
-        const val MAX_AWAIT_S = 120L
-    }
 
     private fun textResult(text: String, isError: Boolean = false): Json = Json.obj(
         "content" to Json.arr(
@@ -436,4 +504,21 @@ class McpTools(private val project: Project) {
         ),
         "isError" to Json.of(isError),
     )
+
+    internal companion object {
+        const val DEFAULT_AWAIT_S = 45L
+        const val MAX_AWAIT_S = 120L
+        const val REVIEW_DOMAIN = "review"
+
+        /**
+         * Приписка к задаче участника состава. Плагин дописывает её сам, потому что промпт
+         * tempo называет один путь отчёта, и без приписки ревьюверы писали бы в один файл;
+         * Codex задачу получает при старте, позже её не поправить.
+         */
+        fun panelNote(size: Int, slot: String): String =
+            "\n\n---\nТы — один из $size ревьюверов этой проверки (твой слот: $slot). Если задача " +
+                "называет файл отчёта, пиши в файл с тем же путём и суффиксом `-$slot` перед " +
+                "расширением (например review.md → review-$slot.md). Файл по исходному пути " +
+                "соберёт один из участников по просьбе оркестратора — сам его не пиши, пока не попросят."
+    }
 }

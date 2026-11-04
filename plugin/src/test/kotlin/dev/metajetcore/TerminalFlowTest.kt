@@ -8,10 +8,12 @@ import dev.metajetcore.agents.CloseResult
 import dev.metajetcore.agents.SpawnResult
 import dev.metajetcore.harness.Codex
 import dev.metajetcore.harness.Harness
+import dev.metajetcore.mcp.McpTools
 import dev.metajetcore.registry.SessionRegistry
 import dev.metajetcore.roles.Role
 import dev.metajetcore.settings.MjcSettings
 import dev.metajetcore.terminal.Terminal
+import dev.metajetcore.util.Json
 import java.nio.file.Files
 
 /**
@@ -61,6 +63,8 @@ class TerminalFlowTest : BasePlatformTestCase() {
             settings.launchCommand = "claude"
             settings.codexLaunchCommand = "codex"
             Codex.homeOverride = null
+            settings.reviewPanel = mutableMapOf()
+            settings.reviewPanelModel = mutableMapOf()
             TestDialogManager.setTestDialog(TestDialog.DEFAULT)
         } finally {
             super.tearDown()
@@ -322,6 +326,51 @@ class TerminalFlowTest : BasePlatformTestCase() {
         assertEquals(CloseResult.Closed, onPooledThreadPumpingEdt { manager.close(name) })
         assertFalse("вкладка осталась под управлением", manager.knownTabs().contains(name))
         assertNull(manager.list().firstOrNull { it.name == name })
+    }
+
+    fun testFinalReviewOpensTheWholePanel() {
+        if (dev.metajetcore.shell.ShellDialect.isWindows()) return
+        // Один вызов spawn_agent(reviewer, domain=review) — весь состав из настроек: Claude и
+        // Codex, у каждого свой слот и своя приписка про файл отчёта.
+        val codex = FakeCodex.install()
+        Codex.homeOverride = codex.home
+        settings.codexLaunchCommand = codex.command
+        settings.reviewPanel = mutableMapOf("claude_code" to 1, "codex" to 1)
+        Files.createDirectories(manager.projectDirectory())
+
+        val tools = McpTools(project)
+        val result = onPooledThreadPumpingEdt {
+            tools.call(
+                Json.obj(
+                    "name" to Json.of("spawn_agent"),
+                    "arguments" to Json.obj(
+                        "role" to Json.of("reviewer"),
+                        "task" to Json.of("ревью ветки, отчёт в review.md"),
+                        "domain" to Json.of("review"),
+                    ),
+                ),
+            )
+        }
+        val text = result["content"]!!.asList!!.first()["text"]!!.asString!!
+        val claudeName = "mjc-rev-review-claude"
+        val codexName = "mjc-rev-review-codex"
+        try {
+            assertTrue(text, text.contains("запущено: 2"))
+            assertTrue(text, text.contains("SendMessage(to=\"$claudeName\")"))
+            assertTrue(text, text.contains("await_messages(names=[\"$codexName\"])"))
+            // Сводит Claude-участник, а не оркестратор.
+            assertTrue(text, text.contains("отправь $claudeName (SendMessage)"))
+            // Задача Codex-у ушла при старте — вместе с припиской про его файл отчёта.
+            val first = onPooledThreadPumpingEdt { manager.awaitMessages(listOf(codexName), 10_000) }
+            val echoed = first.messages.singleOrNull()?.text.orEmpty()
+            assertTrue(echoed, echoed.startsWith("ECHO: ревью ветки") && echoed.contains("review-review-codex.md"))
+        } finally {
+            for (name in listOf(claudeName, codexName)) {
+                if (manager.knownTabs().contains(name)) onPooledThreadPumpingEdt { manager.close(name) }
+            }
+        }
+        assertFalse(manager.knownTabs().contains(claudeName))
+        assertFalse(manager.knownTabs().contains(codexName))
     }
 
     fun testFakeAgentWritesWhereWeExpect() {

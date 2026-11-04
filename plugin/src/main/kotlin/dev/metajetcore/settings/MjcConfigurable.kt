@@ -21,6 +21,7 @@ import javax.swing.JList
 import com.intellij.ui.dsl.builder.AlignX
 import com.intellij.ui.dsl.builder.RowLayout
 import com.intellij.ui.dsl.builder.bindIntText
+import com.intellij.ui.dsl.builder.bindIntValue
 import com.intellij.ui.dsl.builder.bindItem
 import com.intellij.ui.dsl.builder.bindSelected
 import com.intellij.ui.dsl.builder.bindText
@@ -98,7 +99,7 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
                         // Оркестратор — всегда Claude Code: на нём держится SendMessage.
                         .enabled(role != Role.ORCHESTRATOR && choices.size > 1)
                     val box = ModelField(role)
-                    modelBoxes += box to harness.component
+                    modelBoxes += box to { harness.component.item ?: Harness.CLAUDE }
                     cell(box)
                         .bindText(
                             { settings.roleModel[role.id].orEmpty() },
@@ -129,7 +130,48 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
             loadModels(offered)
         }
 
-        val codexUsed = Role.entries.any { settings.harnessFor(it) == Harness.CODEX }
+        group("Итоговое ревью") {
+            // Те же харнесы, что можно назначить ролям; уже заданный в составе показываем, даже
+            // если IDE его сейчас не видит, — иначе Apply молча обнулил бы его.
+            val available = Terminal.terminalAgentKeys()
+            val panelHarnesses = Harness.entries.filter {
+                it == Harness.CLAUDE || it.key in available || (settings.reviewPanel[it.key] ?: 0) > 0
+            }
+            for (harness in panelHarnesses) {
+                row(harness.displayName + ":") {
+                    spinner(0..MjcSettings.MAX_PANEL_PER_HARNESS)
+                        .bindIntValue(
+                            { settings.reviewPanel[harness.key] ?: 0 },
+                            { value: Int ->
+                                if (value > 0) settings.reviewPanel[harness.key] = value
+                                else settings.reviewPanel.remove(harness.key)
+                            },
+                        )
+                    val box = ModelField(Role.REVIEWER)
+                    modelBoxes += box to { harness }
+                    cell(box)
+                        .bindText(
+                            { settings.reviewPanelModel[harness.key].orEmpty() },
+                            { value ->
+                                if (value.isBlank()) settings.reviewPanelModel.remove(harness.key)
+                                else settings.reviewPanelModel[harness.key] = value.trim()
+                            },
+                        )
+                        .validationOnInput { modelWarning(it.text, harness) }
+                    box.show(harness, models[harness].orEmpty())
+                }.layout(RowLayout.PARENT_GRID)
+            }
+            row {
+                comment(
+                    "Сколько ревьюверов каждого харнеса открыть на итоговое ревью (tempo review, ревью MR): " +
+                        "оркестратор заведёт всех одним вызовом, а отчёты сведёт один из них. Все нули — " +
+                        "один ревьювер по настройке роли выше. Гейты (tests, sec, a11y, perf, scen) — всегда по одному.",
+                )
+            }
+        }
+
+        val codexUsed = Role.entries.any { settings.harnessFor(it) == Harness.CODEX } ||
+            (settings.reviewPanel[Harness.CODEX.key] ?: 0) > 0
         collapsibleGroup("Codex") {
             row("Команда:") {
                 textField().bindText(settings::codexLaunchCommand).columns(30)
@@ -192,7 +234,7 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
     /** Списки моделей по харнесам: сначала запасные, потом — что ответил CLI. */
     private val models = HashMap<Harness, List<ModelCatalog.Model>>()
     private val modelStatus = LinkedHashMap<Harness, String>()
-    private val modelBoxes = mutableListOf<Pair<ModelField, ComboBox<Harness>>>()
+    private val modelBoxes = mutableListOf<Pair<ModelField, () -> Harness>>()
     private var statusLabel: JLabel? = null
 
     /**
@@ -228,7 +270,7 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
 
     private fun refreshModels() {
         for ((box, harness) in modelBoxes) {
-            val picked = harness.item ?: Harness.CLAUDE
+            val picked = harness()
             box.show(picked, models[picked].orEmpty())
         }
         statusLabel?.text = modelStatus.values.joinToString("   ·   ")

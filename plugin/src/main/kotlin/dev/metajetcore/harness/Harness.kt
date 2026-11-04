@@ -11,9 +11,9 @@ package dev.metajetcore.harness
  * покажет (Junie, сторонние провайдеры), но назначить их роли нельзя: чем такого агента
  * запустить, как узнать, что он готов, и как до него достучаться, — разное у каждого.
  */
-enum class Harness(val key: String, val displayName: String) {
-    CLAUDE("claude_code", "Claude Code"),
-    CODEX("codex", "Codex"),
+enum class Harness(val key: String, val displayName: String, val shortName: String) {
+    CLAUDE("claude_code", "Claude Code", "claude"),
+    CODEX("codex", "Codex", "codex"),
     ;
 
     companion object {

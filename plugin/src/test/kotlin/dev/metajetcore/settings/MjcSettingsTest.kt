@@ -1,5 +1,6 @@
 package dev.metajetcore.settings
 
+import dev.metajetcore.harness.Harness
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -110,5 +111,29 @@ class MjcSettingsTest {
         assertEquals(0, settings.mcpPort)
         // Ожидание должно быть заметно меньше таймаута MCP-вызова на стороне оркестратора.
         assertTrue(settings.readyTimeoutSeconds <= 60)
+    }
+
+    @Test
+    fun emptyReviewPanelMeansSingleReviewer() {
+        assertTrue(MjcSettings().reviewPanelMembers().isEmpty())
+    }
+
+    @Test
+    fun reviewPanelExpandsClaudeFirstWithNumberedSlots() {
+        val settings = MjcSettings()
+        settings.reviewPanel = mutableMapOf("codex" to 1, "claude_code" to 2)
+        settings.reviewPanelModel = mutableMapOf("claude_code" to "  opus ", "codex" to " ")
+        val members = settings.reviewPanelMembers()
+        assertEquals(listOf("review-claude", "review-claude-2", "review-codex"), members.map { it.slot })
+        assertEquals(listOf(Harness.CLAUDE, Harness.CLAUDE, Harness.CODEX), members.map { it.harness })
+        // Пустая модель — не пустая строка в CLI, а «модель роли по умолчанию».
+        assertEquals(listOf("opus", "opus", null), members.map { it.model })
+    }
+
+    @Test
+    fun reviewPanelSizeIsClamped() {
+        val settings = MjcSettings()
+        settings.reviewPanel = mutableMapOf("claude_code" to 9, "codex" to -1)
+        assertEquals(MjcSettings.MAX_PANEL_PER_HARNESS, settings.reviewPanelMembers().size)
     }
 }

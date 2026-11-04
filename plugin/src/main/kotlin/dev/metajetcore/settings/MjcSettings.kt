@@ -101,6 +101,30 @@ class MjcSettings : PersistentStateComponent<MjcSettings> {
      */
     var codexArgs: String = "-s workspace-write -a never --disable hooks"
 
+    /**
+     * Состав итогового ревью: ключ харнеса -> сколько ревьюверов (0–3).
+     *
+     * Только итоговое ревью (`domain=review`): гейты в фиче идут десятками, и умножать каждый
+     * на размер состава дорого. Пусто или все нули — один ревьювер на харнесе роли, как до
+     * появления состава (docs/PLAN-REVIEW-PANEL.md).
+     */
+    var reviewPanel: MutableMap<String, Int> = mutableMapOf()
+
+    /** Модель ревьюверов состава по харнесу; пусто — как у роли ревьювера. */
+    var reviewPanelModel: MutableMap<String, String> = mutableMapOf()
+
+    /** Участник состава: харнес, модель и слот — хвост имени (`review-codex`, `review-claude-2`). */
+    data class PanelMember(val harness: Harness, val model: String?, val slot: String)
+
+    fun reviewPanelMembers(): List<PanelMember> = Harness.entries.flatMap { harness ->
+        val count = (reviewPanel[harness.key] ?: 0).coerceIn(0, MAX_PANEL_PER_HARNESS)
+        val model = reviewPanelModel[harness.key]?.trim()?.takeIf { it.isNotEmpty() }
+        (1..count).map { index ->
+            val slot = "review-" + harness.shortName + if (index > 1) "-$index" else ""
+            PanelMember(harness, model, slot)
+        }
+    }
+
     fun harnessFor(role: Role): Harness =
         if (role == Role.ORCHESTRATOR) Harness.CLAUDE
         else Harness.fromKey(roleHarness[role.id]) ?: Harness.CLAUDE
@@ -127,6 +151,8 @@ class MjcSettings : PersistentStateComponent<MjcSettings> {
     }
 
     companion object {
+        const val MAX_PANEL_PER_HARNESS = 3
+
         /** Обратный слэш кодом, чтобы не плодить экранирование в исходнике. */
         private val WINDOWS_SEPARATOR: Char = 92.toChar()
 
