@@ -4,11 +4,16 @@
     <vendor>metajetcore</vendor>
 
     <description><![CDATA[
+        Claude Code meta-orchestrator inside JetBrains IDEs: one session opens and drives
+        full Claude Code or Codex sessions in neighbouring terminal tabs.
+        <br/><br/>
+        <!-- Абзац на английском стоит первым не для красоты: Plugin Verifier отвергает
+             описание, которое не начинается с латиницы. -->
         Метаоркестратор Claude Code внутри JetBrains IDE.
         <br/><br/>
         Поднимает локальный MCP-сервер, через который сессия-оркестратор открывает рядом
-        с собой вкладки с другими полноценными сессиями Claude Code — имплементером,
-        ресерчером, ревьювером — и управляет их жизненным циклом.
+        с собой вкладки с другими полноценными сессиями — Claude Code или Codex:
+        планировщиком, имплементером, ресерчером, ревьювером — и управляет их жизненным циклом.
         <br/><br/>
         Субагенты не используются: каждый агент это отдельный процесс со своим контекстом.
     ]]></description>

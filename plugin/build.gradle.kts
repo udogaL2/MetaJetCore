@@ -6,7 +6,7 @@ plugins {
 }
 
 group = "dev.metajetcore"
-version = "0.3.0"
+version = "0.4.0"
 
 repositories {
     mavenCentral()
@@ -84,7 +84,11 @@ intellijPlatform {
 
     pluginVerification {
         ides {
-            recommended()
+            // С локальной IDE проверяем на ней же: recommended() качает несколько
+            // дистрибутивов, а там, где download.jetbrains.com недоступен, не скачает ничего.
+            val localIde = providers.gradleProperty("mjcLocalIde")
+                .orElse(providers.environmentVariable("MJC_LOCAL_IDE"))
+            if (localIde.isPresent) local(file(localIde.get())) else recommended()
         }
     }
 }
