@@ -3,7 +3,7 @@
 #
 #   ./scripts/spawn-agent.sh <role> <name> [model]
 #
-#   role   implementer | researcher | reviewer | orchestrator
+#   role   planner | implementer | researcher | reviewer | orchestrator
 #   name   имя сессии = адрес для SendMessage, напр. mjc-impl-be
 #   model  переопределить модель роли
 #
@@ -25,12 +25,12 @@ name="${2:-}"
 model="${3:-}"
 
 if [[ -z "$role" || -z "$name" ]]; then
-    echo "usage: $0 <implementer|researcher|reviewer|orchestrator> <name> [model]" >&2
+    echo "usage: $0 <planner|implementer|researcher|reviewer|orchestrator> <name> [model]" >&2
     exit 2
 fi
 
 case "$role" in
-    implementer|orchestrator) default_model="opus" ;;
+    planner|implementer|orchestrator) default_model="opus" ;;
     researcher|reviewer)      default_model="sonnet" ;;
     *) echo "unknown role: $role" >&2; exit 2 ;;
 esac

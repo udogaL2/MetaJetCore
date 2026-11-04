@@ -233,6 +233,20 @@ Gradle-JVM не видит `HTTPS_PROXY` окружения — прокси п�
 `/orchestrate` поднимает ресерчера, тот вызывает `Skill`/MCP-инструмент (раньше было недоступно)
 и отвечает одним словом.
 
+
+### 3.5 Итог этапа 2
+- Роли: `planner` (новая, `<pfx>-plan`), `implementer`, `researcher`, `reviewer`; оркестратор —
+  метка. В определениях нет `tools:`, в скилле нет `disallowed-tools`; ограничения словами.
+- Общий протокол ролей: ответ — SendMessage оркестратору, блок `STATUS:` последним, гейты —
+  файл с `STATUS: PASS | FAIL`, не коммитить, правила задачи (промпт tempo) главнее протокола.
+- `/orchestrate` — мост tempo: таблица «роль tempo → роль сессии + domain», промпт дословно,
+  волна одним ходом, «Продолжай»/правки/fixer — тому же агенту, коммитит оркестратор.
+- Тесты: `RolesTest` (нет `tools:`/`disallowed-tools`, все роли tempo в мосте, формат STATUS,
+  запрет менять код словами), `McpIntegrationTest` — зелёные.
+- Живьём (песочница PyCharm 2026.3 RC, haiku): ресерчер подтвердил `Skill`, через ToolSearch
+  вызвал `mcp__phpstorm__get_project_modules` и ответил SendMessage-ем в формате
+  `…; STATUS: DONE`; `close_agent` закрыл вкладку.
+
 ---
 
 ## 4. Этап 3 — харнесы и Codex

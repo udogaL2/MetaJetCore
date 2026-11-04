@@ -48,7 +48,7 @@ class McpTools(private val project: Project) {
                 "model" to schema("string", "Переопределить модель роли"),
                 "domain" to schema(
                     "string",
-                    "Короткий суффикс имени: be, fe, sec, arch. Различает агентов одной роли.",
+                    "Короткий суффикс имени: участок агента — be, fe, p1, tests, sec. Различает агентов одной роли.",
                 ),
             ),
             required = listOf("role", "task", "parent"),

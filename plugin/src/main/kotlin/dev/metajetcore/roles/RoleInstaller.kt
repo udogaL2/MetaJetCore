@@ -77,15 +77,17 @@ object RoleInstaller {
         return changed
     }
 
-    private fun definitionText(role: Role): String {
-        val tools = Roles.toolsFor(role).joinToString(", ")
+    /**
+     * Поля `tools` в определении нет намеренно: белый список отрезал агенту `Skill` и MCP,
+     * без которых не работают гейты tempo (см. KDoc [Roles]). Не возвращать.
+     */
+    internal fun definitionText(role: Role): String {
         return buildString {
             append("---\n")
             append("name: ${agentName(role)}\n")
             append("description: Роль целой сессии MetaJetCore. НЕ использовать как субагента. ")
             append(descriptionFor(role))
             append("\n")
-            append("tools: $tools\n")
             append("model: ${role.defaultModel}\n")
             append("---\n\n")
             append(Roles.promptFor(role))
@@ -95,8 +97,9 @@ object RoleInstaller {
 
     private fun descriptionFor(role: Role): String = when (role) {
         Role.ORCHESTRATOR -> "Координирует остальные роли, сам код не пишет."
+        Role.PLANNER -> "Пишет и правит ADR, SDD и план фичи."
         Role.IMPLEMENTER -> "Пишет код в рамках выданного файлового домена."
-        Role.RESEARCHER -> "Исследует кодовую базу и внешние источники, только чтение."
-        Role.REVIEWER -> "Вычитывает готовый код через заданную линзу, только чтение."
+        Role.RESEARCHER -> "Исследует кодовую базу и внешние источники, код не меняет."
+        Role.REVIEWER -> "Проверяет готовые изменения через заданную линзу, код не меняет."
     }
 }
