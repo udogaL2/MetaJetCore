@@ -294,18 +294,16 @@ object Terminal {
     /**
      * Открыта ли вкладка где-нибудь — в тулвиндоу или в editor area.
      *
-     * Присутствие в тулвиндоу смотрим по `Content` в его менеджере, а не по списку
-     * `getTabs()`: сверка с этим списком по объекту вкладки на 263 не срабатывала, и
-     * вкладка считалась закрытой, оставаясь на экране.
+     * Сверяемся со списками платформы (вкладки менеджера и файлы редактора), а не с
+     * `Content.manager`: у вкладки, перенесённой в редактор, `Content` остаётся в менеджере
+     * контента редактора и после её закрытия — проверено живым прогоном на 2026.3, плагин
+     * считал самостоятельно вышедшего агента живым.
      */
     fun isOpen(project: Project, handle: TabHandle): Boolean {
-        val content = handle.content
-        if (content != null) {
-            val manager = content.manager
-            if (manager != null && manager.getIndexOfContent(content) >= 0) return true
+        if (handle.tab == null) {
+            return handle.editorFile?.let { FileEditorManager.getInstance(project).isFileOpen(it) } == true
         }
-        if (editorFileOf(project, handle) != null) return true
-        return handle.tab == null && handle.editorFile?.let { FileEditorManager.getInstance(project).isFileOpen(it) } == true
+        return tabs(project).any { isSameTab(it, handle) } || editorFileOf(project, handle) != null
     }
 
     /** Та же вкладка: по объекту или по её view — обёртки платформы бывают разными объектами. */

@@ -33,7 +33,13 @@ dependencies {
         // чужим машинам не место, отсюда и внешнее свойство.
         val localIde = providers.gradleProperty("mjcLocalIde")
             .orElse(providers.environmentVariable("MJC_LOCAL_IDE"))
-        if (localIde.isPresent) local(localIde) else intellijIdea("2026.3")
+        // Версия платформы для сборки и песочницы. По умолчанию — IntelliJ IDEA: EAP-сборки
+        // и бесплатные возможности IDEA работают без лицензии, а песочница платной IDE
+        // встаёт на модальном диалоге лицензии, и MCP-сервер в ней не отвечает. Пока 2026.3
+        // выходит только EAP, номер сборки указан явно; переопределяется свойством
+        // `mjcIdeVersion`.
+        val ideVersion = providers.gradleProperty("mjcIdeVersion").orElse("263.7307.44")
+        if (localIde.isPresent) local(localIde) else intellijIdea(ideVersion)
 
         // Плагин терминала и его frontend-модуль нужны, чтобы тесты могли поднять настоящую
         // вкладку: без них в тестовой IDE терминала просто нет, и весь терминальный слой
@@ -98,13 +104,16 @@ tasks {
      */
     val seedSandbox = register("seedSandbox") {
         val repoRoot = rootProject.projectDir.parentFile
-        val optionsDir = layout.buildDirectory.dir("idea-sandbox").get().asFile
+        // Каталог конфигурации песочницы берём у самой задачи подготовки, а не собираем
+        // путь руками: Gradle-плагин 2.x держит песочницу в `.intellijPlatform/sandbox/...`,
+        // и прежний путь `build/idea-sandbox` молча указывал в пустоту — песочница вставала
+        // на диалоге доверия к проекту, и MCP-сервер так и не поднимался.
+        val configDir = named<org.jetbrains.intellij.platform.gradle.tasks.PrepareSandboxTask>("prepareSandbox")
+            .flatMap { it.sandboxConfigDirectory }
+        dependsOn("prepareSandbox")
 
         doLast {
-            val targets = optionsDir.listFiles()
-                ?.filter { it.isDirectory }
-                ?.map { File(it, "config/options") }
-                ?: emptyList()
+            val targets = listOf(File(configDir.get().asFile, "options"))
 
             for (dir in targets) {
                 dir.mkdirs()
