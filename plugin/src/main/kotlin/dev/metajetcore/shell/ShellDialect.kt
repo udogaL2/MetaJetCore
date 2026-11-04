@@ -59,13 +59,38 @@ enum class ShellDialect {
      * при закрытии идут прямо ему. К составной строке `exec` приклеился бы лишь к первой
      * части и молча сломал бы запуск.
      */
-    fun argv(shellPath: String, unset: String, command: String): List<String> = when (this) {
+    fun argv(
+        shellPath: String,
+        unset: String,
+        command: String,
+        execable: Boolean = isSimple(command),
+    ): List<String> = when (this) {
         POSIX, FISH -> {
-            val body = if (isSimple(command)) "exec $command" else command
+            val body = if (execable) "exec $command" else command
             listOf(shellPath, "-l", "-i", "-c", unset + body)
         }
         POWERSHELL -> listOf(shellPath, "-NoLogo", "-Command", unset + command)
         CMD -> listOf(shellPath, "/c", unset + command)
+    }
+
+    /**
+     * Значение переменной окружения одним аргументом команды.
+     *
+     * Так в строку запуска попадает пользовательский текст (задача Codex-агенту, путь
+     * проекта): само значение едет через API вкладки, а в строке — только имя переменной.
+     * Кавычки, `$` и переводы строки в значении шелл при такой подстановке не трогает —
+     * проверено с задачей `привет, "кавычки" и ${'$'}доллар`. Имя обязано быть безобидным, его
+     * проверяет вызывающий.
+     *
+     * Известные исключения — Windows. cmd раскрывает `%VAR%` до разбора строки, поэтому
+     * кавычки внутри значения рвут аргумент. Windows PowerShell 5.1 портит кавычки в
+     * аргументах нативных программ (pwsh 7.3+ — нет). На живом Windows это не проверялось;
+     * худшее последствие — искажённая задача, и агент ответит на неё вопросом.
+     */
+    fun envRef(name: String): String = when (this) {
+        POSIX, FISH -> "\"${'$'}$name\""
+        POWERSHELL -> "\"${'$'}env:$name\""
+        CMD -> "\"%$name%\""
     }
 
     companion object {

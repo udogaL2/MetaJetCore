@@ -2,6 +2,7 @@ package dev.metajetcore
 
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.startup.ProjectActivity
+import dev.metajetcore.harness.Codex
 import dev.metajetcore.mcp.McpServerService
 import dev.metajetcore.roles.RoleInstaller
 import dev.metajetcore.skill.SkillInstaller
@@ -15,5 +16,8 @@ class MjcStartupActivity : ProjectActivity {
         // Определения ролей — тоже в пользовательский скоуп: только так текст роли
         // читается как UTF-8 из файла, а не проходит через кодировку терминала.
         RoleInstaller.installIfChanged()
+        // Те же роли для Codex — профилями ~/.codex/mjc-<role>.config.toml. Ставим всегда, а
+        // не только когда роль назначена Codex: настройку меняют на лету, без перезапуска IDE.
+        Codex.installProfiles()
     }
 }

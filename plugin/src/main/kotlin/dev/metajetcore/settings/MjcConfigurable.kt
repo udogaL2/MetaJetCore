@@ -9,6 +9,9 @@ import com.intellij.ui.dsl.builder.bindText
 import com.intellij.ui.dsl.builder.columns
 import com.intellij.ui.dsl.builder.panel
 import com.intellij.ui.dsl.builder.toNullableProperty
+import dev.metajetcore.harness.Harness
+import dev.metajetcore.roles.Role
+import dev.metajetcore.terminal.Terminal
 
 class MjcConfigurable : BoundConfigurable("MetaJetCore") {
 
@@ -71,6 +74,47 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
                     // applyToComponent есть всегда и делает то же самое.
                     .applyToComponent { rows = 4 }
                     .comment("По одной на строку, в формате KEY=VALUE.")
+            }
+        }
+
+        group("Харнесы ролей") {
+            // Список — у IDE (агенты терминала, 263+), а не свой: что установлено и включено,
+            // знает она. Показываем только то, для чего в плагине есть адаптер.
+            val available = Terminal.terminalAgentKeys()
+            val choices = Harness.entries.filter { it == Harness.CLAUDE || it.key in available }
+            for (role in Role.entries - Role.ORCHESTRATOR) {
+                row("${role.id}:") {
+                    comboBox(choices.map { it.key })
+                        .bindItem(
+                            { settings.harnessFor(role).key },
+                            { key -> settings.roleHarness[role.id] = key ?: Harness.CLAUDE.key },
+                        )
+                    textField()
+                        .bindText(
+                            { settings.roleModel[role.id].orEmpty() },
+                            { model -> settings.roleModel[role.id] = model.trim() },
+                        )
+                        .columns(14)
+                        .comment("модель; пусто — по умолчанию")
+                }
+            }
+            row {
+                comment(
+                    "Оркестратор — всегда Claude Code. Харнесы IDE без адаптера плагина " +
+                        "(${(available - Harness.entries.map { it.key }.toSet()).ifEmpty { listOf("нет") }.joinToString()}) " +
+                        "назначить нельзя." +
+                        if (available.isEmpty()) " Список агентов IDE недоступен — доступен только Claude Code." else "",
+                )
+            }
+            row("Команда Codex:") {
+                textField().bindText(settings::codexLaunchCommand).columns(30)
+            }
+            row("Аргументы Codex:") {
+                textField().bindText(settings::codexArgs).columns(40)
+                    .comment(
+                        "-a never: подтверждения во вкладке, которую никто не читает, — вечная " +
+                            "блокировка. --disable hooks: иначе Codex спросит «Review hooks» на старте.",
+                    )
             }
         }
 

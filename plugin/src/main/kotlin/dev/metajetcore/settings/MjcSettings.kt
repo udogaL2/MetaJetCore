@@ -5,6 +5,8 @@ import com.intellij.openapi.components.PersistentStateComponent
 import com.intellij.openapi.components.State
 import com.intellij.openapi.components.Storage
 import com.intellij.util.xmlb.XmlSerializerUtil
+import dev.metajetcore.harness.Harness
+import dev.metajetcore.roles.Role
 
 @State(
     name = "MetaJetCoreSettings",
@@ -73,6 +75,37 @@ class MjcSettings : PersistentStateComponent<MjcSettings> {
 
     /** Слушать только на localhost. Менять незачем; поле оставлено для отладки. */
     var mcpBindLoopbackOnly: Boolean = true
+
+    /**
+     * Харнес каждой роли: id роли -> ключ харнеса (`claude_code`, `codex`).
+     *
+     * Ключи — те же, что у агентов терминала IDE, поэтому список выбора в настройках берётся
+     * у IDE. Нет записи — Claude Code: так ведут себя все установки до 0.4.
+     */
+    var roleHarness: MutableMap<String, String> = mutableMapOf()
+
+    /** Модель каждой роли: id роли -> имя модели. Пусто — модель роли по умолчанию у харнеса. */
+    var roleModel: MutableMap<String, String> = mutableMapOf()
+
+    /** Команда запуска Codex. Как и у Claude, сюда вписывается обёртка. */
+    var codexLaunchCommand: String = "codex"
+
+    /**
+     * Аргументы Codex-агентов сверх роли, доверия к каталогу и модели.
+     *
+     * `-a never`: вопрос о подтверждении во вкладке, которую никто не читает, — вечная
+     * блокировка. `--disable hooks`: иначе при недоверенных хуках пользователя Codex
+     * спрашивает «Review hooks» на старте, а флаг `--dangerously-bypass-hook-trust`
+     * запустил бы непроверенный код (docs/PLAN-0.4.md §4.6). Строка видна в настройках
+     * целиком, чтобы это решение можно было пересмотреть, не трогая код.
+     */
+    var codexArgs: String = "-s workspace-write -a never --disable hooks"
+
+    fun harnessFor(role: Role): Harness =
+        if (role == Role.ORCHESTRATOR) Harness.CLAUDE
+        else Harness.fromKey(roleHarness[role.id]) ?: Harness.CLAUDE
+
+    fun modelFor(role: Role): String? = roleModel[role.id]?.trim()?.takeIf { it.isNotEmpty() }
 
     /** Дополнительные переменные окружения агентов, в формате KEY=VALUE, по одной в строке. */
     var extraEnvRaw: String = ""

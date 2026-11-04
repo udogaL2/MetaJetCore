@@ -5,6 +5,9 @@ import dev.metajetcore.agents.AgentInfo
 import dev.metajetcore.agents.AgentManager
 import dev.metajetcore.agents.BriefResult
 import dev.metajetcore.agents.CloseResult
+import dev.metajetcore.agents.DeliveryResult
+import dev.metajetcore.agents.ResetResult
+import dev.metajetcore.harness.Harness
 import dev.metajetcore.agents.SpawnResult
 import dev.metajetcore.roles.Role
 import dev.metajetcore.roles.RoleInstaller
@@ -50,8 +53,44 @@ class McpTools(private val project: Project) {
                     "string",
                     "Короткий суффикс имени: участок агента — be, fe, p1, tests, sec. Различает агентов одной роли.",
                 ),
+                "harness" to schema(
+                    "string",
+                    "Чем запустить агента; обычно не нужно — харнес роли задан в настройках " +
+                        "плагина. Codex-агент получает задачу сразу при старте, отвечает через " +
+                        "await_messages, новые задачи — через send_to_agent.",
+                    enumValues = Harness.entries.map { it.key },
+                ),
             ),
             required = listOf("role", "task", "parent"),
+        ),
+        tool(
+            name = "send_to_agent",
+            description = "Отправить сообщение агенту НЕ-Claude (Codex): новая задача, " +
+                "«Продолжай: фаза P+1», правки после гейта. Сообщение встаёт в его очередь " +
+                "новым ходом, текст доезжает как есть. Агентам Claude Code пиши SendMessage — " +
+                "этот инструмент им не доставляет. Ответ забирай через await_messages.",
+            properties = Json.obj(
+                "name" to schema("string", "Имя агента"),
+                "text" to schema("string", "Текст сообщения, целиком"),
+            ),
+            required = listOf("name", "text"),
+        ),
+        tool(
+            name = "await_messages",
+            description = "Дождаться ответов агентов НЕ-Claude (Codex): плагин читает их " +
+                "ленты и отдаёт завершённые ходы. С names — ждёт, пока ответит каждый (волна " +
+                "tempo), без — первый ответ любого. По таймауту возвращает что есть и кто ещё " +
+                "в работе: вызови снова. Ответы агентов Claude Code приходят сами, через " +
+                "SendMessage, их здесь не ждут.",
+            properties = Json.obj(
+                "names" to Json.obj(
+                    "type" to Json.of("array"),
+                    "items" to Json.obj("type" to Json.of("string")),
+                    "description" to Json.of("Имена агентов, чьи ответы ждём; пусто — любой"),
+                ),
+                "timeout_s" to schema("integer", "Сколько ждать, секунд (по умолчанию 45, максимум 120)"),
+            ),
+            required = emptyList(),
         ),
         tool(
             name = "list_agents",
@@ -117,6 +156,8 @@ class McpTools(private val project: Project) {
         return try {
             when (name) {
                 "spawn_agent" -> spawnAgent(args)
+                "send_to_agent" -> sendToAgent(args)
+                "await_messages" -> awaitMessages(args)
                 "list_agents" -> listAgents()
                 "brief_agent" -> briefAgent(args)
                 "reset_agent" -> resetAgent(args)
@@ -145,6 +186,13 @@ class McpTools(private val project: Project) {
             )
         val task = args["task"]?.asString.orEmpty()
         val parent = args["parent"]?.asString
+        val harnessKey = args["harness"]?.asString?.takeIf { it.isNotBlank() }
+        val harness = harnessKey?.let {
+            Harness.fromKey(it) ?: return textResult(
+                "неизвестный харнес '$it'; доступны: ${Harness.entries.joinToString { h -> h.key }}",
+                isError = true,
+            )
+        }
 
         return when (
             val result = manager.spawn(
@@ -154,6 +202,7 @@ class McpTools(private val project: Project) {
                 requestedName = args["name"]?.asString,
                 requestedModel = args["model"]?.asString,
                 domain = args["domain"]?.asString,
+                requestedHarness = harness,
             )
         ) {
             is SpawnResult.Started -> textResult(
@@ -172,12 +221,21 @@ class McpTools(private val project: Project) {
                         append("новый агент входит в задачу с нуля. Если участок другой — ")
                         append("всё верно, продолжай.")
                     }
-                    append("\n\nСЛЕДУЮЩИЙ ШАГ, ОБЯЗАТЕЛЬНО: отправь агенту задачу через ")
-                    append("SendMessage(to=\"${result.agent.name}\"). ")
-                    append("Плагин задачу не передаёт намеренно: терминал искажает не-ASCII ")
-                    append("(проверено живым прогоном), а сообщения доставляются как есть. ")
-                    append("Отправь ему это:\n\n")
-                    append(result.pendingBriefing)
+                    if (result.taskDelivered) {
+                        // Codex: без первого сообщения его сессия не создаётся, поэтому задача
+                        // ушла аргументом при старте. Повторно слать её нельзя — будет два хода.
+                        append("\n\nЗадача УЖЕ передана агенту при старте — повторно не отправляй. ")
+                        append("Это агент ${result.agent.harness.displayName}: SendMessage ему не ")
+                        append("доставляет. Ответ забери через await_messages(names=[\"${result.agent.name}\"]), ")
+                        append("следующие задачи — через send_to_agent.")
+                    } else {
+                        append("\n\nСЛЕДУЮЩИЙ ШАГ, ОБЯЗАТЕЛЬНО: отправь агенту задачу через ")
+                        append("SendMessage(to=\"${result.agent.name}\"). ")
+                        append("Плагин задачу не передаёт намеренно: терминал искажает не-ASCII ")
+                        append("(проверено живым прогоном), а сообщения доставляются как есть. ")
+                        append("Отправь ему это:\n\n")
+                        append(result.pendingBriefing)
+                    }
                 },
             )
 
@@ -227,11 +285,53 @@ class McpTools(private val project: Project) {
 
     private fun resetAgent(args: Json): Json {
         val name = args["name"]?.asString ?: return textResult("ошибка: нет name", isError = true)
-        return if (manager.reset(name)) {
-            textResult("контекст '$name' сброшен; новую задачу отправь через SendMessage")
-        } else {
-            textResult("вкладка '$name' плагину неизвестна", isError = true)
+        return when (val result = manager.reset(name)) {
+            ResetResult.Done -> textResult("контекст '$name' сброшен; новую задачу отправь через SendMessage")
+            ResetResult.UnknownTab -> textResult("вкладка '$name' плагину неизвестна", isError = true)
+            is ResetResult.Unsupported -> textResult(result.reason, isError = true)
         }
+    }
+
+    private fun sendToAgent(args: Json): Json {
+        val name = args["name"]?.asString ?: return textResult("ошибка: нет name", isError = true)
+        val text = args["text"]?.asString ?: return textResult("ошибка: нет text", isError = true)
+        return when (val result = manager.deliver(name, text)) {
+            DeliveryResult.Sent ->
+                textResult("отправлено '$name'; ответ забери через await_messages(names=[\"$name\"])")
+            DeliveryResult.UseSendMessage -> textResult(
+                "'$name' — сессия Claude Code: пиши ей SendMessage. Плагин второй канал не " +
+                    "заводит — у двух очередей не было бы порядка между собой.",
+                isError = true,
+            )
+            DeliveryResult.UnknownAgent ->
+                textResult("агент '$name' плагину неизвестен; см. list_agents", isError = true)
+            is DeliveryResult.Failed -> textResult("не доставлено: ${result.reason}", isError = true)
+        }
+    }
+
+    private fun awaitMessages(args: Json): Json {
+        val names = args["names"]?.asList?.mapNotNull { it.asString }?.takeIf { it.isNotEmpty() }
+        val timeout = (args["timeout_s"]?.asLong ?: DEFAULT_AWAIT_S).coerceIn(0, MAX_AWAIT_S)
+        val result = manager.awaitMessages(names, timeout * 1000)
+        return textResult(
+            buildString {
+                if (result.messages.isEmpty()) append("Новых ответов нет.\n")
+                for (message in result.messages) {
+                    append("=== от ${message.from} ===\n")
+                    append(message.text.ifBlank { "(ход без текста)" })
+                    append("\n\n")
+                }
+                if (result.stillWorking.isNotEmpty()) {
+                    append("Ещё в работе: ${result.stillWorking.joinToString()}. Вызови await_messages снова.\n")
+                }
+                if (result.notInMailbox.isNotEmpty()) {
+                    append(
+                        "Не ждём: ${result.notInMailbox.joinToString()} — это сессии Claude Code " +
+                            "или неизвестные имена; ответы Claude-агентов приходят через SendMessage.\n",
+                    )
+                }
+            }.trimEnd(),
+        )
     }
 
     private fun closeAgent(args: Json): Json {
@@ -273,6 +373,11 @@ class McpTools(private val project: Project) {
                 append("проект: ${project.name}\n")
                 append("префикс имён: ${manager.prefix()}\n")
                 append("команда запуска: ${settings.launchCommand}\n")
+                append("команда Codex: ${settings.codexLaunchCommand} ${settings.codexArgs}\n")
+                append("харнесы ролей: ")
+                append(Role.entries.filter { it != Role.ORCHESTRATOR }.joinToString { "${it.id}=${settings.harnessFor(it).key}" })
+                append('\n')
+                append("агенты терминала IDE: ${dev.metajetcore.terminal.Terminal.terminalAgentKeys().ifEmpty { listOf("(API недоступно)") }}\n")
                 append("роли в: ${RoleInstaller.agentsDirectory()}\n")
                 append("режим прав агентов: ${settings.permissionMode.ifBlank { "(не задан)" }}\n")
                 append("вычищаем из окружения: ${manager.inheritedMarkers().ifEmpty { listOf("(нечего)") }}\n")
@@ -289,6 +394,7 @@ class McpTools(private val project: Project) {
     private fun describe(agent: AgentInfo): String = buildString {
         append("- ${agent.name}")
         append("  роль=${agent.role?.id ?: "неизвестна"}")
+        if (agent.harness != Harness.CLAUDE) append("  харнес=${agent.harness.key}")
         if (agent.model.isNotBlank()) append("  модель=${agent.model}")
         agent.status?.let { append("  статус=$it") }
         agent.pid?.let { append("  pid=$it") }
@@ -317,6 +423,11 @@ class McpTools(private val project: Project) {
         )
         if (enumValues != null) fields["enum"] = Json.arr(enumValues.map { Json.of(it) })
         return Json.Obj(fields)
+    }
+
+    private companion object {
+        const val DEFAULT_AWAIT_S = 45L
+        const val MAX_AWAIT_S = 120L
     }
 
     private fun textResult(text: String, isError: Boolean = false): Json = Json.obj(

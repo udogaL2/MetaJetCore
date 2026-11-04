@@ -2,6 +2,7 @@ package dev.metajetcore
 
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import dev.metajetcore.agents.AgentManager
+import dev.metajetcore.harness.Harness
 import dev.metajetcore.mcp.McpTools
 import dev.metajetcore.registry.SessionRegistry
 import dev.metajetcore.roles.Role
@@ -67,6 +68,11 @@ class McpIntegrationTest : BasePlatformTestCase() {
         )
     }
 
+    private fun callText(tool: String, vararg arguments: Pair<String, Json>): String {
+        val result = tools.call(Json.obj("name" to Json.of(tool), "arguments" to Json.obj(*arguments)))
+        return result["content"]!!.asList!!.first()["text"]!!.asString!!
+    }
+
     private fun spawnCall(vararg extra: Pair<String, Json>): String {
         val arguments = Json.obj(
             "role" to Json.of("implementer"),
@@ -109,6 +115,45 @@ class McpIntegrationTest : BasePlatformTestCase() {
 
         val text = spawnCall("name" to Json.of("mjc-impl-be"), "domain" to Json.of("fe"))
         assertTrue(text, text.contains("уже занято"))
+    }
+
+    fun testCodexLaunchLineHasNoUserText() {
+        // Задача, доверие и модель едут через env вкладки; в строке шелла — только ссылки.
+        val line = manager.codexArgv(Role.REVIEWER, "gpt-x").last()
+        assertTrue(line, line.contains("-p mjc-reviewer"))
+        assertTrue(line, line.contains("--disable hooks"))
+        assertTrue(line, line.contains("-a never"))
+        assertTrue(line, line.contains("-m \"${'$'}MJC_MODEL\""))
+        assertTrue(line, line.trimEnd().endsWith("\"${'$'}MJC_TASK\""))
+        assertTrue(line, line.contains("exec "))
+        // Само значение модели в строку не попадает — только ссылка.
+        assertFalse(line, line.contains("gpt-x"))
+
+        val env = manager.codexEnv(Role.REVIEWER, "mjc-rev-x", "gpt-x", null, null, "задача \"в кавычках\"")
+        assertEquals("задача \"в кавычках\"", env["MJC_TASK"])
+        assertEquals("gpt-x", env["MJC_MODEL"])
+        assertTrue(env["MJC_CODEX_TRUST"]!!.startsWith("projects={"))
+        // Пустая модель — флаг не ставится, Codex возьмёт свою из конфига.
+        assertFalse(manager.codexArgv(Role.REVIEWER, "").last().contains(" -m "))
+    }
+
+    fun testModelIsChosenPerHarness() {
+        assertEquals("opus", manager.modelFor(Role.IMPLEMENTER, Harness.CLAUDE, null))
+        assertEquals("haiku", manager.modelFor(Role.IMPLEMENTER, Harness.CLAUDE, "haiku"))
+        // tempo пишет модели в терминах Claude; Codex на них упал бы.
+        assertEquals("", manager.modelFor(Role.IMPLEMENTER, Harness.CODEX, "opus"))
+        assertEquals("gpt-x", manager.modelFor(Role.IMPLEMENTER, Harness.CODEX, "gpt-x"))
+    }
+
+    fun testSendToClaudeAgentPointsToSendMessage() {
+        registerLiveSession(4343, "mjc-impl-cl", "mjc-implementer")
+        val text = callText("send_to_agent", "name" to Json.of("mjc-impl-cl"), "text" to Json.of("x"))
+        assertTrue(text, text.contains("SendMessage"))
+    }
+
+    fun testAwaitMessagesAnswersWithoutCodexAgents() {
+        val text = callText("await_messages", "timeout_s" to Json.of(0))
+        assertTrue(text, text.contains("Новых ответов нет"))
     }
 
     fun testLaunchLineCarriesOnlyWhatEnvironmentCannot() {
@@ -339,7 +384,7 @@ class McpIntegrationTest : BasePlatformTestCase() {
         val names = definitions.mapNotNull { it["name"]?.asString }.toSet()
         assertEquals(
             setOf(
-                "spawn_agent", "list_agents", "brief_agent", "reset_agent",
+                "spawn_agent", "send_to_agent", "await_messages", "list_agents", "brief_agent", "reset_agent",
                 "close_agent", "focus_agent", "read_tab", "diagnostics",
             ),
             names,

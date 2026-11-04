@@ -4,6 +4,8 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
+import dev.metajetcore.harness.Codex
+import dev.metajetcore.harness.Harness
 import dev.metajetcore.registry.SessionRecord
 import dev.metajetcore.registry.SessionRegistry
 import dev.metajetcore.roles.Role
@@ -15,10 +17,12 @@ import dev.metajetcore.terminal.TabPlacement
 import dev.metajetcore.terminal.SessionTab
 import dev.metajetcore.terminal.TabResolver
 import dev.metajetcore.terminal.Terminal
+import dev.metajetcore.util.Json
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 
 /** Что плагин знает про запущенного агента. */
 data class AgentInfo(
@@ -30,7 +34,37 @@ data class AgentInfo(
     val pid: Int?,
     val status: String?,
     val managed: Boolean,
+    val harness: Harness = Harness.CLAUDE,
 )
+
+/** Ответ агента не-Claude, собранный плагином (для Claude-агентов канал — SendMessage). */
+data class AgentMessage(val from: String, val text: String)
+
+/** Результат ожидания ответов: что пришло и кого ещё ждём. */
+data class AwaitResult(
+    val messages: List<AgentMessage>,
+    val stillWorking: List<String>,
+    /** Имена, ответы которых через ящик не приходят: Claude-агенты или неизвестные. */
+    val notInMailbox: List<String>,
+)
+
+/** Результат отправки задачи агенту через плагин. */
+sealed interface DeliveryResult {
+    data object Sent : DeliveryResult
+
+    /** Агент — сессия Claude Code: ей пишут SendMessage, плагин второй канал не заводит. */
+    data object UseSendMessage : DeliveryResult
+
+    data object UnknownAgent : DeliveryResult
+
+    data class Failed(val reason: String) : DeliveryResult
+}
+
+sealed interface ResetResult {
+    data object Done : ResetResult
+    data object UnknownTab : ResetResult
+    data class Unsupported(val reason: String) : ResetResult
+}
 
 /** Результат печати текста во вкладку. */
 sealed interface BriefResult {
@@ -77,6 +111,11 @@ sealed interface SpawnResult {
         val agent: AgentInfo,
         val pendingBriefing: String,
         val siblings: List<AgentInfo> = emptyList(),
+        /**
+         * Задача уже у агента: Codex получает её аргументом при старте, потому что без
+         * первого сообщения его сессия не создаётся вовсе (docs/PLAN-0.4.md §4.6).
+         */
+        val taskDelivered: Boolean = false,
     ) : SpawnResult
 
     /** Терминал недоступен или сессия не поднялась. Оркестратор попросит разработчика. */
@@ -91,6 +130,23 @@ class AgentManager(private val project: Project) {
     private val log = Logger.getInstance(AgentManager::class.java)
     private val tabs = ConcurrentHashMap<String, TabHandle>()
     private val spawned = ConcurrentHashMap<String, AgentInfo>()
+
+    /**
+     * Codex-агенты: их нет в реестре Claude Code, поэтому всё, что про них известно, —
+     * только здесь. Адрес — UUID треда, ответы — из ленты rollout.
+     */
+    private val codexAgents = ConcurrentHashMap<String, CodexAgent>()
+
+    /** Собранные, но ещё не отданные оркестратору ответы агентов не-Claude. */
+    private val pending = ConcurrentHashMap<String, MutableList<String>>()
+
+    /**
+     * Свою сессию Codex опознаём как «новая лента в этом каталоге после момента старта».
+     * Два одновременных старта так не развести, поэтому спавны Codex идут по одному.
+     */
+    private val codexSpawnLock = Any()
+
+    private class CodexAgent(val session: Codex.Session, val reader: Codex.RolloutReader)
 
     private val settings get() = MjcSettings.getInstance()
 
@@ -139,7 +195,12 @@ class AgentManager(private val project: Project) {
         requestedName: String?,
         requestedModel: String?,
         domain: String?,
+        requestedHarness: Harness? = null,
     ): SpawnResult {
+        val harness = requestedHarness ?: settings.harnessFor(role)
+        if (role == Role.ORCHESTRATOR && harness != Harness.CLAUDE) {
+            return SpawnResult.Failed("оркестратор работает только в Claude Code")
+        }
         // Имя родителя приводим к тому, как сессия называется в реестре: оркестратор
         // копирует его из ListAgents вместе с ref-хвостом (см. canonicalName).
         val parent = parentName?.takeIf { it.isNotBlank() }?.let { canonicalName(it) }
@@ -162,13 +223,16 @@ class AgentManager(private val project: Project) {
         val parentSession = parent?.let { parentSessionId(it, parentTab?.record) }
 
         val name = requestedName?.takeIf { it.isNotBlank() } ?: generateName(role, domain)
-        if (SessionRegistry.isNameTaken(name)) {
+        if (SessionRegistry.isNameTaken(name) || codexAgents.containsKey(name)) {
             return SpawnResult.Failed(
                 "имя '$name' уже занято живой сессией; передай другое или закрой ту сессию",
             )
         }
 
-        val model = requestedModel?.takeIf { it.isNotBlank() } ?: role.defaultModel
+        val model = modelFor(role, harness, requestedModel)
+        if (harness == Harness.CODEX) {
+            return spawnCodex(role, task, name, model, parent, parentSession, parentTab, siblings)
+        }
         val manualCommand = manualCommand(role, name, model, parent, parentSession)
 
         if (!runOnEdt { Terminal.isAvailable(project) }) {
@@ -237,6 +301,108 @@ class AgentManager(private val project: Project) {
         return SpawnResult.Started(info, pendingBriefing = task, siblings = siblings)
     }
 
+    /**
+     * Модель агента: явная из вызова, затем из настроек роли, затем дефолт роли.
+     *
+     * Для Codex имена моделей Claude отбрасываются: tempo задаёт модель в терминах Claude, и
+     * `-m opus` уронил бы Codex на старте. Пустая строка у Codex — модель из его конфига.
+     */
+    internal fun modelFor(role: Role, harness: Harness, requested: String?): String {
+        val explicit = requested?.trim()?.takeIf { it.isNotEmpty() }
+        return when (harness) {
+            Harness.CLAUDE -> explicit ?: settings.modelFor(role) ?: role.defaultModel
+            Harness.CODEX -> explicit?.takeUnless { Harness.isClaudeModel(it) }
+                ?: settings.modelFor(role)?.takeUnless { Harness.isClaudeModel(it) }
+                ?: ""
+        }
+    }
+
+    /**
+     * Спавн Codex-агента. Отличия от Claude — следствия того, как устроен Codex 0.166
+     * (docs/PLAN-0.4.md §4.6):
+     *
+     *  * задача уходит аргументом при старте: без первого сообщения сессия не создаётся, и
+     *    адреса для `codex queue` просто нет;
+     *  * готовность — появление новой ленты rollout в каталоге проекта, а не запись в
+     *    реестре Claude Code: туда Codex не пишет;
+     *  * роль — профилем `-p mjc-<role>`, а не флагом `--agent`.
+     */
+    private fun spawnCodex(
+        role: Role,
+        task: String,
+        name: String,
+        model: String,
+        parent: String?,
+        parentSession: String?,
+        parentTab: SessionTab?,
+        siblings: List<AgentInfo>,
+    ): SpawnResult = synchronized(codexSpawnLock) {
+        // Пустую задачу не отправляем пустой: без первого сообщения сессии не будет.
+        val firstMessage = task.ifBlank { CODEX_IDLE_TASK }
+        val env = codexEnv(role, name, model, parent, parentSession, firstMessage)
+        val manual = codexManualCommand(role, model, env)
+        if (!runOnEdt { Terminal.isAvailable(project) }) {
+            return SpawnResult.Manual(manual, "терминальное API IDE недоступно")
+        }
+        val since = System.currentTimeMillis()
+        val argv = runOnEdt { codexArgv(role, model) }
+        val handle = runOnEdt {
+            Terminal.openTab(
+                project = project,
+                name = name,
+                workingDirectory = projectDirectory(),
+                env = env,
+                command = argv,
+            )?.also { child ->
+                Terminal.setAgentIcon(child, Harness.CODEX.key)
+                TabPlacement.placeNear(project, parentTab?.handle, child)
+            }
+        } ?: return SpawnResult.Manual(manual, "не удалось открыть вкладку терминала")
+        tabs[name] = handle
+
+        val session = awaitCodexSession(handle, since)
+            ?: run {
+                val exited = runOnEdt { Terminal.isTerminated(handle) || !Terminal.isOpen(project, handle) }
+                if (exited) tabs.remove(name)
+                return SpawnResult.Manual(
+                    manual,
+                    if (exited) {
+                        "процесс Codex завершился до начала сессии; проверь команду запуска " +
+                            "Codex в настройках плагина (запускалось: ${argv.joinToString(" ")})"
+                    } else {
+                        "сессия Codex не появилась за ${settings.readyTimeoutSeconds} c; посмотри " +
+                            "экран вкладки (read_tab) — скорее всего Codex задал вопрос на старте"
+                    },
+                )
+            }
+        codexAgents[name] = CodexAgent(session, Codex.RolloutReader(session.rollout))
+        val info = AgentInfo(
+            name = name,
+            role = role,
+            model = model,
+            sessionId = session.id,
+            pid = runOnEdt { Terminal.process(handle) }?.pid?.toInt(),
+            status = "busy",
+            managed = true,
+            harness = Harness.CODEX,
+        )
+        spawned[name] = info
+        SpawnResult.Started(info, pendingBriefing = task, siblings = siblings, taskDelivered = true)
+    }
+
+    private fun awaitCodexSession(handle: TabHandle, since: Long): Codex.Session? {
+        val claimed = codexAgents.values.map { it.session.id }.toSet()
+        val deadline = System.currentTimeMillis() + settings.readyTimeoutSeconds * 1000L
+        while (System.currentTimeMillis() < deadline) {
+            Codex.findNewSession(projectDirectory(), since, claimed)?.let { return it }
+            if (runOnEdt { Terminal.isTerminated(handle) || !Terminal.isOpen(project, handle) }) {
+                return Codex.findNewSession(projectDirectory(), since, claimed)
+            }
+            Thread.sleep(POLL_INTERVAL_MS)
+        }
+        return null
+    }
+
     // ------------------------------------------------------------- lifecycle
 
     /**
@@ -259,12 +425,23 @@ class AgentManager(private val project: Project) {
         // и расхождение между ними означало бы вкладку-сироту.
         val name = canonicalName(rawName)
         val handle = tabFor(name) ?: return CloseResult.UnknownTab
-        if (runOnEdt { Terminal.isOpen(project, handle) }) {
+        val codex = codexAgents[name]
+        if (codex == null && runOnEdt { Terminal.isOpen(project, handle) }) {
             runOnEdt { Terminal.send(handle, "/exit", execute = true) }
         }
-        awaitSessionGone(name)
+        if (codex == null) awaitSessionGone(name)
+        // Последний ответ мог прийти прямо перед выходом — собираем, пока агент ещё известен.
+        collectReplies()
+        codexAgents.remove(name)
         // Управлять больше нечем: сессии нет. Дальше речь только об уборке вкладки.
         spawned.remove(name)
+
+        // Codex завершаем сигналом, а не командой в TUI. Живой прогон в IDE: `/quit` не
+        // срабатывал ни слитно с Enter, ни с Enter отдельно после паузы — терминал IDE
+        // доставляет ввод в TUI Codex иначе, чем голый pty (там тот же ввод работает). Сигнал
+        // — контракт ОС, а не экранной формы: SIGTERM, время на корректный выход, затем
+        // принудительно. Лента rollout пишется по событию, поэтому ничего не теряется.
+        if (codex != null && handle.ownsProcess) Terminal.killProcessTree(handle, KILL_GRACE_MS)
 
         var dead = awaitTabDead(handle)
         if (!dead && handle.ownsProcess) {
@@ -289,9 +466,140 @@ class AgentManager(private val project: Project) {
     }
 
     /** Сброс контекста между этапами: сессия и вкладка остаются живыми. */
-    fun reset(rawName: String): Boolean {
-        val handle = tabFor(rawName) ?: return false
-        return runOnEdt { Terminal.send(handle, "/clear", execute = true) }
+    fun reset(rawName: String): ResetResult {
+        val name = canonicalName(rawName)
+        if (codexAgents.containsKey(name)) {
+            // `/new` в Codex заводит новый тред с новым UUID, а его лента появится только со
+            // следующим сообщением — плагин потерял бы адрес агента (docs/PLAN-0.4.md §4.6).
+            return ResetResult.Unsupported(
+                "сброс контекста Codex-агента не поддерживается: закрой его (close_agent) и " +
+                    "заведи нового (spawn_agent)",
+            )
+        }
+        val handle = tabFor(name) ?: return ResetResult.UnknownTab
+        return if (runOnEdt { Terminal.send(handle, "/clear", execute = true) }) ResetResult.Done
+        else ResetResult.UnknownTab
+    }
+
+    /**
+     * Отправить сообщение агенту не-Claude.
+     *
+     * Codex — через `codex queue`: это его собственный способ доставить сообщение в живую
+     * сессию, сообщение встаёт новым ходом (проверено: кириллица доезжает целой). Печатать
+     * в TUI не годится по тем же причинам, что и для Claude.
+     *
+     * Claude-агентам плагин сообщений не возит: у них есть SendMessage, и второй канал
+     * означал бы две очереди без порядка между ними.
+     */
+    fun deliver(rawName: String, text: String): DeliveryResult {
+        val name = canonicalName(rawName)
+        val codex = codexAgents[name]
+            ?: return if (SessionRegistry.findByName(name) != null) DeliveryResult.UseSendMessage
+            else DeliveryResult.UnknownAgent
+        val shellPath = runOnEdt { Terminal.configuredShellPath(project) } ?: ShellDialect.defaultShell()
+        val dialect = ShellDialect.detect(shellPath)
+        val command = settings.codexLaunchCommand + " queue --thread " + dialect.envRef(ENV_THREAD) +
+            " --message " + dialect.envRef(ENV_MESSAGE)
+        val argv = dialect.argv(shellPath, dialect.unsetNames(inheritedMarkers()), command, execable = false)
+        return try {
+            val process = ProcessBuilder(argv)
+                .directory(projectDirectory().toFile())
+                .redirectErrorStream(true)
+                .also { it.environment()[ENV_THREAD] = codex.session.id; it.environment()[ENV_MESSAGE] = text }
+                .start()
+            process.outputStream.close()
+            val finished = process.waitFor(DELIVERY_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            val output = process.inputStream.bufferedReader().readText().trim()
+            when {
+                !finished -> {
+                    process.destroyForcibly()
+                    DeliveryResult.Failed("codex queue не завершился за ${DELIVERY_TIMEOUT_MS / 1000} c")
+                }
+                process.exitValue() != 0 ->
+                    DeliveryResult.Failed("codex queue: код ${process.exitValue()}: ${output.takeLast(400)}")
+                else -> DeliveryResult.Sent
+            }
+        } catch (e: Exception) {
+            DeliveryResult.Failed("не удалось запустить codex queue: ${e.message}")
+        }
+    }
+
+    /**
+     * Дождаться ответов агентов не-Claude.
+     *
+     * Модель tempo — «запустил волну, дождался всех отчётов». Claude-агенты отвечают сами,
+     * через SendMessage, а у Codex обратного канала в сессию Claude нет. Поэтому оркестратор
+     * ждёт их здесь: плагин читает ленты Codex и отдаёт завершённые ходы.
+     *
+     * С [names] — ждём, пока ответит каждый из них (или таймаут); без — первый же ответ
+     * любого. Возвращаем всё, что накопилось, — по таймауту тоже: частичный результат лучше
+     * пустого, оркестратор позовёт снова за остальными.
+     */
+    fun awaitMessages(names: List<String>?, timeoutMs: Long): AwaitResult {
+        val wanted = names?.map { canonicalName(it) }?.filter { it.isNotEmpty() }?.distinct()
+        val notInMailbox = wanted.orEmpty().filter { !codexAgents.containsKey(it) && !pending.containsKey(it) }
+        val waitFor = wanted?.minus(notInMailbox.toSet())
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (true) {
+            collectReplies()
+            val ready = when {
+                waitFor == null -> pending.values.any { it.isNotEmpty() }
+                waitFor.isEmpty() -> true
+                else -> waitFor.all { name ->
+                    pending[name]?.isNotEmpty() == true || !codexAgents.containsKey(name)
+                }
+            }
+            if (ready || System.currentTimeMillis() >= deadline) break
+            Thread.sleep(POLL_INTERVAL_MS)
+        }
+        val messages = mutableListOf<AgentMessage>()
+        for (name in waitFor ?: pending.keys.toList()) {
+            val queue = pending[name] ?: continue
+            synchronized(queue) {
+                queue.forEach { messages += AgentMessage(name, it) }
+                queue.clear()
+            }
+        }
+        val still = (waitFor ?: codexAgents.keys.toList()).filter { name ->
+            messages.none { it.from == name } && codexAgents[name]?.reader?.busy == true
+        }
+        return AwaitResult(messages, still, notInMailbox)
+    }
+
+    /**
+     * Дочитать ленты Codex-агентов и разложить завершённые ходы по ящикам.
+     *
+     * Копию пишем журналом в каталог отчётов: ящик живёт в памяти IDE, а оркестратор может
+     * перезапуститься посреди волны — тогда ответ хотя бы найдётся глазами.
+     */
+    private fun collectReplies() {
+        for ((name, agent) in codexAgents) {
+            val replies = agent.reader.readCompletedTurns()
+            if (replies.isEmpty()) continue
+            val queue = pending.getOrPut(name) { mutableListOf() }
+            synchronized(queue) { queue += replies }
+            journal(name, replies)
+        }
+    }
+
+    private fun journal(name: String, replies: List<String>) {
+        try {
+            val line = replies.joinToString("") { text ->
+                Json.obj(
+                    "at" to Json.of(System.currentTimeMillis()),
+                    "from" to Json.of(name),
+                    "text" to Json.of(text),
+                ).render() + "\n"
+            }
+            Files.writeString(
+                reportsDirectory().resolve(MAILBOX_JOURNAL),
+                line,
+                java.nio.file.StandardOpenOption.CREATE,
+                java.nio.file.StandardOpenOption.APPEND,
+            )
+        } catch (e: Exception) {
+            log.warn("MetaJetCore: журнал ящика не записан", e)
+        }
     }
 
     /**
@@ -423,9 +731,11 @@ class AgentManager(private val project: Project) {
         val owned = tabs.filterValues { it.ownsProcess }
         if (owned.isEmpty()) return
         val closed = runOnEdt { owned.filterValues { !Terminal.isOpen(project, it) }.keys }
+        if (closed.any { codexAgents.containsKey(it) }) collectReplies()
         for (name in closed) {
             tabs.remove(name)
             spawned.remove(name)
+            codexAgents.remove(name)
         }
     }
 
@@ -488,7 +798,22 @@ class AgentManager(private val project: Project) {
     /** Живые сессии в директории проекта, обогащённые тем, что плагин знает про вкладки. */
     fun list(): List<AgentInfo> {
         forgetClosedTabs()
-        return SessionRegistry.inDirectory(projectDirectory()).map { record ->
+        // Статус Codex-агента — по его ленте: дочитываем, заодно ответы встают в ящик.
+        collectReplies()
+        val codex = codexAgents.map { (name, agent) ->
+            val known = spawned[name]
+            AgentInfo(
+                name = name,
+                role = known?.role,
+                model = known?.model.orEmpty(),
+                sessionId = agent.session.id,
+                pid = known?.pid,
+                status = if (agent.reader.busy) "busy" else "idle",
+                managed = tabs.containsKey(name),
+                harness = Harness.CODEX,
+            )
+        }
+        return codex + SessionRegistry.inDirectory(projectDirectory()).map { record ->
             val name = record.name.orEmpty()
             val known = spawned[name]
             AgentInfo(
@@ -564,6 +889,68 @@ class AgentManager(private val project: Project) {
         env.putAll(settings.extraEnv())
         return env
     }
+
+    /**
+     * Окружение Codex-агента. Здесь же едут переменные части его командной строки — задача,
+     * доверие к каталогу, модель: в строке остаются только ссылки на них (см.
+     * [ShellDialect.envRef]), и никакой пользовательский текст через синтаксис шелла не идёт.
+     */
+    internal fun codexEnv(
+        role: Role,
+        name: String,
+        model: String,
+        parentName: String?,
+        parentSessionId: String?,
+        task: String,
+    ): Map<String, String> {
+        val env = LinkedHashMap<String, String>()
+        env["MJC_AGENT_NAME"] = name
+        env["MJC_ROLE"] = role.id
+        env["MJC_REPORTS_DIR"] = reportsDirectory().toString().replace(BACKSLASH, '/')
+        parentName?.takeIf { it.isNotBlank() }?.let { env["MJC_PARENT"] = it.take(MAX_PARENT_NAME) }
+        parentSessionId?.takeIf { it.isNotBlank() }?.let { env["MJC_PARENT_SESSION"] = it }
+        env[ENV_TASK] = task
+        env[ENV_TRUST] = Codex.trustOverride(projectDirectory())
+        if (model.isNotBlank()) env[ENV_MODEL] = model
+        env.putAll(settings.extraEnv())
+        return env
+    }
+
+    /**
+     * argv Codex-агента. Порядок: профиль роли, модель, аргументы из настроек, доверие к
+     * каталогу, задача последней — она позиционный аргумент `[PROMPT]`.
+     *
+     * `exec` решаем по команде без ссылок на переменные: сами ссылки (`"${'$'}MJC_TASK"`) делают
+     * строку «составной» для [ShellDialect.isSimple], хотя программа в ней одна.
+     */
+    internal fun codexArgv(role: Role, model: String): List<String> {
+        val shellPath = Terminal.configuredShellPath(project) ?: ShellDialect.defaultShell()
+        val dialect = ShellDialect.detect(shellPath)
+        val base = settings.codexLaunchCommand + " -p " + Codex.profileName(role) +
+            " " + settings.codexArgs.trim()
+        val command = buildString {
+            append(base.trim())
+            if (model.isNotBlank()) append(" -m ").append(dialect.envRef(ENV_MODEL))
+            append(" -c ").append(dialect.envRef(ENV_TRUST))
+            append(' ').append(dialect.envRef(ENV_TASK))
+        }
+        return dialect.argv(
+            shellPath,
+            dialect.unsetNames(inheritedMarkers()),
+            command,
+            execable = ShellDialect.isSimple(base),
+        )
+    }
+
+    /** Ручной режим для Codex: значения вписаны в строку POSIX-кавычками. */
+    private fun codexManualCommand(role: Role, model: String, env: Map<String, String>): String {
+        val assignments = env.entries.joinToString(" ") { (key, value) -> "$key=${posixQuote(value)}" }
+        val modelFlag = if (model.isNotBlank()) " -m \"${'$'}$ENV_MODEL\"" else ""
+        return "$assignments ${settings.codexLaunchCommand} -p ${Codex.profileName(role)} " +
+            "${settings.codexArgs.trim()}$modelFlag -c \"${'$'}$ENV_TRUST\" \"${'$'}$ENV_TASK\""
+    }
+
+    private fun posixQuote(value: String): String = "'" + value.replace("'", "'\\''") + "'"
 
     /**
      * Окружение вкладки оркестратора.
@@ -771,6 +1158,18 @@ class AgentManager(private val project: Project) {
         const val TAB_READY_TIMEOUT_MS = 20_000L
         const val TAB_CLOSE_TIMEOUT_MS = 3_000L
         const val KILL_GRACE_MS = 3_000L
+
+        /** Задача по умолчанию: без первого сообщения сессия Codex не создаётся. */
+        const val CODEX_IDLE_TASK = "Задач пока нет. Ответь одной строкой: STATUS: DONE"
+
+        const val ENV_TASK = "MJC_TASK"
+        const val ENV_TRUST = "MJC_CODEX_TRUST"
+        const val ENV_MODEL = "MJC_MODEL"
+        const val ENV_THREAD = "MJC_THREAD"
+        const val ENV_MESSAGE = "MJC_MESSAGE"
+
+        const val DELIVERY_TIMEOUT_MS = 30_000L
+        const val MAILBOX_JOURNAL = "mailbox.jsonl"
 
         /** `agentKey` Claude Code в списке агентов терминала IDE — для иконки вкладки. */
         const val CLAUDE_AGENT_KEY = "claude_code"

@@ -333,6 +333,28 @@ interface Harness {
 - **E4** закрыт на этапе 1: `TerminalAgent` через рефлексию работает (иконка вкладки), список
   ключей берём оттуда же.
 
+
+### 4.7 Итог этапа 3
+- `harness/Harness.kt` (ключи = `agentKey` IDE), `harness/Codex.kt` (профили ролей, поиск
+  и чтение rollout), настройки «роль → харнес + модель», команда и аргументы Codex. Список в
+  настройках — из агентов терминала IDE (в песочнице: `junie, claude_code, codex`). Junie видна,
+  но не назначается: для неё нет адаптера.
+- MCP: `spawn_agent(harness?)`, новые `send_to_agent` (через `codex queue`) и `await_messages`
+  (ящик из `task_complete`). У Claude-агента `send_to_agent` отвечает «пиши SendMessage»,
+  `reset_agent` у Codex — честный отказ.
+- Протокол роли для Codex без SendMessage: «последнее сообщение хода доставит плагин».
+- **Выход Codex — сигналом, не `/quit`.** В голом pty `/quit` плюс отдельный Enter работает,
+  а в терминале IDE не срабатывал ни слитно, ни с паузой. Процесс добивался по таймауту за
+  15 с. SIGTERM дереву с запасом на корректный выход — 0,2 с.
+- Модели Claude (`opus`, …) Codex-агенту не передаются: tempo пишет их по привычке.
+- Тесты: `CodexTest` (rollout, недописанная строка, поиск сессии, TOML, протокол),
+  `ShellDialectTest` (envRef, exec), `McpIntegrationTest` (argv/env Codex, модели, новые
+  инструменты), поток `testCodexAgentLifecycle` на фальшивом codex — зелёные.
+- Живьём (PyCharm 2026.3 RC, настоящий Codex 0.166): спавн ревьювера-Codex без вопросов на
+  старте → `await_messages` «ПОНГ-1» → `send_to_agent` с кириллицей и «кавычками» → ответ
+  дословно → `list_agents` idle → `close_agent` 0,2 с, процесса и вкладки нет. Роль из профиля
+  видна developer-сообщением в ленте.
+
 ---
 
 ## 5. Этап 4 — возможности IDE (резерв идей)

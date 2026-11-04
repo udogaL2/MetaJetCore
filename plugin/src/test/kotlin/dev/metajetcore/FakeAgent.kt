@@ -103,3 +103,46 @@ object FakeAgent {
         done
     """.trimIndent()
 }
+
+/**
+ * Подставной `codex`: пишет ленту сессии так, как её пишет Codex 0.166 (`session_meta`, затем
+ * `task_started` / `task_complete` на каждый ход) и отвечает на `queue` новым ходом. Сам не
+ * выходит: плагин завершает Codex сигналом, как и настоящий. Ответ хода — `ECHO: <текст>`, чтобы тест видел, что доехало именно его сообщение.
+ *
+ * Только POSIX: проверяется не Codex, а наш цикл — поиск ленты, ящик, доставка, закрытие.
+ */
+object FakeCodex {
+
+    class Installed(val command: String, val home: Path)
+
+    fun install(): Installed {
+        val home = Files.createTempDirectory("mjc-fake-codex")
+        Files.createDirectories(home.resolve("sessions/2026/11/04"))
+        val script = home.resolve("codex.sh")
+        Files.write(script, script().toByteArray())
+        return Installed("bash $script $home", home)
+    }
+
+    private fun script(): String = """
+        #!/usr/bin/env bash
+        HOME_DIR="${'$'}1"; shift
+        DIR="${'$'}HOME_DIR/sessions/2026/11/04"
+        esc() { printf '%s' "${'$'}1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n' ' '; }
+        turn() {
+            printf '{"type":"event_msg","payload":{"type":"task_started"}}\n' >> "${'$'}1"
+            printf '{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"ECHO: %s"}}\n' "${'$'}(esc "${'$'}2")" >> "${'$'}1"
+        }
+        if [ "${'$'}1" = "queue" ]; then
+            # codex queue --thread <id> --message <text>
+            ID="${'$'}3"; MSG="${'$'}5"
+            turn "${'$'}(ls "${'$'}DIR"/rollout-*-"${'$'}ID".jsonl)" "${'$'}MSG"
+            exit 0
+        fi
+        for ARG in "${'$'}@"; do TASK="${'$'}ARG"; done
+        ID="fake-${'$'}${'$'}"
+        FILE="${'$'}DIR/rollout-2026-11-04T00-00-00-${'$'}ID.jsonl"
+        printf '{"type":"session_meta","payload":{"id":"%s","cwd":"%s"}}\n' "${'$'}ID" "${'$'}(esc "${'$'}(pwd)")" > "${'$'}FILE"
+        turn "${'$'}FILE" "${'$'}TASK"
+        while IFS= read -r LINE; do :; done
+    """.trimIndent()
+}

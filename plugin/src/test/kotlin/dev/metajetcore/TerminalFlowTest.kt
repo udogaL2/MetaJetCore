@@ -6,6 +6,8 @@ import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import dev.metajetcore.agents.AgentManager
 import dev.metajetcore.agents.CloseResult
 import dev.metajetcore.agents.SpawnResult
+import dev.metajetcore.harness.Codex
+import dev.metajetcore.harness.Harness
 import dev.metajetcore.registry.SessionRegistry
 import dev.metajetcore.roles.Role
 import dev.metajetcore.settings.MjcSettings
@@ -57,6 +59,8 @@ class TerminalFlowTest : BasePlatformTestCase() {
             SessionRegistry.directoryOverride = null
             SessionRegistry.isProcessAlive = SessionRegistry.defaultLivenessCheck
             settings.launchCommand = "claude"
+            settings.codexLaunchCommand = "codex"
+            Codex.homeOverride = null
             TestDialogManager.setTestDialog(TestDialog.DEFAULT)
         } finally {
             super.tearDown()
@@ -93,7 +97,11 @@ class TerminalFlowTest : BasePlatformTestCase() {
 
         // /clear доходит до уже запущенного процесса. Раньше он оседал в поле ввода:
         // в pty уходил \n, а Enter в TUI — это \r.
-        assertTrue("reset не прошёл", onPooledThreadPumpingEdt { manager.reset(name) })
+        assertEquals(
+            "reset не прошёл",
+            dev.metajetcore.agents.ResetResult.Done,
+            onPooledThreadPumpingEdt { manager.reset(name) },
+        )
 
         // Не-ASCII в терминал не отправляем — он его искажает (docs/ARCHITECTURE.md §2.7.1).
         assertTrue(
@@ -261,6 +269,60 @@ class TerminalFlowTest : BasePlatformTestCase() {
     /** Экран вкладки — то, что видел бы разработчик. Без него отладка стенда слепая. */
     private fun screenOf(name: String): String =
         onPooledThreadPumpingEdt { manager.readScreen(name) } ?: "(экран недоступен)"
+
+    fun testCodexAgentLifecycle() {
+        if (dev.metajetcore.shell.ShellDialect.isWindows()) return
+        // Весь цикл Codex-агента: задача уходит при старте, ответ хода плагин берёт из ленты,
+        // следующая задача — через `codex queue`, сброс честно не поддерживается, закрытие
+        // по /quit закрывает и вкладку.
+        val codex = FakeCodex.install()
+        Codex.homeOverride = codex.home
+        settings.codexLaunchCommand = codex.command
+        // Сессию Codex плагин опознаёт по каталогу. У лёгкого тестового проекта basePath на
+        // диске нет, и терминал стартовал бы в родительском — в жизни каталог проекта есть.
+        Files.createDirectories(manager.projectDirectory())
+
+        val result = onPooledThreadPumpingEdt {
+            manager.spawn(
+                role = Role.REVIEWER,
+                task = "проверь \"кавычки\" и ${'$'}HOME",
+                parentName = null,
+                requestedName = null,
+                requestedModel = "opus",
+                domain = "cdx",
+                requestedHarness = Harness.CODEX,
+            )
+        }
+        val started = result as? SpawnResult.Started
+            ?: throw AssertionError("Codex-агент не поднялся: $result\nэкран:\n${screenOf("mjc-rev-cdx")}")
+        val name = started.agent.name
+        assertTrue("задача должна уйти при старте", started.taskDelivered)
+        assertEquals(Harness.CODEX, started.agent.harness)
+        // Модель Claude Codex-у не передаётся: он бы на ней упал.
+        assertEquals("", started.agent.model)
+
+        // Задача доехала через env дословно: кавычки целы, ${'$'}HOME не раскрыт.
+        val first = onPooledThreadPumpingEdt { manager.awaitMessages(listOf(name), 10_000) }
+        assertEquals(first.toString(), listOf("ECHO: проверь \"кавычки\" и ${'$'}HOME"), first.messages.map { it.text })
+
+        val listed = manager.list().firstOrNull { it.name == name }
+        assertEquals("idle", listed?.status)
+        assertEquals(Harness.CODEX, listed?.harness)
+
+        assertEquals(
+            dev.metajetcore.agents.DeliveryResult.Sent,
+            onPooledThreadPumpingEdt { manager.deliver(name, "вторая задача") },
+        )
+        val second = onPooledThreadPumpingEdt { manager.awaitMessages(listOf(name), 10_000) }
+        assertEquals(second.toString(), listOf("ECHO: вторая задача"), second.messages.map { it.text })
+
+        assertTrue(
+            onPooledThreadPumpingEdt { manager.reset(name) } is dev.metajetcore.agents.ResetResult.Unsupported,
+        )
+        assertEquals(CloseResult.Closed, onPooledThreadPumpingEdt { manager.close(name) })
+        assertFalse("вкладка осталась под управлением", manager.knownTabs().contains(name))
+        assertNull(manager.list().firstOrNull { it.name == name })
+    }
 
     fun testFakeAgentWritesWhereWeExpect() {
         // Проверка самого стенда: если подставной агент перестанет писать запись, остальные

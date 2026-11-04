@@ -182,6 +182,12 @@ object Terminal {
      * манглинга (`getAgentKey-LamVg8w`) и возвращает уже распакованную строку. Суффикс между
      * версиями может смениться — ищем по префиксу.
      */
+    /**
+     * Ключи агентов, которых знает терминал IDE: `claude_code`, `codex`, `junie`, сторонние.
+     * Пусто — API нет (не 263+) или поменялось; тогда плагин работает только с Claude Code.
+     */
+    fun terminalAgentKeys(): List<String> = terminalAgents().mapNotNull { agentKeyOf(it) }
+
     fun agentKeyOf(agent: Any): String? = try {
         agent.javaClass.methods
             .firstOrNull { it.name.startsWith("getAgentKey") && it.parameterCount == 0 }

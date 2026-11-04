@@ -92,4 +92,18 @@ class ShellDialectTest {
         assertEquals(expected, ShellDialect.detect(null))
         assertEquals(expected, ShellDialect.detect(""))
     }
+
+    @Test
+    fun envRefPerDialect() {
+        assertEquals("\"${'$'}MJC_TASK\"", ShellDialect.POSIX.envRef("MJC_TASK"))
+        assertEquals("\"${'$'}env:MJC_TASK\"", ShellDialect.POWERSHELL.envRef("MJC_TASK"))
+        assertEquals("\"%MJC_TASK%\"", ShellDialect.CMD.envRef("MJC_TASK"))
+    }
+
+    @Test
+    fun execIsDecidedByTheCallerWhenAsked() {
+        // Ссылка на переменную делает строку «составной», хотя программа в ней одна.
+        val argv = ShellDialect.POSIX.argv("/bin/zsh", "", "codex \"${'$'}MJC_TASK\"", execable = true)
+        assertEquals("exec codex \"${'$'}MJC_TASK\"", argv.last())
+    }
 }
