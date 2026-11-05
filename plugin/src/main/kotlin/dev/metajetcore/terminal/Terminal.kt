@@ -224,6 +224,49 @@ object Terminal {
         return TabHandle(name = name, tab = tab, view = view, content = content)
     }
 
+    /**
+     * Снимает вкладку с тулвиндоу, не трогая сессию, — перед переносом в editor area.
+     *
+     * Без этого в тулвиндоу оставалась пустая вкладка с именем агента («Nothing to show»):
+     * `TerminalInEditorSupport.openInEditor` открывает терминал в редакторе, но вкладку не
+     * убирает — при перетаскивании мышью это делает сам drag-and-drop. Штатный «Move to Editor»
+     * (`MoveTerminalSessionToEditorAction`) поэтому сначала зовёт `detachTab`, а потом
+     * открывает файл; повторяем ровно этот порядок (проверено по байткоду 263.7307).
+     *
+     * Возвращает менеджер содержимого, из которого вкладку сняли, — чтобы вернуть её туда,
+     * если в редактор она не попадёт. null — снимать нечего или API нет: тогда перенос идёт
+     * как раньше, с пустой вкладкой внизу, но без поломки.
+     */
+    fun detachFromToolWindow(project: Project, handle: TabHandle): Any? {
+        val tab = handle.tab ?: return null
+        val contentManager = handle.content?.manager ?: return null
+        val manager = manager(project) ?: return null
+        return try {
+            val method = manager.javaClass.methods.firstOrNull { it.name == "detachTab" && it.parameterCount == 1 }
+                ?: return null
+            method.isAccessible = true
+            method.invoke(manager, tab)
+            contentManager
+        } catch (e: Throwable) {
+            log.info("MetaJetCore: снять '${handle.name}' с тулвиндоу не вышло", e)
+            null
+        }
+    }
+
+    /** Возвращает снятую вкладку в тулвиндоу: перенос в редактор не удался, а агент жив. */
+    fun reattachToToolWindow(project: Project, handle: TabHandle, contentManager: Any) {
+        val tab = handle.tab ?: return
+        val manager = manager(project) ?: return
+        try {
+            manager.javaClass.methods
+                .firstOrNull { it.name == "attachTab" && it.parameterCount == 2 }
+                ?.also { it.isAccessible = true }
+                ?.invoke(manager, tab, contentManager)
+        } catch (e: Throwable) {
+            log.warn("MetaJetCore: вернуть '${handle.name}' в тулвиндоу не вышло — вкладка без окна", e)
+        }
+    }
+
     /** Вкладки терминала в тулвиндоу. */
     fun tabs(project: Project): List<Any> {
         val manager = manager(project) ?: return emptyList()

@@ -44,10 +44,13 @@ object TabPlacement {
             return false
         }
 
+        val method = support.javaClass.methods.firstOrNull {
+            it.name == "openInEditor" && it.parameterCount == 2
+        } ?: return false
+        // Порядок штатного «Move to Editor»: сначала снять с тулвиндоу, потом открыть.
+        // Иначе внизу остаётся пустая вкладка агента (см. Terminal.detachFromToolWindow).
+        val detachedFrom = Terminal.detachFromToolWindow(project, handle)
         return try {
-            val method = support.javaClass.methods.firstOrNull {
-                it.name == "openInEditor" && it.parameterCount == 2
-            } ?: return false
             method.isAccessible = true
             method.invoke(support, content, window)
             // Файл ищем по самой вкладке, а не по выбранному в окне редактору: выбор мы сразу
@@ -59,6 +62,8 @@ object TabPlacement {
             // Именно с исключением: у обёрток рефлексии message пустой, и без причины
             // разбирать такое бесполезно — один раз уже потратили на это прогон.
             log.info("MetaJetCore: перенести '${handle.name}' в editor area не вышло", unwrap(e))
+            // Вкладку уже сняли — без возврата агент остался бы живым, но без окна.
+            detachedFrom?.let { Terminal.reattachToToolWindow(project, handle, it) }
             false
         }
     }

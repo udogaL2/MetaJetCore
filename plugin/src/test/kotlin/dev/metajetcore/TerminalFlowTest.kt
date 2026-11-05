@@ -197,6 +197,30 @@ class TerminalFlowTest : BasePlatformTestCase() {
         Terminal.closeTab(project, parent)
     }
 
+    fun testTabIsDetachedFromToolWindowAndCanBeReturned() {
+        // Перенос в editor area целиком здесь не проверить (окон редактора в тестах нет, см.
+        // выше). Проверяем его половину, из-за которой внизу оставалась пустая вкладка агента:
+        // снятие с тулвиндоу без гибели сессии — и возврат, если в редактор не попали.
+        val handle = Terminal.openTab(
+            project = project,
+            name = "mjc-detach",
+            workingDirectory = manager.projectDirectory(),
+            env = emptyMap(),
+        ) ?: throw AssertionError("вкладка не создалась")
+        awaitPumpingEdt("шелл поднялся") { Terminal.isRunning(handle) }
+        fun inToolWindow() = Terminal.tabs(project).any { Terminal.titleOf(it) == "mjc-detach" }
+        assertTrue(inToolWindow())
+
+        val from = Terminal.detachFromToolWindow(project, handle)
+            ?: throw AssertionError("detachTab не вызвался — API сменилось?")
+        assertFalse("вкладка осталась в тулвиндоу", inToolWindow())
+        assertTrue("сессия не должна умирать при снятии", Terminal.isRunning(handle))
+
+        Terminal.reattachToToolWindow(project, handle, from)
+        assertTrue("вкладка не вернулась в тулвиндоу", inToolWindow())
+        Terminal.closeTab(project, handle)
+    }
+
     fun testManuallyStartedSessionIsMatchedByProcessTree() {
         // Вкладку открываем сами и печатаем команду руками — так делает разработчик, когда
         // запускает оркестратора не действием плагина. Плагин о такой вкладке ничего не

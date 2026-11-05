@@ -308,8 +308,13 @@ TUI — это `\r`. Теперь дожатие ввода делает пла�
 шелла: не настройка IDE и не окружение процесса IDE, а то, что реально запущено во вкладке.
 
 **Editor area — штатная операция.** `TerminalInEditorSupport.openInEditor(content, editorWindow)`
-(реализация платформенного `ToolWindowInEditorSupport`) — то же самое, что делает пункт меню
-Move to Editor. Свой `FileEditorProvider` писать не нужно.
+(реализация платформенного `ToolWindowInEditorSupport`) открывает терминал в нужном окне
+редактора. Свой `FileEditorProvider` писать не нужно. Но вкладку из тулвиндоу он **не убирает**:
+это путь перетаскивания мышью, там её снимает сам drag-and-drop. Пункт меню Move to Editor
+(`MoveTerminalSessionToEditorAction`) перед открытием зовёт
+`TerminalToolWindowTabsManager.detachTab(tab)` — без этого внизу оставалась пустая вкладка
+агента («Nothing to show»). Плагин повторяет этот порядок, а если открыть в редакторе не
+вышло — возвращает вкладку `attachTab` (проверено по байткоду 263.7307).
 
 #### 2.7.1 Живой прогон на новом терминале — что подтвердилось и что нет
 
@@ -398,7 +403,7 @@ createTabBuilder().processType(NON_SHELL).shellCommand(argv)
   редактор руками, раньше не находился. Файл вкладки ищется среди открытых
   `TerminalViewVirtualFile` по `getTab() === вкладка`, а не по выделенному композиту.
 - **`Content.manager` врёт** для вкладок, побывавших в редакторе: Content остаётся в менеджере
-  редактора. «Вкладка ещё открыта» проверяется по спискам платформы (вкладки тулвиндоу +
+  тулвиндоу (так было, пока перенос шёл без `detachTab`, см. выше). «Вкладка ещё открыта» проверяется по спискам платформы (вкладки тулвиндоу +
   открытые файлы терминала).
 - Без `restoreOnProjectReopen(false)` вкладки агентов вернулись бы после рестарта IDE пустыми,
   без `userDefinedName(true)` заголовок перезаписывался бы заголовком процесса.
@@ -739,6 +744,7 @@ mjc-rsrch   mjc-rev-sec     mjc-rev-arch
 
 ```kotlin
 // content вкладки терминала + окно, в котором его показать
+TerminalToolWindowTabsManager.getInstance(project).detachTab(tab)   // иначе пустая вкладка внизу
 TerminalInEditorSupport().openInEditor(tab.content, editorWindow)
 
 // окно родителя, чтобы агент оказался рядом
