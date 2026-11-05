@@ -6,7 +6,7 @@ plugins {
 }
 
 group = "dev.metajetcore"
-version = "0.5.1"
+version = "0.5.2"
 
 repositories {
     mavenCentral()
@@ -89,6 +89,22 @@ intellijPlatform {
             val localIde = providers.gradleProperty("mjcLocalIde")
                 .orElse(providers.environmentVariable("MJC_LOCAL_IDE"))
             if (localIde.isPresent) local(file(localIde.get())) else recommended()
+
+            // Дополнительные IDE для проверки, через системный разделитель путей (`:` на
+            // macOS/Linux). Нужна прежде всего САМАЯ СТАРАЯ поддерживаемая сборка 263: собираем
+            // против новой, а ломается на старой. Живой случай — 0.5.0: против 263.7307
+            // «Compatible», а в PhpStorm 263.6949 NoSuchFieldError на FileEditorManager.Companion
+            // (класс переписали на Kotlin между сборками). Верификатор против 263.6949 это ловит.
+            //
+            // Только для проверки, не для компиляции: mjcLocalIde меняет платформу сборки, и
+            // подставить туда старую IDE значило бы пересобрать сам архив против неё.
+            providers.gradleProperty("mjcVerifyIdes")
+                .orElse(providers.environmentVariable("MJC_VERIFY_IDES"))
+                .orNull
+                ?.split(System.getProperty("path.separator"))
+                ?.map { it.trim() }
+                ?.filter { it.isNotEmpty() }
+                ?.forEach { local(file(it)) }
         }
     }
 }

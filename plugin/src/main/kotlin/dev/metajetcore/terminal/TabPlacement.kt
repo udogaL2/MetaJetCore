@@ -1,7 +1,6 @@
 package dev.metajetcore.terminal
 
 import com.intellij.openapi.diagnostic.Logger
-import com.intellij.openapi.fileEditor.ex.FileEditorManagerEx
 import com.intellij.openapi.fileEditor.impl.EditorWindow
 import com.intellij.openapi.project.Project
 import javax.swing.SwingUtilities
@@ -32,7 +31,7 @@ object TabPlacement {
     fun moveToEditor(project: Project, handle: TabHandle, targetWindow: EditorWindow? = null): Boolean {
         val content = handle.content ?: return false
         val support = support() ?: return false
-        val editors = FileEditorManagerEx.getInstanceEx(project)
+        val editors = Editors.ex(project) ?: return false
         // currentWindow пуст, когда фокус не в редакторе — например, разработчик сейчас в
         // терминале, что для нас обычное дело. Тогда берём любое открытое окно: перенести
         // вкладку в редактор всё равно лучше, чем оставить её в тулвиндоу.
@@ -91,8 +90,8 @@ object TabPlacement {
             if (parent != null) {
                 log.info("MetaJetCore: родитель '${parent.name}' не в editor area, агент — в текущее окно редактора")
             }
-            val editors = FileEditorManagerEx.getInstanceEx(project)
-            val window = editors.currentWindow ?: editors.windows.firstOrNull()
+            val editors = Editors.ex(project)
+            val window = editors?.currentWindow ?: editors?.windows?.firstOrNull()
             val selected = window?.selectedComposite
             moveToEditor(project, child, window)
             restoreSelection(window, selected, parent?.name)
@@ -128,7 +127,8 @@ object TabPlacement {
      */
     private fun windowOf(project: Project, handle: TabHandle): EditorWindow? {
         val component = Terminal.componentOf(handle) ?: return null
-        for (window in FileEditorManagerEx.getInstanceEx(project).windows) {
+        val windows = Editors.ex(project)?.windows ?: return null
+        for (window in windows) {
             for (composite in window.allComposites) {
                 if (SwingUtilities.isDescendingFrom(component, composite.component)) {
                     // Заодно запоминаем файл: по нему вкладку можно найти дешевле.

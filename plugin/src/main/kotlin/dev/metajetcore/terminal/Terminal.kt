@@ -1,7 +1,6 @@
 package dev.metajetcore.terminal
 
 import com.intellij.openapi.diagnostic.Logger
-import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.ui.content.Content
@@ -303,8 +302,8 @@ object Terminal {
 
     /** Имя выбранной сейчас вкладки редактора — для диагностики. */
     private fun selectedEditorTab(project: Project): String? = try {
-        com.intellij.openapi.fileEditor.ex.FileEditorManagerEx.getInstanceEx(project)
-            .currentWindow
+        Editors.ex(project)
+            ?.currentWindow
             ?.selectedComposite
             ?.file
             ?.name
@@ -322,7 +321,7 @@ object Terminal {
      */
     private fun editorTabs(project: Project): List<Pair<VirtualFile, Any>> {
         val files = try {
-            FileEditorManager.getInstance(project).openFiles
+            Editors.of(project).openFiles
         } catch (e: Throwable) {
             log.warn("MetaJetCore: не удалось перечислить открытые файлы", e)
             return emptyList()
@@ -354,7 +353,7 @@ object Terminal {
      */
     fun isOpen(project: Project, handle: TabHandle): Boolean {
         if (handle.tab == null) {
-            return handle.editorFile?.let { FileEditorManager.getInstance(project).isFileOpen(it) } == true
+            return handle.editorFile?.let { Editors.of(project).isFileOpen(it) } == true
         }
         return tabs(project).any { isSameTab(it, handle) } || editorFileOf(project, handle) != null
     }
@@ -522,7 +521,7 @@ object Terminal {
     fun closeTab(project: Project, handle: TabHandle): Boolean = try {
         val file = editorFileOf(project, handle)
         if (file != null) {
-            FileEditorManager.getInstance(project).closeFile(file)
+            Editors.of(project).closeFile(file)
         }
         val tab = handle.tab
         val manager = manager(project)
