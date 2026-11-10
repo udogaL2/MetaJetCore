@@ -391,7 +391,8 @@ class TerminalFlowTest : BasePlatformTestCase() {
         val channel = Files.list(fake.channels).use { it.toList() }.single()
         val seen = Json.parse(Files.readString(channel.resolve("seen.json")))
         assertEquals("bitrix/bitrixgpt-6.5-agent", seen["model"]?.asString)
-        assertEquals(B24.approvalMode(settings.permissionMode), seen["approval"]?.asString)
+        // Режим прав b24 — свой, по умолчанию auto: агент в default встал бы на вопросе во вкладке.
+        assertEquals("auto", seen["approval"]?.asString)
         assertTrue(seen["prompt"]?.asString.orEmpty().contains("Протокол команды"))
 
         val listed = manager.list().firstOrNull { it.name == name }

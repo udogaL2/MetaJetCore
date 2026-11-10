@@ -1243,7 +1243,7 @@ class AgentManager(private val project: Project) : Disposable {
         val command = buildString {
             append(base)
             append(" --session-id ").append(sessionId)
-            B24.approvalMode(settings.permissionMode)?.let { append(" --approval-mode ").append(it) }
+            B24.approvalMode(settings.b24ApprovalMode)?.let { append(" --approval-mode ").append(it) }
             if (model.isNotBlank()) append(" -m ").append(dialect.envRef(ENV_MODEL))
             settings.b24Args.trim().takeIf { it.isNotEmpty() }?.let { append(' ').append(it) }
             append(" --json-file ").append(dialect.envRef(ENV_B24_EVENTS))
@@ -1262,7 +1262,7 @@ class AgentManager(private val project: Project) : Disposable {
     /** Ручной режим для b24: значения вписаны в строку POSIX-кавычками. */
     private fun b24ManualCommand(sessionId: String, model: String, env: Map<String, String>, hasTask: Boolean): String {
         val assignments = env.entries.joinToString(" ") { (key, value) -> "$key=${posixQuote(value)}" }
-        val mode = B24.approvalMode(settings.permissionMode)?.let { " --approval-mode $it" }.orEmpty()
+        val mode = B24.approvalMode(settings.b24ApprovalMode)?.let { " --approval-mode $it" }.orEmpty()
         val modelFlag = if (model.isNotBlank()) " -m \"${'$'}$ENV_MODEL\"" else ""
         val taskFlag = if (hasTask) " -i \"${'$'}$ENV_TASK\"" else ""
         return "$assignments ${settings.b24LaunchCommand} --session-id $sessionId$mode$modelFlag " +

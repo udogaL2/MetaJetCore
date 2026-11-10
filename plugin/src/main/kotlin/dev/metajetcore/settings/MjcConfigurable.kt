@@ -35,8 +35,9 @@ import dev.metajetcore.terminal.Terminal
 /**
  * Экран `Settings | Tools | MetaJetCore`.
  *
- * Устроен от частого к редкому: команда запуска и режим прав, затем таблица ролей, затем Codex
- * (раскрыт, только если он кому-то назначен) и свёрнутое «Дополнительно». Почему у каждой
+ * Устроен от частого к редкому: таблица агентов (команда, аргументы и режим прав каждого
+ * харнеса — строками одной сетки, чтобы всё про запуск было в одном месте), затем роли, ревью и
+ * свёрнутое «Дополнительно». Почему у каждой
  * опции такое значение по умолчанию — в подсказке «?», а не в абзаце под полем: абзацы под
  * каждой строкой превращали экран в стену текста, за которой не видно самих настроек.
  */
@@ -45,27 +46,56 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
     private val settings = MjcSettings.getInstance()
 
     override fun createPanel(): DialogPanel = panel {
-        group("Claude Code") {
-            row("Команда запуска:") {
-                textField()
-                    .bindText(settings::launchCommand)
-                    .columns(30)
-                    .comment("claude или ваша обёртка вокруг него")
-                contextHelp(
-                    "Обёртка обязана пробрасывать аргументы (\"\$@\"): иначе до агента не дойдут " +
-                        "--agent и --permission-mode, и он стартует без роли в ручном режиме прав. " +
-                        "Проверить: scripts/check-wrapper.sh.",
-                )
-            }
-            row("Режим прав агентов:") {
+        group("Агенты") {
+            // Одна сетка на все харнесы: раньше Claude Code был вверху, а Codex и b24 — в
+            // свёрнутых группах внизу, и команду запуска приходилось искать по экрану.
+            row("") {
+                label("Команда запуска").bold()
+                label("Аргументы").bold()
+                label("Режим прав").bold()
+            }.layout(RowLayout.PARENT_GRID)
+            row(Harness.CLAUDE.displayName + ":") {
+                textField().bindText(settings::launchCommand).columns(COMMAND_COLUMNS)
+                    .applyToComponent { emptyText.text = "claude" }
+                // Аргументов у Claude Code нет: роль и режим прав плагин передаёт сам, а
+                // остальное настраивается в самом Claude Code.
+                label("")
                 comboBox(PERMISSION_MODES.keys.toList(), textRenderer { PERMISSION_MODES[it] ?: it })
                     .bindItem(settings::permissionMode.toNullableProperty())
                 contextHelp(
-                    "Агента без режима прав никто не разблокирует: его вкладку не читают, и он " +
-                        "встанет на первом же запросе. Настройкой проекта это не задать — " +
-                        "repo-level defaultMode Claude Code игнорирует, поэтому режим едет флагом.",
+                    "Команда — claude или ваша обёртка. Обёртка обязана пробрасывать аргументы " +
+                        "(\"\$@\"): иначе до агента не дойдут --agent и --permission-mode, и он " +
+                        "стартует без роли в ручном режиме прав (проверить: scripts/check-wrapper.sh). " +
+                        "Режим прав обязателен: вкладку агента никто не читает, и без режима он встанет " +
+                        "на первом же запросе. Настройкой проекта это не задать — repo-level " +
+                        "defaultMode Claude Code игнорирует.",
                 )
-            }
+            }.layout(RowLayout.PARENT_GRID)
+            row(Harness.CODEX.displayName + ":") {
+                textField().bindText(settings::codexLaunchCommand).columns(COMMAND_COLUMNS)
+                    .applyToComponent { emptyText.text = "codex" }
+                textField().bindText(settings::codexArgs).columns(ARGS_COLUMNS)
+                // Режим прав Codex — флагами -s/-a в аргументах: так он задаётся у самого CLI.
+                label("в аргументах (-s, -a)")
+                contextHelp(
+                    "-a never: вопрос о подтверждении во вкладке, которую никто не читает, — вечная " +
+                        "блокировка. --disable hooks: иначе Codex спросит «Review hooks» на старте. " +
+                        "Роль, доверие к каталогу и модель плагин добавит сам.",
+                )
+            }.layout(RowLayout.PARENT_GRID)
+            row(Harness.B24.displayName + ":") {
+                textField().bindText(settings::b24LaunchCommand).columns(COMMAND_COLUMNS)
+                    .applyToComponent { emptyText.text = "b24-cowork-code-cli" }
+                textField().bindText(settings::b24Args).columns(ARGS_COLUMNS)
+                comboBox(B24_APPROVAL_MODES.keys.toList(), textRenderer { B24_APPROVAL_MODES[it] ?: it })
+                    .bindItem(settings::b24ApprovalMode.toNullableProperty())
+                contextHelp(
+                    "Режим — --approval-mode, свой, а не режим Claude Code: в default агент встанет " +
+                        "на вопросе во вкладке, ответить на который из оркестратора нельзя. " +
+                        "Аргументы — сверх того, что плагин добавит сам: --session-id, канал " +
+                        "(--json-file, --input-file), роль (--append-system-prompt), задача (-i), модель (-m).",
+                )
+            }.layout(RowLayout.PARENT_GRID)
             row("Префикс имён сессий:") {
                 textField()
                     .bindText(settings::namePrefix)
@@ -78,7 +108,7 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
         group("Роли") {
             // Список — у IDE (агенты терминала, 263+), а не свой: что установлено и включено,
             // знает она. Назначить можно только харнес, для которого в плагине есть адаптер.
-            // b24 IDE не знает — его предлагаем всегда, команда запуска — в его группе ниже.
+            // b24 IDE не знает — его предлагаем всегда, команда запуска — в таблице агентов.
             val available = Terminal.terminalAgentKeys()
             val offered = Harness.entries.filter { it == Harness.CLAUDE || !it.knownToIde || it.key in available }
 
@@ -170,39 +200,6 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
                 )
             }
         }
-
-        val codexUsed = Role.entries.any { settings.harnessFor(it) == Harness.CODEX } ||
-            (settings.reviewPanel[Harness.CODEX.key] ?: 0) > 0
-        collapsibleGroup("Codex") {
-            row("Команда:") {
-                textField().bindText(settings::codexLaunchCommand).columns(30)
-            }
-            row("Аргументы:") {
-                textField().bindText(settings::codexArgs).columns(40)
-                contextHelp(
-                    "-a never: вопрос о подтверждении во вкладке, которую никто не читает, — вечная " +
-                        "блокировка. --disable hooks: иначе Codex спросит «Review hooks» на старте. " +
-                        "Роль, доверие к каталогу и модель плагин добавит сам.",
-                )
-            }
-        }.expanded = codexUsed
-
-        val b24Used = Role.entries.any { settings.harnessFor(it) == Harness.B24 } ||
-            (settings.reviewPanel[Harness.B24.key] ?: 0) > 0
-        collapsibleGroup("B24 CoWork Code") {
-            row("Команда:") {
-                textField().bindText(settings::b24LaunchCommand).columns(30)
-            }
-            row("Аргументы:") {
-                textField().bindText(settings::b24Args).columns(40)
-                contextHelp(
-                    "Сверх того, что плагин добавит сам: --session-id, канал (--json-file, --input-file), " +
-                        "роль (--append-system-prompt), задача (-i), модель (-m) и режим прав " +
-                        "(--approval-mode по общей настройке: auto, acceptEdits → auto-edit, " +
-                        "bypassPermissions → yolo).",
-                )
-            }
-        }.expanded = b24Used
 
         collapsibleGroup("Дополнительно") {
             row("Ожидание старта агента:") {
@@ -386,12 +383,26 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
     }
 
     private companion object {
+        const val COMMAND_COLUMNS = 22
+        const val ARGS_COLUMNS = 28
+
+        // Подписи короткие: комбобоксы стоят в одной сетке, и длинная подпись раздвинула бы
+        // колонку на весь экран. Что значит каждый режим — в подсказке «?».
         val PERMISSION_MODES = linkedMapOf(
-            "auto" to "auto — агент решает сам (рекомендуется)",
-            "acceptEdits" to "acceptEdits — правки без вопросов",
-            "plan" to "plan — только планирование",
-            "bypassPermissions" to "bypassPermissions — без проверок",
-            "" to "не передавать флаг",
+            "auto" to "auto (рекомендуется)",
+            "acceptEdits" to "acceptEdits",
+            "plan" to "plan",
+            "bypassPermissions" to "bypassPermissions",
+            "" to "не передавать",
+        )
+
+        val B24_APPROVAL_MODES = linkedMapOf(
+            "auto" to "auto (рекомендуется)",
+            "auto-edit" to "auto-edit",
+            "plan" to "plan",
+            "yolo" to "yolo",
+            "default" to "default — спрашивать",
+            "" to "не передавать",
         )
 
         val ROLE_TITLES = mapOf(

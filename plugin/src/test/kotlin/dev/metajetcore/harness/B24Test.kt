@@ -129,13 +129,12 @@ class B24Test {
     }
 
     @Test
-    fun permissionModesMapToApprovalModes() {
-        assertEquals("auto", B24.approvalMode("auto"))
-        assertEquals("auto-edit", B24.approvalMode("acceptEdits"))
-        assertEquals("plan", B24.approvalMode("plan"))
-        assertEquals("yolo", B24.approvalMode("bypassPermissions"))
+    fun onlyKnownApprovalModesReachTheCommandLine() {
+        assertEquals("auto", B24.approvalMode(" auto "))
+        assertEquals("yolo", B24.approvalMode("yolo"))
         assertNull(B24.approvalMode(""))
-        assertNull(B24.approvalMode("что-то-новое"))
+        // Режимы Claude Code у CLI не существуют — с ними он бы не стартовал.
+        assertNull(B24.approvalMode("acceptEdits"))
     }
 
     @Test

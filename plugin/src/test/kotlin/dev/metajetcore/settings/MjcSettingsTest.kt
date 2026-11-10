@@ -106,6 +106,8 @@ class MjcSettingsTest {
         assertTrue(settings.stripInheritedClaudeMarkers)
         // Режим прав задан: без него агент стартует в manual mode.
         assertEquals("auto", settings.permissionMode)
+        // У b24 — свой режим и тоже auto: в default агент встанет на вопросе во вкладке.
+        assertEquals("auto", settings.b24ApprovalMode)
         assertEquals("claude", settings.launchCommand)
         // 0 означает «вывести из пути проекта», а не «взять случайный».
         assertEquals(0, settings.mcpPort)

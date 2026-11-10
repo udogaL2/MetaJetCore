@@ -81,20 +81,14 @@ object B24 {
 
     fun channel(sessionId: String): Channel = Channel(channelsRoot().resolve(sessionId))
 
+    /** Значения `--approval-mode` CLI (0.26.7). */
+    val APPROVAL_MODES = listOf("auto", "auto-edit", "plan", "yolo", "default")
+
     /**
-     * Режим прав плагина → `--approval-mode` b24. null — флаг не передаём.
-     *
-     * Соответствие по смыслу, а не по имени: `acceptEdits` у b24 называется `auto-edit`,
-     * `bypassPermissions` — `yolo`.
+     * Настройка → значение `--approval-mode`; null — флаг не передаём. Незнакомое значение
+     * (руками в metajetcore.xml) тоже не передаём: CLI с неизвестным режимом не стартует.
      */
-    fun approvalMode(permissionMode: String): String? = when (permissionMode.trim()) {
-        "auto" -> "auto"
-        "acceptEdits" -> "auto-edit"
-        "plan" -> "plan"
-        "bypassPermissions" -> "yolo"
-        "default" -> "default"
-        else -> null
-    }
+    fun approvalMode(setting: String): String? = setting.trim().takeIf { it in APPROVAL_MODES }
 
     // ------------------------------------------------------------- models
 
