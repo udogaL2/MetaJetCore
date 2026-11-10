@@ -1,9 +1,11 @@
 package dev.metajetcore.agents
 
+import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
+import dev.metajetcore.harness.B24
 import dev.metajetcore.harness.Codex
 import dev.metajetcore.harness.Harness
 import dev.metajetcore.registry.SessionRecord
@@ -21,7 +23,9 @@ import dev.metajetcore.util.Json
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 
 /** Что плагин знает про запущенного агента. */
@@ -51,6 +55,12 @@ data class AwaitResult(
 /** Результат отправки задачи агенту через плагин. */
 sealed interface DeliveryResult {
     data object Sent : DeliveryResult
+
+    /**
+     * Агент занят ходом (или стоит пауза после сброса), сообщение ждёт в очереди плагина и
+     * уйдёт, когда агент освободится. Так у b24: сообщение посреди хода он вливает в текущий ход (docs/PLAN-B24.md §2.6).
+     */
+    data class Queued(val position: Int) : DeliveryResult
 
     /** Агент — сессия Claude Code: ей пишут SendMessage, плагин второй канал не заводит. */
     data object UseSendMessage : DeliveryResult
@@ -112,8 +122,9 @@ sealed interface SpawnResult {
         val pendingBriefing: String,
         val siblings: List<AgentInfo> = emptyList(),
         /**
-         * Задача уже у агента: Codex получает её аргументом при старте, потому что без
-         * первого сообщения его сессия не создаётся вовсе (docs/PLAN-0.4.md §4.6).
+         * Задача уже у агента: Codex и b24 получают её аргументом при старте. Codex — потому
+         * что без первого сообщения его сессия не создаётся вовсе (docs/PLAN-0.4.md §4.6),
+         * b24 — потому что так задача не ждёт отдельного канала (docs/PLAN-B24.md §2.4).
          */
         val taskDelivered: Boolean = false,
     ) : SpawnResult
@@ -124,18 +135,42 @@ sealed interface SpawnResult {
     data class Failed(val reason: String) : SpawnResult
 }
 
+/**
+ * Агент без SendMessage (Codex, b24). Всё, что про него известно, — у плагина: адрес, лента
+ * ответов, доставка. Отдельный тип, а не ветки `if codex` по всему менеджеру: каждая операция
+ * (список, закрытие, сброс, ожидание) иначе обрастала бы случаем на каждый харнес.
+ */
+private interface ExternalAgent {
+    val harness: Harness
+    val sessionId: String
+
+    /** Ход идёт или сообщения ждут отправки — ответ ещё будет. */
+    val busy: Boolean
+
+    /** Статус для list_agents. */
+    fun status(): String
+
+    /** Ответы завершённых ходов с прошлого вызова. */
+    fun readCompletedTurns(): List<String>
+    fun deliver(text: String): DeliveryResult
+    fun reset(): ResetResult
+
+    /** Агент забыт: убрать то, что плагин заводил под него. */
+    fun dispose() {}
+}
+
 @Service(Service.Level.PROJECT)
-class AgentManager(private val project: Project) {
+class AgentManager(private val project: Project) : Disposable {
 
     private val log = Logger.getInstance(AgentManager::class.java)
     private val tabs = ConcurrentHashMap<String, TabHandle>()
     private val spawned = ConcurrentHashMap<String, AgentInfo>()
 
     /**
-     * Codex-агенты: их нет в реестре Claude Code, поэтому всё, что про них известно, —
-     * только здесь. Адрес — UUID треда, ответы — из ленты rollout.
+     * Агенты не-Claude: их нет в реестре Claude Code, поэтому всё, что про них известно, —
+     * только здесь. Адрес — UUID сессии, ответы — из ленты агента.
      */
-    private val codexAgents = ConcurrentHashMap<String, CodexAgent>()
+    private val externalAgents = ConcurrentHashMap<String, ExternalAgent>()
 
     /** Собранные, но ещё не отданные оркестратору ответы агентов не-Claude. */
     private val pending = ConcurrentHashMap<String, MutableList<String>>()
@@ -146,7 +181,117 @@ class AgentManager(private val project: Project) {
      */
     private val codexSpawnLock = Any()
 
-    private class CodexAgent(val session: Codex.Session, val reader: Codex.RolloutReader)
+    private inner class CodexAgent(val session: Codex.Session) : ExternalAgent {
+        val reader = Codex.RolloutReader(session.rollout)
+        override val harness get() = Harness.CODEX
+        override val sessionId get() = session.id
+        override val busy get() = reader.busy
+        override fun status() = if (reader.busy) "busy" else "idle"
+        override fun readCompletedTurns() = reader.readCompletedTurns()
+        override fun deliver(text: String) = deliverToCodex(session.id, text)
+
+        // `/new` в Codex заводит новый тред с новым UUID, а его лента появится только со
+        // следующим сообщением — плагин потерял бы адрес агента (docs/PLAN-0.4.md §4.6).
+        override fun reset() = ResetResult.Unsupported(
+            "сброс контекста Codex-агента не поддерживается: закрой его (close_agent) и " +
+                "заведи нового (spawn_agent)",
+        )
+    }
+
+    /**
+     * b24-агент. Канал — два файла рядом с его TUI (см. [B24]): команды пишем в input, ответы
+     * читаем из ленты событий.
+     *
+     * Своя очередь исходящих — потому что b24 сообщение посреди хода не ставит в очередь, а
+     * вливает в текущий ход (проверено, вопреки его документации): один ответ закрыл бы два
+     * ожидания оркестратора. Поэтому пишем в input только в простое, остальное ждёт здесь.
+     */
+    private inner class B24Agent(
+        override val sessionId: String,
+        val channel: B24.Channel,
+        hasTask: Boolean,
+    ) : ExternalAgent {
+        val reader = B24.EventsReader(channel.events, startsBusy = hasTask)
+        private val outbox = ArrayDeque<String>()
+
+        /** После `/clear` событий нет, поэтому следующую команду придерживаем на время опроса CLI. */
+        private var holdUntil = 0L
+
+        override val harness get() = Harness.B24
+        override val busy get() = reader.busy || synchronized(outbox) { outbox.isNotEmpty() }
+
+        fun hasOutgoing(): Boolean = synchronized(outbox) { outbox.isNotEmpty() }
+
+        override fun status(): String {
+            val asks = reader.pendingPermissions()
+            return when {
+                asks.isNotEmpty() -> "ждёт разрешения в своей вкладке: " + asks.joinToString()
+                busy -> "busy"
+                else -> "idle"
+            }
+        }
+
+        override fun readCompletedTurns(): List<String> {
+            val replies = reader.readCompletedTurns()
+            flush()
+            return replies
+        }
+
+        override fun deliver(text: String): DeliveryResult {
+            synchronized(outbox) { outbox.addLast(text) }
+            flush()
+            val left = synchronized(outbox) { outbox.size }
+            return if (left == 0) DeliveryResult.Sent else DeliveryResult.Queued(left)
+        }
+
+        /** `/clear` через тот же канал: проверено, контекст сбрасывается. Занят — встанет в очередь. */
+        override fun reset(): ResetResult = when (val result = deliver(B24_CLEAR)) {
+            is DeliveryResult.Failed -> ResetResult.Unsupported("не доставлено: ${result.reason}")
+            else -> ResetResult.Done
+        }
+
+        fun flush() = synchronized(outbox) {
+            while (outbox.isNotEmpty() && !reader.busy && System.currentTimeMillis() >= holdUntil) {
+                val next = outbox.first()
+                try {
+                    channel.submit(next)
+                } catch (e: Exception) {
+                    log.warn("MetaJetCore: не удалось записать в канал b24 ${channel.input}", e)
+                    return@synchronized
+                }
+                outbox.removeFirst()
+                if (next == B24_CLEAR) holdUntil = System.currentTimeMillis() + B24_CLEAR_HOLD_MS
+                else reader.markSubmitted()
+            }
+        }
+
+        override fun dispose() = channel.delete()
+    }
+
+    /**
+     * Фоновый дочитыватель лент: очередь b24 сбрасывается при чтении, а оркестратор может
+     * долго не звать ни await_messages, ни list_agents — например ждёт Claude-агентов.
+     * Работает только пока есть что отправлять.
+     */
+    @Volatile
+    private var outboxPump: ScheduledFuture<*>? = null
+
+    @Synchronized
+    private fun ensureOutboxPump() {
+        if (outboxPump != null) return
+        outboxPump = com.intellij.util.concurrency.AppExecutorUtil.getAppScheduledExecutorService()
+            .scheduleWithFixedDelay({
+                try {
+                    if (externalAgents.values.any { it is B24Agent && it.hasOutgoing() }) collectReplies()
+                } catch (e: Throwable) {
+                    log.warn("MetaJetCore: фоновое чтение лент упало", e)
+                }
+            }, OUTBOX_PUMP_MS, OUTBOX_PUMP_MS, TimeUnit.MILLISECONDS)
+    }
+
+    override fun dispose() {
+        outboxPump?.cancel(false)
+    }
 
     private val settings get() = MjcSettings.getInstance()
 
@@ -223,15 +368,17 @@ class AgentManager(private val project: Project) {
         val parentSession = parent?.let { parentSessionId(it, parentTab?.record) }
 
         val name = requestedName?.takeIf { it.isNotBlank() } ?: generateName(role, domain)
-        if (SessionRegistry.isNameTaken(name) || codexAgents.containsKey(name)) {
+        if (SessionRegistry.isNameTaken(name) || externalAgents.containsKey(name)) {
             return SpawnResult.Failed(
                 "имя '$name' уже занято живой сессией; передай другое или закрой ту сессию",
             )
         }
 
         val model = modelFor(role, harness, requestedModel)
-        if (harness == Harness.CODEX) {
-            return spawnCodex(role, task, name, model, parent, parentSession, parentTab, siblings)
+        when (harness) {
+            Harness.CODEX -> return spawnCodex(role, task, name, model, parent, parentSession, parentTab, siblings)
+            Harness.B24 -> return spawnB24(role, task, name, model, parent, parentSession, parentTab, siblings)
+            Harness.CLAUDE -> Unit
         }
         val manualCommand = manualCommand(role, name, model, parent, parentSession)
 
@@ -304,14 +451,14 @@ class AgentManager(private val project: Project) {
     /**
      * Модель агента: явная из вызова, затем из настроек роли, затем дефолт роли.
      *
-     * Для Codex имена моделей Claude отбрасываются: tempo задаёт модель в терминах Claude, и
-     * `-m opus` уронил бы Codex на старте. Пустая строка у Codex — модель из его конфига.
+     * Для Codex и b24 имена моделей Claude отбрасываются: tempo задаёт модель в терминах
+     * Claude, и `-m opus` уронил бы их на старте. Пустая строка — модель из конфига самого CLI.
      */
     internal fun modelFor(role: Role, harness: Harness, requested: String?): String {
         val explicit = requested?.trim()?.takeIf { it.isNotEmpty() }
         return when (harness) {
             Harness.CLAUDE -> explicit ?: settings.modelFor(role) ?: role.defaultModel
-            Harness.CODEX -> explicit?.takeUnless { Harness.isClaudeModel(it) }
+            Harness.CODEX, Harness.B24 -> explicit?.takeUnless { Harness.isClaudeModel(it) }
                 ?: settings.modelFor(role)?.takeUnless { Harness.isClaudeModel(it) }
                 ?: ""
         }
@@ -375,7 +522,7 @@ class AgentManager(private val project: Project) {
                     },
                 )
             }
-        codexAgents[name] = CodexAgent(session, Codex.RolloutReader(session.rollout))
+        externalAgents[name] = CodexAgent(session)
         val info = AgentInfo(
             name = name,
             role = role,
@@ -391,7 +538,7 @@ class AgentManager(private val project: Project) {
     }
 
     private fun awaitCodexSession(handle: TabHandle, since: Long): Codex.Session? {
-        val claimed = codexAgents.values.map { it.session.id }.toSet()
+        val claimed = externalAgents.values.map { it.sessionId }.toSet()
         val deadline = System.currentTimeMillis() + settings.readyTimeoutSeconds * 1000L
         while (System.currentTimeMillis() < deadline) {
             Codex.findNewSession(projectDirectory(), since, claimed)?.let { return it }
@@ -401,6 +548,103 @@ class AgentManager(private val project: Project) {
             Thread.sleep(POLL_INTERVAL_MS)
         }
         return null
+    }
+
+    /**
+     * Спавн b24-агента (docs/PLAN-B24.md). Проще Codex:
+     *
+     *  * адрес задаём сами — `--session-id`, поэтому сессию не ищем и спавны не сериализуем;
+     *  * готовность — `session_start` в ленте событий;
+     *  * роль — `--append-system-prompt`, задача — `-i`; обе через переменные окружения.
+     */
+    private fun spawnB24(
+        role: Role,
+        task: String,
+        name: String,
+        model: String,
+        parent: String?,
+        parentSession: String?,
+        parentTab: SessionTab?,
+        siblings: List<AgentInfo>,
+    ): SpawnResult {
+        val sessionId = UUID.randomUUID().toString()
+        val channel = B24.channel(sessionId)
+        val env = b24Env(role, name, model, parent, parentSession, task, channel)
+        val manual = b24ManualCommand(sessionId, model, env, task.isNotBlank())
+        if (!runOnEdt { Terminal.isAvailable(project) }) {
+            return SpawnResult.Manual(manual, "терминальное API IDE недоступно")
+        }
+        try {
+            channel.create()
+        } catch (e: Exception) {
+            return SpawnResult.Failed("не удалось создать канал b24 в ${channel.dir}: ${e.message}")
+        }
+        val argv = runOnEdt { b24Argv(sessionId, model, task.isNotBlank()) }
+        val handle = runOnEdt {
+            Terminal.openTab(
+                project = project,
+                name = name,
+                workingDirectory = projectDirectory(),
+                env = env,
+                command = argv,
+            )?.also { child -> TabPlacement.placeNear(project, parentTab?.handle, child) }
+        } ?: run {
+            channel.delete()
+            return SpawnResult.Manual(manual, "не удалось открыть вкладку терминала")
+        }
+        tabs[name] = handle
+
+        if (!awaitB24Start(channel, handle)) {
+            val exited = runOnEdt { Terminal.isTerminated(handle) || !Terminal.isOpen(project, handle) }
+            if (exited) {
+                tabs.remove(name)
+                channel.delete()
+            }
+            return SpawnResult.Manual(
+                manual,
+                if (exited) {
+                    "процесс b24 завершился до начала сессии; проверь команду запуска b24 в " +
+                        "настройках плагина (запускалось: ${argv.joinToString(" ")})"
+                } else {
+                    "сессия b24 не началась за ${settings.readyTimeoutSeconds} c; посмотри экран " +
+                        "вкладки (read_tab) — скорее всего CLI задал вопрос на старте (вход в Vibecode?)"
+                },
+            )
+        }
+        externalAgents[name] = B24Agent(sessionId, channel, hasTask = task.isNotBlank())
+        ensureOutboxPump()
+        val info = AgentInfo(
+            name = name,
+            role = role,
+            model = model,
+            sessionId = sessionId,
+            pid = runOnEdt { Terminal.process(handle) }?.pid?.toInt(),
+            status = if (task.isNotBlank()) "busy" else "idle",
+            managed = true,
+            harness = Harness.B24,
+        )
+        spawned[name] = info
+        return SpawnResult.Started(info, pendingBriefing = task, siblings = siblings, taskDelivered = task.isNotBlank())
+    }
+
+    /**
+     * Ждём `session_start` в ленте — первое событие, которое CLI пишет, подняв TUI. Читаем
+     * первую строку, не трогая читателя ленты: его смещение должно начаться с нуля, иначе
+     * ответ на задачу из `-i` мог бы проскочить мимо ящика.
+     */
+    private fun awaitB24Start(channel: B24.Channel, handle: TabHandle): Boolean {
+        val deadline = System.currentTimeMillis() + settings.readyTimeoutSeconds * 1000L
+        fun started() = try {
+            Files.newBufferedReader(channel.events).use { it.readLine() }?.contains("\"session_start\"") == true
+        } catch (e: Exception) {
+            false
+        }
+        while (System.currentTimeMillis() < deadline) {
+            if (started()) return true
+            if (runOnEdt { Terminal.isTerminated(handle) || !Terminal.isOpen(project, handle) }) return started()
+            Thread.sleep(POLL_INTERVAL_MS)
+        }
+        return false
     }
 
     // ------------------------------------------------------------- lifecycle
@@ -425,23 +669,23 @@ class AgentManager(private val project: Project) {
         // и расхождение между ними означало бы вкладку-сироту.
         val name = canonicalName(rawName)
         val handle = tabFor(name) ?: return CloseResult.UnknownTab
-        val codex = codexAgents[name]
-        if (codex == null && runOnEdt { Terminal.isOpen(project, handle) }) {
+        val external = externalAgents[name]
+        if (external == null && runOnEdt { Terminal.isOpen(project, handle) }) {
             runOnEdt { Terminal.send(handle, "/exit", execute = true) }
         }
-        if (codex == null) awaitSessionGone(name)
+        if (external == null) awaitSessionGone(name)
         // Последний ответ мог прийти прямо перед выходом — собираем, пока агент ещё известен.
         collectReplies()
-        codexAgents.remove(name)
+        externalAgents.remove(name)?.dispose()
         // Управлять больше нечем: сессии нет. Дальше речь только об уборке вкладки.
         spawned.remove(name)
 
-        // Codex завершаем сигналом, а не командой в TUI. Живой прогон в IDE: `/quit` не
-        // срабатывал ни слитно с Enter, ни с Enter отдельно после паузы — терминал IDE
-        // доставляет ввод в TUI Codex иначе, чем голый pty (там тот же ввод работает). Сигнал
-        // — контракт ОС, а не экранной формы: SIGTERM, время на корректный выход, затем
-        // принудительно. Лента rollout пишется по событию, поэтому ничего не теряется.
-        if (codex != null && handle.ownsProcess) Terminal.killProcessTree(handle, KILL_GRACE_MS)
+        // Codex и b24 завершаем сигналом, а не командой в TUI. Живой прогон в IDE: `/quit` у
+        // Codex не срабатывал ни слитно с Enter, ни с Enter отдельно после паузы — терминал IDE
+        // доставляет ввод в его TUI иначе, чем голый pty. Сигнал — контракт ОС, а не экранной
+        // формы: SIGTERM, время на корректный выход, затем принудительно. Ленты пишутся по
+        // событию, поэтому ничего не теряется. b24 по SIGTERM выходит за доли секунды.
+        if (external != null && handle.ownsProcess) Terminal.killProcessTree(handle, KILL_GRACE_MS)
 
         var dead = awaitTabDead(handle)
         if (!dead && handle.ownsProcess) {
@@ -468,13 +712,10 @@ class AgentManager(private val project: Project) {
     /** Сброс контекста между этапами: сессия и вкладка остаются живыми. */
     fun reset(rawName: String): ResetResult {
         val name = canonicalName(rawName)
-        if (codexAgents.containsKey(name)) {
-            // `/new` в Codex заводит новый тред с новым UUID, а его лента появится только со
-            // следующим сообщением — плагин потерял бы адрес агента (docs/PLAN-0.4.md §4.6).
-            return ResetResult.Unsupported(
-                "сброс контекста Codex-агента не поддерживается: закрой его (close_agent) и " +
-                    "заведи нового (spawn_agent)",
-            )
+        externalAgents[name]?.let { agent ->
+            // Ответ хода, закончившегося до сброса, ещё должен попасть в ящик.
+            collectReplies()
+            return agent.reset()
         }
         val handle = tabFor(name) ?: return ResetResult.UnknownTab
         return if (runOnEdt { Terminal.send(handle, "/clear", execute = true) }) ResetResult.Done
@@ -485,17 +726,25 @@ class AgentManager(private val project: Project) {
      * Отправить сообщение агенту не-Claude.
      *
      * Codex — через `codex queue`: это его собственный способ доставить сообщение в живую
-     * сессию, сообщение встаёт новым ходом (проверено: кириллица доезжает целой). Печатать
-     * в TUI не годится по тем же причинам, что и для Claude.
+     * сессию, сообщение встаёт новым ходом (проверено: кириллица доезжает целой). b24 — через
+     * input-файл, в простое (см. [B24Agent]). Печатать в TUI не годится по тем же причинам,
+     * что и для Claude.
      *
      * Claude-агентам плагин сообщений не возит: у них есть SendMessage, и второй канал
      * означал бы две очереди без порядка между ними.
      */
     fun deliver(rawName: String, text: String): DeliveryResult {
         val name = canonicalName(rawName)
-        val codex = codexAgents[name]
+        val agent = externalAgents[name]
             ?: return if (SessionRegistry.findByName(name) != null) DeliveryResult.UseSendMessage
             else DeliveryResult.UnknownAgent
+        // Сначала дочитать ленту: занятость агента должна быть свежей, а ответы, прочитанные
+        // попутно, — оказаться в ящике, а не потеряться.
+        collectReplies()
+        return agent.deliver(text)
+    }
+
+    private fun deliverToCodex(threadId: String, text: String): DeliveryResult {
         val shellPath = runOnEdt { Terminal.configuredShellPath(project) } ?: ShellDialect.defaultShell()
         val dialect = ShellDialect.detect(shellPath)
         val command = settings.codexLaunchCommand + " queue --thread " + dialect.envRef(ENV_THREAD) +
@@ -505,7 +754,7 @@ class AgentManager(private val project: Project) {
             val process = ProcessBuilder(argv)
                 .directory(projectDirectory().toFile())
                 .redirectErrorStream(true)
-                .also { it.environment()[ENV_THREAD] = codex.session.id; it.environment()[ENV_MESSAGE] = text }
+                .also { it.environment()[ENV_THREAD] = threadId; it.environment()[ENV_MESSAGE] = text }
                 .start()
             process.outputStream.close()
             val finished = process.waitFor(DELIVERY_TIMEOUT_MS, TimeUnit.MILLISECONDS)
@@ -528,8 +777,8 @@ class AgentManager(private val project: Project) {
      * Дождаться ответов агентов не-Claude.
      *
      * Модель tempo — «запустил волну, дождался всех отчётов». Claude-агенты отвечают сами,
-     * через SendMessage, а у Codex обратного канала в сессию Claude нет. Поэтому оркестратор
-     * ждёт их здесь: плагин читает ленты Codex и отдаёт завершённые ходы.
+     * через SendMessage, а у Codex и b24 обратного канала в сессию Claude нет. Поэтому
+     * оркестратор ждёт их здесь: плагин читает их ленты и отдаёт завершённые ходы.
      *
      * С [names] — ждём, пока ответит каждый из них (или таймаут); без — первый же ответ
      * любого. Возвращаем всё, что накопилось, — по таймауту тоже: частичный результат лучше
@@ -537,7 +786,7 @@ class AgentManager(private val project: Project) {
      */
     fun awaitMessages(names: List<String>?, timeoutMs: Long): AwaitResult {
         val wanted = names?.map { canonicalName(it) }?.filter { it.isNotEmpty() }?.distinct()
-        val notInMailbox = wanted.orEmpty().filter { !codexAgents.containsKey(it) && !pending.containsKey(it) }
+        val notInMailbox = wanted.orEmpty().filter { !externalAgents.containsKey(it) && !pending.containsKey(it) }
         val waitFor = wanted?.minus(notInMailbox.toSet())
         val deadline = System.currentTimeMillis() + timeoutMs
         while (true) {
@@ -546,7 +795,7 @@ class AgentManager(private val project: Project) {
                 waitFor == null -> pending.values.any { it.isNotEmpty() }
                 waitFor.isEmpty() -> true
                 else -> waitFor.all { name ->
-                    pending[name]?.isNotEmpty() == true || !codexAgents.containsKey(name)
+                    pending[name]?.isNotEmpty() == true || !externalAgents.containsKey(name)
                 }
             }
             if (ready || System.currentTimeMillis() >= deadline) break
@@ -560,21 +809,21 @@ class AgentManager(private val project: Project) {
                 queue.clear()
             }
         }
-        val still = (waitFor ?: codexAgents.keys.toList()).filter { name ->
-            messages.none { it.from == name } && codexAgents[name]?.reader?.busy == true
+        val still = (waitFor ?: externalAgents.keys.toList()).filter { name ->
+            messages.none { it.from == name } && externalAgents[name]?.busy == true
         }
         return AwaitResult(messages, still, notInMailbox)
     }
 
     /**
-     * Дочитать ленты Codex-агентов и разложить завершённые ходы по ящикам.
+     * Дочитать ленты агентов не-Claude и разложить завершённые ходы по ящикам.
      *
      * Копию пишем журналом в каталог отчётов: ящик живёт в памяти IDE, а оркестратор может
      * перезапуститься посреди волны — тогда ответ хотя бы найдётся глазами.
      */
     private fun collectReplies() {
-        for ((name, agent) in codexAgents) {
-            val replies = agent.reader.readCompletedTurns()
+        for ((name, agent) in externalAgents) {
+            val replies = agent.readCompletedTurns()
             if (replies.isEmpty()) continue
             val queue = pending.getOrPut(name) { mutableListOf() }
             synchronized(queue) { queue += replies }
@@ -731,11 +980,11 @@ class AgentManager(private val project: Project) {
         val owned = tabs.filterValues { it.ownsProcess }
         if (owned.isEmpty()) return
         val closed = runOnEdt { owned.filterValues { !Terminal.isOpen(project, it) }.keys }
-        if (closed.any { codexAgents.containsKey(it) }) collectReplies()
+        if (closed.any { externalAgents.containsKey(it) }) collectReplies()
         for (name in closed) {
             tabs.remove(name)
             spawned.remove(name)
-            codexAgents.remove(name)
+            externalAgents.remove(name)?.dispose()
         }
     }
 
@@ -779,6 +1028,9 @@ class AgentManager(private val project: Project) {
         }
     }
 
+    /** Агент не-Claude: сообщения ему — через send_to_agent, а не SendMessage. */
+    fun isExternal(rawName: String): Boolean = externalAgents.containsKey(canonicalName(rawName))
+
     fun focus(rawName: String): Boolean {
         val handle = tabFor(rawName) ?: return false
         return runOnEdt { Terminal.focus(handle) }
@@ -798,22 +1050,22 @@ class AgentManager(private val project: Project) {
     /** Живые сессии в директории проекта, обогащённые тем, что плагин знает про вкладки. */
     fun list(): List<AgentInfo> {
         forgetClosedTabs()
-        // Статус Codex-агента — по его ленте: дочитываем, заодно ответы встают в ящик.
+        // Статус агента не-Claude — по его ленте: дочитываем, заодно ответы встают в ящик.
         collectReplies()
-        val codex = codexAgents.map { (name, agent) ->
+        val external = externalAgents.map { (name, agent) ->
             val known = spawned[name]
             AgentInfo(
                 name = name,
                 role = known?.role,
                 model = known?.model.orEmpty(),
-                sessionId = agent.session.id,
+                sessionId = agent.sessionId,
                 pid = known?.pid,
-                status = if (agent.reader.busy) "busy" else "idle",
+                status = agent.status(),
                 managed = tabs.containsKey(name),
-                harness = Harness.CODEX,
+                harness = agent.harness,
             )
         }
-        return codex + SessionRegistry.inDirectory(projectDirectory()).map { record ->
+        return external + SessionRegistry.inDirectory(projectDirectory()).map { record ->
             val name = record.name.orEmpty()
             val known = spawned[name]
             AgentInfo(
@@ -949,6 +1201,73 @@ class AgentManager(private val project: Project) {
         val modelFlag = if (model.isNotBlank()) " -m \"${'$'}$ENV_MODEL\"" else ""
         return "$assignments ${settings.codexLaunchCommand} -p ${Codex.profileName(role)} " +
             "${settings.codexArgs.trim()}$modelFlag -c \"${'$'}$ENV_TRUST\" \"${'$'}$ENV_TASK\""
+    }
+
+    /**
+     * Окружение b24-агента. Как у Codex, здесь же едут переменные части командной строки:
+     * задача, промпт роли, модель, пути канала — в строке остаются только ссылки на них.
+     */
+    internal fun b24Env(
+        role: Role,
+        name: String,
+        model: String,
+        parentName: String?,
+        parentSessionId: String?,
+        task: String,
+        channel: B24.Channel,
+    ): Map<String, String> {
+        val env = LinkedHashMap<String, String>()
+        env["MJC_AGENT_NAME"] = name
+        env["MJC_ROLE"] = role.id
+        env["MJC_REPORTS_DIR"] = reportsDirectory().toString().replace(BACKSLASH, '/')
+        parentName?.takeIf { it.isNotBlank() }?.let { env["MJC_PARENT"] = it.take(MAX_PARENT_NAME) }
+        parentSessionId?.takeIf { it.isNotBlank() }?.let { env["MJC_PARENT_SESSION"] = it }
+        if (task.isNotBlank()) env[ENV_TASK] = task
+        env[ENV_ROLE_PROMPT] = dev.metajetcore.roles.Roles.promptFor(role, Harness.B24)
+        env[ENV_B24_EVENTS] = channel.events.toString()
+        env[ENV_B24_INPUT] = channel.input.toString()
+        if (model.isNotBlank()) env[ENV_MODEL] = model
+        env.putAll(settings.extraEnv())
+        return env
+    }
+
+    /**
+     * argv b24-агента. UUID сессии и режим прав — литералами: они из букв, цифр и дефисов.
+     * Всё остальное — ссылками на окружение вкладки. Задача последней: `-i` — «выполнить и
+     * остаться в интерактиве»; без задачи CLI стартует пустым и ждёт ввода.
+     */
+    internal fun b24Argv(sessionId: String, model: String, hasTask: Boolean): List<String> {
+        val shellPath = Terminal.configuredShellPath(project) ?: ShellDialect.defaultShell()
+        val dialect = ShellDialect.detect(shellPath)
+        val base = settings.b24LaunchCommand.trim().ifEmpty { "b24-cowork-code-cli" }
+        val command = buildString {
+            append(base)
+            append(" --session-id ").append(sessionId)
+            B24.approvalMode(settings.permissionMode)?.let { append(" --approval-mode ").append(it) }
+            if (model.isNotBlank()) append(" -m ").append(dialect.envRef(ENV_MODEL))
+            settings.b24Args.trim().takeIf { it.isNotEmpty() }?.let { append(' ').append(it) }
+            append(" --json-file ").append(dialect.envRef(ENV_B24_EVENTS))
+            append(" --input-file ").append(dialect.envRef(ENV_B24_INPUT))
+            append(" --append-system-prompt ").append(dialect.envRef(ENV_ROLE_PROMPT))
+            if (hasTask) append(" -i ").append(dialect.envRef(ENV_TASK))
+        }
+        return dialect.argv(
+            shellPath,
+            dialect.unsetNames(inheritedMarkers()),
+            command,
+            execable = ShellDialect.isSimple(base),
+        )
+    }
+
+    /** Ручной режим для b24: значения вписаны в строку POSIX-кавычками. */
+    private fun b24ManualCommand(sessionId: String, model: String, env: Map<String, String>, hasTask: Boolean): String {
+        val assignments = env.entries.joinToString(" ") { (key, value) -> "$key=${posixQuote(value)}" }
+        val mode = B24.approvalMode(settings.permissionMode)?.let { " --approval-mode $it" }.orEmpty()
+        val modelFlag = if (model.isNotBlank()) " -m \"${'$'}$ENV_MODEL\"" else ""
+        val taskFlag = if (hasTask) " -i \"${'$'}$ENV_TASK\"" else ""
+        return "$assignments ${settings.b24LaunchCommand} --session-id $sessionId$mode$modelFlag " +
+            "${settings.b24Args.trim()} --json-file \"${'$'}$ENV_B24_EVENTS\" " +
+            "--input-file \"${'$'}$ENV_B24_INPUT\" --append-system-prompt \"${'$'}$ENV_ROLE_PROMPT\"$taskFlag"
     }
 
     private fun posixQuote(value: String): String = "'" + value.replace("'", "'\\''") + "'"
@@ -1168,6 +1487,15 @@ class AgentManager(private val project: Project) {
         const val ENV_MODEL = "MJC_MODEL"
         const val ENV_THREAD = "MJC_THREAD"
         const val ENV_MESSAGE = "MJC_MESSAGE"
+        const val ENV_ROLE_PROMPT = "MJC_ROLE_PROMPT"
+        const val ENV_B24_EVENTS = "MJC_B24_EVENTS"
+        const val ENV_B24_INPUT = "MJC_B24_INPUT"
+
+        const val B24_CLEAR = "/clear"
+
+        /** CLI опрашивает input раз в 500 мс; после `/clear` выжидаем с запасом. */
+        const val B24_CLEAR_HOLD_MS = 1_500L
+        const val OUTBOX_PUMP_MS = 1_000L
 
         const val DELIVERY_TIMEOUT_MS = 30_000L
         const val MAILBOX_JOURNAL = "mailbox.jsonl"

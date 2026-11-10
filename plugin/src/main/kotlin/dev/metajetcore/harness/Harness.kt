@@ -14,7 +14,16 @@ package dev.metajetcore.harness
 enum class Harness(val key: String, val displayName: String, val shortName: String) {
     CLAUDE("claude_code", "Claude Code", "claude"),
     CODEX("codex", "Codex", "codex"),
+
+    /**
+     * b24-cowork-code-cli. В списке агентов терминала IDE его нет — ключ свой, и в настройках
+     * он предлагается всегда, а не по списку IDE; иконки у вкладки нет.
+     */
+    B24("b24", "B24 CoWork Code", "b24"),
     ;
+
+    /** Харнес есть в списке агентов терминала IDE: оттуда берутся доступность и иконка. */
+    val knownToIde: Boolean get() = this != B24
 
     companion object {
         fun fromKey(key: String?): Harness? =
@@ -24,9 +33,9 @@ enum class Harness(val key: String, val displayName: String, val shortName: Stri
          * Похоже ли имя модели на модель Claude.
          *
          * tempo задаёт модель каждому запуску субагента в терминах Claude (`opus`, `sonnet`), и
-         * оркестратор передаёт её в `spawn_agent` как есть. Codex такую модель не знает и
-         * упал бы на старте, поэтому для него это имя отбрасываем — берётся модель из
-         * настроек роли или из конфига Codex.
+         * оркестратор передаёт её в `spawn_agent` как есть. Codex и b24 такую модель не знают
+         * и упали бы на старте, поэтому для них это имя отбрасываем — берётся модель из
+         * настроек роли или из конфига самого CLI.
          */
         fun isClaudeModel(model: String): Boolean {
             val lower = model.trim().lowercase()

@@ -41,7 +41,7 @@ object ModelCatalog {
             Model("haiku", "Haiku"),
             Model("fable", "Fable"),
         )
-        Harness.CODEX -> emptyList()
+        Harness.CODEX, Harness.B24 -> emptyList()
     }
 
     private val cache = HashMap<String, List<Model>>()
@@ -85,6 +85,8 @@ object ModelCatalog {
         val line = when (harness) {
             Harness.CLAUDE -> "$command -p --input-format stream-json --output-format stream-json --verbose"
             Harness.CODEX -> "$command app-server"
+            // Модели b24 перечислены в его settings.json — запускать CLI ради списка незачем.
+            Harness.B24 -> return B24.models()
         }
         val argv = ShellDialect.detect(shellPath).argv(shellPath, "", line)
         val builder = ProcessBuilder(argv)
@@ -144,6 +146,7 @@ object ModelCatalog {
             """{"jsonrpc":"2.0","method":"initialized"}""",
             """{"jsonrpc":"2.0","id":2,"method":"model/list","params":{}}""",
         )
+        Harness.B24 -> emptyList()
     }
 
     /** Строка ответа CLI → список моделей; null — строка не та (шелл может напечатать что угодно). */
@@ -170,6 +173,7 @@ object ModelCatalog {
                     Model(id, m["displayName"]?.asString ?: id, if (isDefault) "по умолчанию в Codex" else "")
                 }
             }
+            Harness.B24 -> null
         }
     }
 

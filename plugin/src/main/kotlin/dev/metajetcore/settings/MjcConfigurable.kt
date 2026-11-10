@@ -78,8 +78,9 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
         group("Роли") {
             // Список — у IDE (агенты терминала, 263+), а не свой: что установлено и включено,
             // знает она. Назначить можно только харнес, для которого в плагине есть адаптер.
+            // b24 IDE не знает — его предлагаем всегда, команда запуска — в его группе ниже.
             val available = Terminal.terminalAgentKeys()
-            val offered = Harness.entries.filter { it == Harness.CLAUDE || it.key in available }
+            val offered = Harness.entries.filter { it == Harness.CLAUDE || !it.knownToIde || it.key in available }
 
             row("") {
                 label("Харнес").bold()
@@ -117,8 +118,8 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
             }
             row {
                 comment(
-                    if (Harness.CODEX in offered) "Пустая модель — модель роли для Claude Code, модель из ~/.codex/config.toml для Codex."
-                    else "Codex появится в списке, когда IDE увидит его среди агентов терминала.",
+                    "Пустая модель — модель роли для Claude Code, модель из конфига CLI для Codex и B24 CoWork Code." +
+                        if (Harness.CODEX in offered) "" else " Codex появится в списке, когда IDE увидит его среди агентов терминала.",
                 )
             }
             row {
@@ -135,7 +136,7 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
             // если IDE его сейчас не видит, — иначе Apply молча обнулил бы его.
             val available = Terminal.terminalAgentKeys()
             val panelHarnesses = Harness.entries.filter {
-                it == Harness.CLAUDE || it.key in available || (settings.reviewPanel[it.key] ?: 0) > 0
+                it == Harness.CLAUDE || !it.knownToIde || it.key in available || (settings.reviewPanel[it.key] ?: 0) > 0
             }
             for (harness in panelHarnesses) {
                 row(harness.displayName + ":") {
@@ -185,6 +186,23 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
                 )
             }
         }.expanded = codexUsed
+
+        val b24Used = Role.entries.any { settings.harnessFor(it) == Harness.B24 } ||
+            (settings.reviewPanel[Harness.B24.key] ?: 0) > 0
+        collapsibleGroup("B24 CoWork Code") {
+            row("Команда:") {
+                textField().bindText(settings::b24LaunchCommand).columns(30)
+            }
+            row("Аргументы:") {
+                textField().bindText(settings::b24Args).columns(40)
+                contextHelp(
+                    "Сверх того, что плагин добавит сам: --session-id, канал (--json-file, --input-file), " +
+                        "роль (--append-system-prompt), задача (-i), модель (-m) и режим прав " +
+                        "(--approval-mode по общей настройке: auto, acceptEdits → auto-edit, " +
+                        "bypassPermissions → yolo).",
+                )
+            }
+        }.expanded = b24Used
 
         collapsibleGroup("Дополнительно") {
             row("Ожидание старта агента:") {
@@ -289,7 +307,14 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
     private fun commandOf(harness: Harness) = when (harness) {
         Harness.CLAUDE -> settings.launchCommand
         Harness.CODEX -> settings.codexLaunchCommand
-    }.trim().ifEmpty { if (harness == Harness.CLAUDE) "claude" else "codex" }
+        Harness.B24 -> settings.b24LaunchCommand
+    }.trim().ifEmpty {
+        when (harness) {
+            Harness.CLAUDE -> "claude"
+            Harness.CODEX -> "codex"
+            Harness.B24 -> "b24-cowork-code-cli"
+        }
+    }
 
     /**
      * Модель роли: свободный ввод плюс список от харнеса по стрелке.
@@ -316,7 +341,11 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
             models = list
             // Подсказка — модель, которая реально поедет, а не «по умолчанию»: так видно, что
             // оставить поле пустым — тоже осознанный выбор.
-            emptyText.text = if (harness == Harness.CODEX) "из конфига Codex" else role.defaultModel
+            emptyText.text = when (harness) {
+                Harness.CODEX -> "из конфига Codex"
+                Harness.B24 -> "из конфига B24"
+                else -> role.defaultModel
+            }
             repaint()
         }
 
@@ -348,8 +377,8 @@ class MjcConfigurable : BoundConfigurable("MetaJetCore") {
     private fun modelWarning(text: String, harness: Harness?) = with(text.trim()) {
         when {
             isEmpty() -> null
-            harness == Harness.CODEX && Harness.isClaudeModel(this) ->
-                com.intellij.openapi.ui.ValidationInfo("Codex не знает модели Claude — возьмётся модель из его конфига").asWarning()
+            harness != null && harness != Harness.CLAUDE && Harness.isClaudeModel(this) ->
+                com.intellij.openapi.ui.ValidationInfo("${harness.displayName} не знает модели Claude — возьмётся модель из его конфига").asWarning()
             harness == Harness.CLAUDE && !Harness.isClaudeModel(this) ->
                 com.intellij.openapi.ui.ValidationInfo("Не похоже на модель Claude").asWarning()
             else -> null

@@ -59,7 +59,7 @@ class McpTools(private val project: Project) {
                 "harness" to schema(
                     "string",
                     "Чем запустить агента; обычно не нужно — харнес роли задан в настройках " +
-                        "плагина. Codex-агент получает задачу сразу при старте, отвечает через " +
+                        "плагина. Агент Codex или b24 получает задачу сразу при старте, отвечает через " +
                         "await_messages, новые задачи — через send_to_agent.",
                     enumValues = Harness.entries.map { it.key },
                 ),
@@ -68,7 +68,7 @@ class McpTools(private val project: Project) {
         ),
         tool(
             name = "send_to_agent",
-            description = "Отправить сообщение агенту НЕ-Claude (Codex): новая задача, " +
+            description = "Отправить сообщение агенту НЕ-Claude (Codex, b24): новая задача, " +
                 "«Продолжай: фаза P+1», правки после гейта. Сообщение встаёт в его очередь " +
                 "новым ходом, текст доезжает как есть. Агентам Claude Code пиши SendMessage — " +
                 "этот инструмент им не доставляет. Ответ забирай через await_messages.",
@@ -80,7 +80,7 @@ class McpTools(private val project: Project) {
         ),
         tool(
             name = "await_messages",
-            description = "Дождаться ответов агентов НЕ-Claude (Codex): плагин читает их " +
+            description = "Дождаться ответов агентов НЕ-Claude (Codex, b24): плагин читает их " +
                 "ленты и отдаёт завершённые ходы. С names — ждёт, пока ответит каждый (волна " +
                 "tempo), без — первый ответ любого. По таймауту возвращает что есть и кто ещё " +
                 "в работе: вызови снова. Ответы агентов Claude Code приходят сами, через " +
@@ -253,12 +253,16 @@ class McpTools(private val project: Project) {
                 append("всё верно, продолжай.")
             }
             if (result.taskDelivered) {
-                // Codex: без первого сообщения его сессия не создаётся, поэтому задача
-                // ушла аргументом при старте. Повторно слать её нельзя — будет два хода.
+                // Codex и b24 получают задачу аргументом при старте (у Codex без первого
+                // сообщения сессии нет вовсе). Повторно слать её нельзя — будет два хода.
                 append("\n\nЗадача УЖЕ передана агенту при старте — повторно не отправляй. ")
                 append("Это агент ${result.agent.harness.displayName}: SendMessage ему не ")
                 append("доставляет. Ответ забери через await_messages(names=[\"${result.agent.name}\"]), ")
                 append("следующие задачи — через send_to_agent.")
+            } else if (result.agent.harness != Harness.CLAUDE) {
+                append("\n\nЭто агент ${result.agent.harness.displayName}: SendMessage ему не доставляет. ")
+                append("Задачу отправь через send_to_agent(name=\"${result.agent.name}\"), ")
+                append("ответ забери через await_messages(names=[\"${result.agent.name}\"]).")
             } else {
                 append("\n\nСЛЕДУЮЩИЙ ШАГ, ОБЯЗАТЕЛЬНО: отправь агенту задачу через ")
                 append("SendMessage(to=\"${result.agent.name}\"). ")
@@ -358,7 +362,10 @@ class McpTools(private val project: Project) {
     private fun resetAgent(args: Json): Json {
         val name = args["name"]?.asString ?: return textResult("ошибка: нет name", isError = true)
         return when (val result = manager.reset(name)) {
-            ResetResult.Done -> textResult("контекст '$name' сброшен; новую задачу отправь через SendMessage")
+            ResetResult.Done -> textResult(
+                "контекст '$name' сброшен; новую задачу отправь через " +
+                    if (manager.isExternal(name)) "send_to_agent" else "SendMessage",
+            )
             ResetResult.UnknownTab -> textResult("вкладка '$name' плагину неизвестна", isError = true)
             is ResetResult.Unsupported -> textResult(result.reason, isError = true)
         }
@@ -370,6 +377,14 @@ class McpTools(private val project: Project) {
         return when (val result = manager.deliver(name, text)) {
             DeliveryResult.Sent ->
                 textResult("отправлено '$name'; ответ забери через await_messages(names=[\"$name\"])")
+            is DeliveryResult.Queued -> textResult(
+                // Очередь бывает и без идущего хода — короткая пауза после сброса (/clear ответа не
+                // даёт). Поэтому не обещаем «ответ на текущий ход»: оркестратор ждал бы лишний.
+                "'$name' сейчас не принимает сообщение: оно в очереди плагина (позиция " +
+                    "${result.position}) и уйдёт отдельным ходом, как только агент освободится. " +
+                    "Ответ на него придёт через await_messages(names=[\"$name\"]) после ответов на " +
+                    "то, что ты отправил раньше.",
+            )
             DeliveryResult.UseSendMessage -> textResult(
                 "'$name' — сессия Claude Code: пиши ей SendMessage. Плагин второй канал не " +
                     "заводит — у двух очередей не было бы порядка между собой.",
@@ -446,6 +461,7 @@ class McpTools(private val project: Project) {
                 append("префикс имён: ${manager.prefix()}\n")
                 append("команда запуска: ${settings.launchCommand}\n")
                 append("команда Codex: ${settings.codexLaunchCommand} ${settings.codexArgs}\n")
+                append("команда b24: ${settings.b24LaunchCommand} ${settings.b24Args}\n")
                 append("харнесы ролей: ")
                 append(Role.entries.filter { it != Role.ORCHESTRATOR }.joinToString { "${it.id}=${settings.harnessFor(it).key}" })
                 append('\n')
@@ -513,7 +529,7 @@ class McpTools(private val project: Project) {
         /**
          * Приписка к задаче участника состава. Плагин дописывает её сам, потому что промпт
          * tempo называет один путь отчёта, и без приписки ревьюверы писали бы в один файл;
-         * Codex задачу получает при старте, позже её не поправить.
+         * Codex и b24 задачу получают при старте, позже её не поправить.
          */
         fun panelNote(size: Int, slot: String): String =
             "\n\n---\nТы — один из $size ревьюверов этой проверки (твой слот: $slot). Если задача " +

@@ -77,7 +77,7 @@ class MjcSettings : PersistentStateComponent<MjcSettings> {
     var mcpBindLoopbackOnly: Boolean = true
 
     /**
-     * Харнес каждой роли: id роли -> ключ харнеса (`claude_code`, `codex`).
+     * Харнес каждой роли: id роли -> ключ харнеса (`claude_code`, `codex`, `b24`).
      *
      * Ключи — те же, что у агентов терминала IDE, поэтому список выбора в настройках берётся
      * у IDE. Нет записи — Claude Code: так ведут себя все установки до 0.4.
@@ -100,6 +100,15 @@ class MjcSettings : PersistentStateComponent<MjcSettings> {
      * целиком, чтобы это решение можно было пересмотреть, не трогая код.
      */
     var codexArgs: String = "-s workspace-write -a never --disable hooks"
+
+    /** Команда запуска b24-cowork-code-cli. Как и у Claude, сюда вписывается обёртка. */
+    var b24LaunchCommand: String = "b24-cowork-code-cli"
+
+    /**
+     * Аргументы b24-агентов сверх канала, роли, режима прав и модели. По умолчанию пусто:
+     * всё обязательное плагин добавляет сам (docs/PLAN-B24.md §2).
+     */
+    var b24Args: String = ""
 
     /**
      * Состав итогового ревью: ключ харнеса -> сколько ревьюверов (0–3).

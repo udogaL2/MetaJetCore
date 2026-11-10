@@ -146,3 +146,84 @@ object FakeCodex {
         while IFS= read -r LINE; do :; done
     """.trimIndent()
 }
+
+/**
+ * Подставной `b24-cowork-code-cli`: пишет ленту так, как её пишет b24 0.26.7
+ * (EXPERIMENT-B24-CLI.md §4) — `session_start`, затем на каждое сообщение ход
+ * `user` → `message_start` → `assistant` → `message_stop`, — и опрашивает input-файл.
+ *
+ * Ответ хода — `ECHO: <текст>`. Сообщение со словом «медленно» идёт ходом с инструментом: первое
+ * сообщение кончается `tool_use`, а ответ приходит вторым через 2 с — так тест видит, что плагин
+ * не считает ход законченным раньше времени и держит очередь. `/clear` событий не даёт, как у
+ * настоящего, но следующий ответ помечается. Что пришло в argv, фейк кладёт в `seen.json`
+ * рядом с лентой. Сам не выходит: плагин завершает b24 сигналом.
+ *
+ * python3, а не bash: фейку надо разбирать JSON команд. Только POSIX.
+ */
+object FakeB24 {
+
+    class Installed(val command: String, val channels: Path)
+
+    fun install(): Installed {
+        val dir = Files.createTempDirectory("mjc-fake-b24")
+        val script = dir.resolve("b24.py")
+        Files.write(script, SCRIPT.toByteArray())
+        return Installed("python3 $script", Files.createDirectories(dir.resolve("channels")))
+    }
+
+    private val SCRIPT = """
+        import json, os, sys, time
+        args = sys.argv[1:]
+        def opt(name):
+            return args[args.index(name) + 1] if name in args else None
+        events, inp = opt("--json-file"), opt("--input-file")
+        task, sid = opt("-i"), opt("--session-id")
+        with open(os.path.join(os.path.dirname(events), "seen.json"), "w") as f:
+            json.dump({"model": opt("-m"), "approval": opt("--approval-mode"),
+                       "prompt": opt("--append-system-prompt") or ""}, f, ensure_ascii=False)
+        def emit(obj):
+            with open(events, "a", encoding="utf-8") as f:
+                f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        def stream(kind):
+            emit({"type": "stream_event", "event": {"type": kind}})
+        def say(text, stop_reason=None):
+            emit({"type": "assistant", "message": {"content": [{"type": "text", "text": text}], "stop_reason": stop_reason}})
+        cleared = False
+        def turn(text):
+            global cleared
+            emit({"type": "user", "message": {"content": [{"type": "text", "text": text}]}})
+            reply = ("ECHO(после /clear): " if cleared else "ECHO: ") + text
+            cleared = False
+            if "медленно" in text:
+                stream("message_start")
+                say("Делаю.")
+                emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t1", "name": "write_file", "input": {}}], "stop_reason": "tool_use"}})
+                stream("message_stop")
+                time.sleep(2)
+                emit({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}})
+            stream("message_start")
+            say(reply)
+            stream("message_stop")
+        emit({"type": "system", "subtype": "session_start", "session_id": sid, "data": {"session_id": sid}})
+        if task:
+            turn(task)
+        offset = os.path.getsize(inp)
+        while True:
+            time.sleep(0.2)
+            with open(inp, "rb") as f:
+                f.seek(offset)
+                chunk = f.read()
+            end = chunk.rfind(b"\n")
+            if end < 0:
+                continue
+            offset += end + 1
+            for line in chunk[:end].decode("utf-8").splitlines():
+                cmd = json.loads(line)
+                if cmd.get("type") != "submit":
+                    continue
+                if cmd["text"] == "/clear":
+                    cleared = True
+                else:
+                    turn(cmd["text"])
+    """.trimIndent()
+}

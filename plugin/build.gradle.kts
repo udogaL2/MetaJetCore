@@ -6,7 +6,7 @@ plugins {
 }
 
 group = "dev.metajetcore"
-version = "0.5.2"
+version = "0.6.0"
 
 repositories {
     mavenCentral()

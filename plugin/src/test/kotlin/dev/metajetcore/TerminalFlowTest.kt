@@ -5,7 +5,9 @@ import com.intellij.openapi.ui.TestDialogManager
 import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import dev.metajetcore.agents.AgentManager
 import dev.metajetcore.agents.CloseResult
+import dev.metajetcore.agents.DeliveryResult
 import dev.metajetcore.agents.SpawnResult
+import dev.metajetcore.harness.B24
 import dev.metajetcore.harness.Codex
 import dev.metajetcore.harness.Harness
 import dev.metajetcore.mcp.McpTools
@@ -63,6 +65,8 @@ class TerminalFlowTest : BasePlatformTestCase() {
             settings.launchCommand = "claude"
             settings.codexLaunchCommand = "codex"
             Codex.homeOverride = null
+            settings.b24LaunchCommand = "b24-cowork-code-cli"
+            B24.channelsOverride = null
             settings.reviewPanel = mutableMapOf()
             settings.reviewPanelModel = mutableMapOf()
             TestDialogManager.setTestDialog(TestDialog.DEFAULT)
@@ -350,6 +354,75 @@ class TerminalFlowTest : BasePlatformTestCase() {
         assertEquals(CloseResult.Closed, onPooledThreadPumpingEdt { manager.close(name) })
         assertFalse("вкладка осталась под управлением", manager.knownTabs().contains(name))
         assertNull(manager.list().firstOrNull { it.name == name })
+    }
+
+    fun testB24AgentLifecycle() {
+        if (dev.metajetcore.shell.ShellDialect.isWindows()) return
+        // Весь цикл b24-агента (docs/PLAN-B24.md): задача и роль уходят при старте, ответ —
+        // последнее сообщение хода, а не первое; сообщение занятому агенту ждёт в очереди
+        // плагина и уходит отдельным ходом; /clear работает; закрытие убирает и канал.
+        val fake = FakeB24.install()
+        settings.b24LaunchCommand = fake.command
+        B24.channelsOverride = fake.channels
+        Files.createDirectories(manager.projectDirectory())
+
+        val result = onPooledThreadPumpingEdt {
+            manager.spawn(
+                role = Role.IMPLEMENTER,
+                task = "проверь \"кавычки\" и ${'$'}HOME",
+                parentName = null,
+                requestedName = null,
+                requestedModel = "bitrix/bitrixgpt-6.5-agent",
+                domain = "b24",
+                requestedHarness = Harness.B24,
+            )
+        }
+        val started = result as? SpawnResult.Started
+            ?: throw AssertionError("b24-агент не поднялся: $result\nэкран:\n${screenOf("mjc-impl-b24")}")
+        val name = started.agent.name
+        assertTrue("задача должна уйти при старте", started.taskDelivered)
+        assertEquals(Harness.B24, started.agent.harness)
+        assertEquals("bitrix/bitrixgpt-6.5-agent", started.agent.model)
+
+        val first = onPooledThreadPumpingEdt { manager.awaitMessages(listOf(name), 10_000) }
+        assertEquals(first.toString(), listOf("ECHO: проверь \"кавычки\" и ${'$'}HOME"), first.messages.map { it.text })
+
+        // Что доехало в argv: модель, режим прав по общей настройке, промпт роли с протоколом.
+        val channel = Files.list(fake.channels).use { it.toList() }.single()
+        val seen = Json.parse(Files.readString(channel.resolve("seen.json")))
+        assertEquals("bitrix/bitrixgpt-6.5-agent", seen["model"]?.asString)
+        assertEquals(B24.approvalMode(settings.permissionMode), seen["approval"]?.asString)
+        assertTrue(seen["prompt"]?.asString.orEmpty().contains("Протокол команды"))
+
+        val listed = manager.list().firstOrNull { it.name == name }
+        assertEquals("idle", listed?.status)
+        assertEquals(Harness.B24, listed?.harness)
+
+        // Ход с инструментом: пока он идёт, второе сообщение ждёт в очереди плагина.
+        assertEquals(DeliveryResult.Sent, onPooledThreadPumpingEdt { manager.deliver(name, "медленно раз") })
+        assertEquals(DeliveryResult.Queued(1), onPooledThreadPumpingEdt { manager.deliver(name, "два") })
+        val replies = mutableListOf<String>()
+        repeat(3) {
+            if (replies.size < 2) {
+                replies += onPooledThreadPumpingEdt { manager.awaitMessages(listOf(name), 10_000) }.messages.map { it.text }
+            }
+        }
+        // Ответ первого хода — итог, а не «Делаю.» из сообщения с инструментом; второе
+        // сообщение — отдельный ход, а не влитое в первый.
+        assertEquals(listOf("ECHO: медленно раз", "ECHO: два"), replies)
+
+        assertEquals(
+            dev.metajetcore.agents.ResetResult.Done,
+            onPooledThreadPumpingEdt { manager.reset(name) },
+        )
+        onPooledThreadPumpingEdt { manager.deliver(name, "три") }
+        val afterReset = onPooledThreadPumpingEdt { manager.awaitMessages(listOf(name), 10_000) }
+        assertEquals(afterReset.toString(), listOf("ECHO(после /clear): три"), afterReset.messages.map { it.text })
+
+        assertEquals(CloseResult.Closed, onPooledThreadPumpingEdt { manager.close(name) })
+        assertFalse("вкладка осталась под управлением", manager.knownTabs().contains(name))
+        assertNull(manager.list().firstOrNull { it.name == name })
+        assertFalse("канал не удалён", Files.exists(channel))
     }
 
     fun testFinalReviewOpensTheWholePanel() {

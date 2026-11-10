@@ -176,12 +176,13 @@ object Roles {
     )
 
     /**
-     * Протокол для Codex. Отличается ровно каналом: межсессионных сообщений у Codex нет, а
-     * ответ хода плагин сам забирает из его ленты (`task_complete`, docs/PLAN-0.4.md §4.6) и
-     * кладёт в ящик оркестратора. Поэтому «отправь через SendMessage» здесь заменено на
-     * «закончи ход отчётом» — иначе агент искал бы несуществующий инструмент.
+     * Протокол для харнесов без SendMessage (Codex, b24). Отличается ровно каналом: ответ хода
+     * плагин сам забирает из ленты агента (`task_complete` у Codex, docs/PLAN-0.4.md §4.6;
+     * последнее сообщение хода у b24, docs/PLAN-B24.md) и кладёт в ящик оркестратора. Поэтому
+     * «отправь через SendMessage» здесь заменено на «закончи ход отчётом» — иначе агент искал
+     * бы несуществующий инструмент.
      */
-    private const val CODEX_PROTOCOL = """
+    private const val MAILBOX_PROTOCOL = """
 ## Протокол команды
 
 Ты полноценная сессия в команде метаоркестратора. Эту вкладку никто не читает: разработчик
@@ -209,7 +210,7 @@ object Roles {
     fun promptFor(role: Role, harness: Harness = Harness.CLAUDE): String {
         val body = prompts.getValue(role).trim()
         if (role == Role.ORCHESTRATOR) return body
-        val protocol = if (harness == Harness.CODEX) CODEX_PROTOCOL else PROTOCOL
+        val protocol = if (harness == Harness.CLAUDE) PROTOCOL else MAILBOX_PROTOCOL
         return body + "\n" + protocol.trimEnd()
     }
 }
