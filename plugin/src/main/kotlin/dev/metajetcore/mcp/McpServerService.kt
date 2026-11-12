@@ -210,7 +210,12 @@ class McpServerService(private val project: Project) : Disposable {
             "initialize" -> initializeResult()
             "ping" -> Json.obj()
             "tools/list" -> Json.obj("tools" to Json.arr(tools.definitions()))
-            "tools/call" -> tools.call(request["params"])
+            // Порт клиента — чтобы spawn_agent узнал вызывающую сессию по соединению, а не
+            // по имени, которое модель присылает и которое меняется (docs/PLAN-CALLER.md).
+            "tools/call" -> tools.call(
+                request["params"],
+                McpTools.Caller(exchange.remoteAddress.port, exchange.localAddress.port),
+            )
             else -> {
                 respond(exchange, 200, errorResponse(id, -32601, "unknown method: $method"))
                 return

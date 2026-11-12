@@ -74,6 +74,12 @@ object Terminal {
     private const val TABS_MANAGER = "com.intellij.terminal.frontend.toolwindow.TerminalToolWindowTabsManager"
     private const val VIEW_KT = "com.intellij.terminal.frontend.view.TerminalViewKt"
     private const val TERMINAL_VIEW_FILE = "com.intellij.terminal.frontend.editor.TerminalViewVirtualFile"
+
+    /**
+     * Вкладка AIR (Agent Threads, `plugins/air-plugin`): сессия Claude Code в своём редакторе,
+     * а не в терминале. Плагин AIR внутренний и не наша зависимость — только по имени.
+     */
+    private const val AIR_THREAD_FILE = "com.intellij.air.thread.view.AgentThreadViewContentFile"
     private const val PROCESS_TYPE = "org.jetbrains.plugins.terminal.startup.TerminalProcessType"
     private const val TERMINAL_AGENT = "org.jetbrains.plugins.terminal.agent.TerminalAgent"
     private const val OPTIONS_PROVIDER = "org.jetbrains.plugins.terminal.TerminalOptionsProvider"
@@ -333,6 +339,33 @@ object Terminal {
     }
 
     /**
+     * Открытая вкладка AIR с сессией [sessionId], или null.
+     *
+     * У файла AIR `getThreadId()` — это `sessionId` Claude Code (проверено на PhpStorm
+     * 263.8054: в workspace.xml `threadIdentity="claude:<sessionId>" threadId="<sessionId>"`).
+     * Через вложенный `TerminalView` и pid было бы длиннее и хрупче: `threadId` — часть
+     * публичного интерфейса файла.
+     */
+    fun airThreadFile(project: Project, sessionId: String): VirtualFile? = airThreadFiles(project)
+        .firstOrNull { call(it, "getThreadId") == sessionId }
+
+    /** Открытые вкладки AIR — для поиска родителя и диагностики. */
+    fun airThreadFiles(project: Project): List<VirtualFile> = try {
+        Editors.of(project).openFiles.filter { implementsByName(it.javaClass, AIR_THREAD_FILE) }
+    } catch (_: Throwable) {
+        emptyList()
+    }
+
+    private fun implementsByName(cls: Class<*>?, name: String): Boolean {
+        var c = cls
+        while (c != null) {
+            if (c.name == name || c.interfaces.any { it.name == name || implementsByName(it, name) }) return true
+            c = c.superclass
+        }
+        return false
+    }
+
+    /**
      * Файл editor area, под которым сейчас открыта вкладка, или null — она в тулвиндоу.
      *
      * Ищем по самой вкладке, а не по выбранному редактору после переноса: выбор к этому
@@ -587,6 +620,7 @@ object Terminal {
             append("терминалов в editor area: ${inEditor.size}")
             if (inEditor.isNotEmpty()) append(" (${inEditor.joinToString { it.name }})")
             append('\n')
+            append("вкладок AIR (Agent Threads): ${airThreadFiles(project).size}\n")
             // Какая вкладка выбрана: спавн агента не должен уводить разработчика с
             // оркестратора, а проверить это иначе нечем.
             append("активная вкладка редактора: ${selectedEditorTab(project) ?: "нет"}\n")

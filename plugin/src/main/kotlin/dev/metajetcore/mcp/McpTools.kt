@@ -1,5 +1,7 @@
 package dev.metajetcore.mcp
 
+import dev.metajetcore.registry.CallerResolver
+import dev.metajetcore.registry.SessionRecord
 import com.intellij.openapi.project.Project
 import dev.metajetcore.agents.AgentInfo
 import dev.metajetcore.agents.AgentManager
@@ -151,14 +153,17 @@ class McpTools(private val project: Project) {
         ),
     )
 
-    fun call(params: Json?): Json {
+    /** Откуда пришёл вызов: порт клиента и порт нашего сервера. */
+    data class Caller(val clientPort: Int, val serverPort: Int)
+
+    fun call(params: Json?, caller: Caller? = null): Json {
         val name = params?.get("name")?.asString
             ?: return textResult("ошибка: не указано имя инструмента", isError = true)
         val args = params["arguments"] ?: Json.obj()
 
         return try {
             when (name) {
-                "spawn_agent" -> spawnAgent(args)
+                "spawn_agent" -> spawnAgent(args, caller)
                 "send_to_agent" -> sendToAgent(args)
                 "await_messages" -> awaitMessages(args)
                 "list_agents" -> listAgents()
@@ -179,7 +184,7 @@ class McpTools(private val project: Project) {
 
     // ---------------------------------------------------------------- actions
 
-    private fun spawnAgent(args: Json): Json {
+    private fun spawnAgent(args: Json, caller: Caller?): Json {
         val roleId = args["role"]?.asString
             ?: return textResult("ошибка: не указана role", isError = true)
         val role = Role.fromId(roleId)
@@ -200,6 +205,9 @@ class McpTools(private val project: Project) {
         val requestedName = args["name"]?.asString
         val requestedModel = args["model"]?.asString
         val domain = args["domain"]?.asString
+        // Сразу, пока соединение открыто: по нему и определяется вызывающий. Один раз на
+        // вызов — состав ревью спавнит нескольких, а вызывающий у них общий.
+        val callerRecord = caller?.let { CallerResolver.recordFor(it.clientPort, it.serverPort) }
         val panel = MjcSettings.getInstance().reviewPanelMembers()
         // Итоговое ревью разворачивается в состав из настроек одним вызовом: оркестратору не
         // нужно знать настройки, и второго ревьювера не «забыть». Явный harness или name —
@@ -207,7 +215,7 @@ class McpTools(private val project: Project) {
         if (role == Role.REVIEWER && harness == null && requestedName.isNullOrBlank() &&
             domain?.trim().equals(REVIEW_DOMAIN, ignoreCase = true) && panel.isNotEmpty()
         ) {
-            return spawnReviewPanel(panel, task, parent, requestedModel)
+            return spawnReviewPanel(panel, task, parent, requestedModel, callerRecord)
         }
 
         return when (
@@ -219,6 +227,7 @@ class McpTools(private val project: Project) {
                 requestedModel = requestedModel,
                 domain = domain,
                 requestedHarness = harness,
+                caller = callerRecord,
             )
         ) {
             is SpawnResult.Started -> textResult("Агент запущен.\n" + describeStarted(result))
@@ -286,6 +295,7 @@ class McpTools(private val project: Project) {
         task: String,
         parent: String?,
         requestedModel: String?,
+        callerRecord: SessionRecord?,
     ): Json {
         val started = mutableListOf<SpawnResult.Started>()
         val sections = mutableListOf<String>()
@@ -301,6 +311,7 @@ class McpTools(private val project: Project) {
                     requestedModel = member.model ?: requestedModel,
                     domain = member.slot,
                     requestedHarness = member.harness,
+                    caller = callerRecord,
                 )
             ) {
                 is SpawnResult.Started -> {

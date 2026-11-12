@@ -51,14 +51,7 @@ object TabResolver {
         // Перебираем ВСЕ записи с этим именем: взять первую значило бы промахнуться мимо
         // вкладки ровно в тех случаях, ради которых поиск и написан.
         for (record in SessionRegistry.byName(sessionName)) {
-            val ancestors = ancestorPids(record.pid.toLong())
-            for (handle in handles) {
-                val pid = Terminal.process(handle)?.pid ?: continue
-                if (pid in ancestors) {
-                    log.info("MetaJetCore: '$sessionName' (pid ${record.pid}) живёт во вкладке с шеллом $pid")
-                    return SessionTab(handle.renamed(sessionName), record)
-                }
-            }
+            match(handles, record, sessionName)?.let { return it }
         }
 
         val byTitle = handles.firstOrNull { it.name == sessionName }
@@ -71,6 +64,29 @@ object TabResolver {
         }
 
         log.info("MetaJetCore: вкладку для '$sessionName' сопоставить не удалось")
+        return null
+    }
+
+    /**
+     * Вкладка терминала конкретной сессии — по её процессу. Для вызывающей сессии, которую
+     * определили по соединению (docs/PLAN-CALLER.md): имя здесь не нужно и не годится.
+     * null — сессия не в терминале IDE (например, во вкладке AIR) или вкладка не нашлась.
+     */
+    fun resolveRecord(project: Project, record: SessionRecord): SessionTab? {
+        val handles = Terminal.handles(project)
+        if (handles.isEmpty()) return null
+        return match(handles, record, record.name ?: record.sessionId)
+    }
+
+    private fun match(handles: List<TabHandle>, record: SessionRecord, name: String): SessionTab? {
+        val ancestors = ancestorPids(record.pid.toLong())
+        for (handle in handles) {
+            val pid = Terminal.process(handle)?.pid ?: continue
+            if (pid in ancestors) {
+                log.info("MetaJetCore: '$name' (pid ${record.pid}) живёт во вкладке с шеллом $pid")
+                return SessionTab(handle.renamed(name), record)
+            }
+        }
         return null
     }
 

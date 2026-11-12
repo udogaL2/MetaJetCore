@@ -88,8 +88,10 @@ object FakeAgent {
         #!/usr/bin/env bash
         REG="${'$'}1"
         FILE="${'$'}REG/${'$'}${'$'}.json"
-        printf '{"pid":%s,"sessionId":"11111111-2222-4333-8444-555555555555","cwd":"%s","name":"%s","agent":"%s","status":"idle","version":"fake"}' \
-            "${'$'}${'$'}" "${'$'}(pwd)" "${'$'}CLAUDE_CODE_SESSION_NAME" "${'$'}CLAUDE_CODE_AGENT" > "${'$'}FILE"
+        # mjcParent* — не поля реестра Claude Code: так тест видит, какую связь с родителем
+        # агент получил в окружении.
+        printf '{"pid":%s,"sessionId":"11111111-2222-4333-8444-555555555555","cwd":"%s","name":"%s","agent":"%s","status":"idle","version":"fake","mjcParent":"%s","mjcParentSession":"%s"}' \
+            "${'$'}${'$'}" "${'$'}(pwd)" "${'$'}CLAUDE_CODE_SESSION_NAME" "${'$'}CLAUDE_CODE_AGENT" "${'$'}MJC_PARENT" "${'$'}MJC_PARENT_SESSION" > "${'$'}FILE"
         while IFS= read -r LINE; do
             case "${'$'}LINE" in
                 */exit*) break ;;

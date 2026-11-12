@@ -5,6 +5,7 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.vfs.VirtualFile
 import dev.metajetcore.harness.B24
 import dev.metajetcore.harness.Codex
 import dev.metajetcore.harness.Harness
@@ -134,6 +135,12 @@ sealed interface SpawnResult {
 
     data class Failed(val reason: String) : SpawnResult
 }
+
+/**
+ * Где родитель на экране: вкладка терминала или файл вкладки AIR (Agent Threads). Оба null —
+ * не нашли, агент откроется в текущем окне редактора.
+ */
+internal data class ParentPlace(val handle: TabHandle?, val file: VirtualFile?)
 
 /**
  * Агент без SendMessage (Codex, b24). Всё, что про него известно, — у плагина: адрес, лента
@@ -341,6 +348,7 @@ class AgentManager(private val project: Project) : Disposable {
         requestedModel: String?,
         domain: String?,
         requestedHarness: Harness? = null,
+        caller: SessionRecord? = null,
     ): SpawnResult {
         val harness = requestedHarness ?: settings.harnessFor(role)
         if (role == Role.ORCHESTRATOR && harness != Harness.CLAUDE) {
@@ -348,7 +356,14 @@ class AgentManager(private val project: Project) : Disposable {
         }
         // Имя родителя приводим к тому, как сессия называется в реестре: оркестратор
         // копирует его из ListAgents вместе с ref-хвостом (см. canonicalName).
-        val parent = parentName?.takeIf { it.isNotBlank() }?.let { canonicalName(it) }
+        val requestedParent = parentName?.takeIf { it.isNotBlank() }?.let { canonicalName(it) }
+        // Вызывающая сессия, определённая по соединению, главнее имени из аргумента: имя модель
+        // помнит старым после /rename, а процесс не врёт (docs/PLAN-CALLER.md). Имя наружу —
+        // текущее, из реестра.
+        if (caller != null && requestedParent != null && caller.name != requestedParent) {
+            log.info("MetaJetCore: parent='$requestedParent', но вызвала сессия '${caller.name}' (${caller.sessionId}) — берём её")
+        }
+        val parent = caller?.name?.takeIf { it.isNotBlank() } ?: requestedParent
 
         // Кто этой роли уже работает — снимаем ДО открытия вкладки, иначе в списке окажется
         // и сам новичок. Спавн этим не отменяется: несколько имплементеров по
@@ -359,13 +374,17 @@ class AgentManager(private val project: Project) : Disposable {
 
         // Родителя разрешаем один раз: нужна и вкладка (чтобы открыть агента рядом), и
         // запись реестра (чтобы отдать наружу sessionId вместо неуникального имени).
-        val parentTab = parent?.let { resolveParent(it) }
-        if (parent != null && parentTab?.handle == null) {
+        val parentTab = if (caller != null) resolveParent(caller) else parent?.let { resolveParent(it) }
+        val parentSession = caller?.sessionId ?: parent?.let { parentSessionId(it, parentTab?.record) }
+        // Оркестратор может жить не в терминале, а во вкладке AIR (Agent Threads) — тогда рядом
+        // с ним открываем по её файлу.
+        val parentFile = if (parentTab?.handle == null) parentSession?.let { runOnEdt { Terminal.airThreadFile(project, it) } } else null
+        if (parent != null && parentTab?.handle == null && parentFile == null) {
             // Не отказ: агент нужнее, чем его место на экране. Но в логе это должно быть
             // видно — иначе «вкладка снова упала вниз» разбирается вслепую.
-            log.info("MetaJetCore: вкладка родителя '$parent' не найдена, агент откроется в тулвиндоу")
+            log.info("MetaJetCore: вкладка родителя '$parent' не найдена, агент откроется в текущем окне")
         }
-        val parentSession = parent?.let { parentSessionId(it, parentTab?.record) }
+        val place = ParentPlace(parentTab?.handle, parentFile)
 
         val name = requestedName?.takeIf { it.isNotBlank() } ?: generateName(role, domain)
         if (SessionRegistry.isNameTaken(name) || externalAgents.containsKey(name)) {
@@ -376,8 +395,8 @@ class AgentManager(private val project: Project) : Disposable {
 
         val model = modelFor(role, harness, requestedModel)
         when (harness) {
-            Harness.CODEX -> return spawnCodex(role, task, name, model, parent, parentSession, parentTab, siblings)
-            Harness.B24 -> return spawnB24(role, task, name, model, parent, parentSession, parentTab, siblings)
+            Harness.CODEX -> return spawnCodex(role, task, name, model, parent, parentSession, place, siblings)
+            Harness.B24 -> return spawnB24(role, task, name, model, parent, parentSession, place, siblings)
             Harness.CLAUDE -> Unit
         }
         val manualCommand = manualCommand(role, name, model, parent, parentSession)
@@ -399,7 +418,7 @@ class AgentManager(private val project: Project) : Disposable {
                 command = argv,
             )?.also { child ->
                 Terminal.setAgentIcon(child, CLAUDE_AGENT_KEY)
-                TabPlacement.placeNear(project, parentTab?.handle, child)
+                TabPlacement.placeNear(project, place.handle, child, place.file)
             }
         } ?: return SpawnResult.Manual(manualCommand, "не удалось открыть вкладку терминала")
 
@@ -481,7 +500,7 @@ class AgentManager(private val project: Project) : Disposable {
         model: String,
         parent: String?,
         parentSession: String?,
-        parentTab: SessionTab?,
+        place: ParentPlace,
         siblings: List<AgentInfo>,
     ): SpawnResult = synchronized(codexSpawnLock) {
         // Пустую задачу не отправляем пустой: без первого сообщения сессии не будет.
@@ -502,7 +521,7 @@ class AgentManager(private val project: Project) : Disposable {
                 command = argv,
             )?.also { child ->
                 Terminal.setAgentIcon(child, Harness.CODEX.key)
-                TabPlacement.placeNear(project, parentTab?.handle, child)
+                TabPlacement.placeNear(project, place.handle, child, place.file)
             }
         } ?: return SpawnResult.Manual(manual, "не удалось открыть вкладку терминала")
         tabs[name] = handle
@@ -564,7 +583,7 @@ class AgentManager(private val project: Project) : Disposable {
         model: String,
         parent: String?,
         parentSession: String?,
-        parentTab: SessionTab?,
+        place: ParentPlace,
         siblings: List<AgentInfo>,
     ): SpawnResult {
         val sessionId = UUID.randomUUID().toString()
@@ -587,7 +606,7 @@ class AgentManager(private val project: Project) : Disposable {
                 workingDirectory = projectDirectory(),
                 env = env,
                 command = argv,
-            )?.also { child -> TabPlacement.placeNear(project, parentTab?.handle, child) }
+            )?.also { child -> TabPlacement.placeNear(project, place.handle, child, place.file) }
         } ?: run {
             channel.delete()
             return SpawnResult.Manual(manual, "не удалось открыть вкладку терминала")
@@ -906,6 +925,13 @@ class AgentManager(private val project: Project) : Disposable {
     private fun resolveParent(name: String): SessionTab? {
         val resolved = runOnEdt { TabResolver.resolve(project, name) } ?: return null
         tabs[name] = resolved.handle
+        return resolved
+    }
+
+    /** Вкладка уже известной сессии — по её процессу, без поиска по имени. */
+    private fun resolveParent(record: SessionRecord): SessionTab? {
+        val resolved = runOnEdt { TabResolver.resolveRecord(project, record) } ?: return null
+        record.name?.takeIf { it.isNotBlank() }?.let { tabs[it] = resolved.handle }
         return resolved
     }
 

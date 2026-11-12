@@ -3,6 +3,7 @@ package dev.metajetcore.terminal
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.fileEditor.impl.EditorWindow
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.vfs.VirtualFile
 import javax.swing.SwingUtilities
 
 /**
@@ -84,11 +85,12 @@ object TabPlacement {
      * вкладка агента теряется среди обычных терминалов. В тулвиндоу агент остаётся, только
      * если окон редактора нет вовсе.
      */
-    fun placeNear(project: Project, parent: TabHandle?, child: TabHandle) {
-        val parentWindow = parent?.let { windowOf(project, it) }
+    fun placeNear(project: Project, parent: TabHandle?, child: TabHandle, parentFile: VirtualFile? = null) {
+        // Родитель-терминал — по компоненту вкладки; родитель во вкладке AIR — по её файлу.
+        val parentWindow = parent?.let { windowOf(project, it) } ?: parentFile?.let { windowOfFile(project, it) }
         if (parentWindow == null) {
-            if (parent != null) {
-                log.info("MetaJetCore: родитель '${parent.name}' не в editor area, агент — в текущее окно редактора")
+            if (parent != null || parentFile != null) {
+                log.info("MetaJetCore: родитель '${parent?.name ?: parentFile?.name}' не в editor area, агент — в текущее окно редактора")
             }
             val editors = Editors.ex(project)
             val window = editors?.currentWindow ?: editors?.windows?.firstOrNull()
@@ -105,7 +107,7 @@ object TabPlacement {
         val selected = parentWindow.selectedComposite
 
         moveToEditor(project, child, parentWindow)
-        restoreSelection(parentWindow, selected, parent.name)
+        restoreSelection(parentWindow, selected, parent?.name ?: parentFile?.name)
     }
 
     private fun restoreSelection(window: EditorWindow?, selected: com.intellij.openapi.fileEditor.impl.EditorComposite?, who: String?) {
@@ -138,6 +140,16 @@ object TabPlacement {
             }
         }
         return null
+    }
+
+    /**
+     * Окно editor area, в котором открыт [file]. Если файл открыт в нескольких окнах (сплит
+     * одного и того же), берём то, где он выбран: туда разработчик и смотрит.
+     */
+    private fun windowOfFile(project: Project, file: VirtualFile): EditorWindow? {
+        val windows = Editors.ex(project)?.windows ?: return null
+        val holding = windows.filter { window -> window.allComposites.any { it.file == file } }
+        return holding.firstOrNull { it.selectedComposite?.file == file } ?: holding.firstOrNull()
     }
 
     private fun support(): Any? = try {

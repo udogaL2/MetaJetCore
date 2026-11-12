@@ -201,6 +201,55 @@ class TerminalFlowTest : BasePlatformTestCase() {
         Terminal.closeTab(project, parent)
     }
 
+    fun testCallerSessionIsTheParentEvenAfterRename() {
+        // Оркестратор во вкладке AIR, переименованный после старта: в parent он шлёт старое
+        // имя, которого в реестре уже нет (OctoDash, 12.11). Вызывающего плагин знает по
+        // соединению — связь и место агента берутся от него, а не от имени.
+        val caller = dev.metajetcore.registry.SessionRecord(
+            pid = ProcessHandle.current().pid().toInt(),
+            sessionId = "8692d369-4c9d-482a-9c44-1b4dec44e0b5",
+            name = "инт html",
+            cwd = manager.projectDirectory().toString(),
+            kind = "interactive",
+            agent = null,
+            status = "busy",
+            version = "fake",
+            startedAt = null,
+        )
+        val thread = object : com.intellij.testFramework.LightVirtualFile("threadView-orc"),
+            com.intellij.air.thread.view.AgentThreadViewContentFile {
+            override fun getThreadId() = caller.sessionId
+        }
+        com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project).openFile(thread, false)
+        try {
+            assertSame("вкладка AIR не нашлась по threadId", thread, Terminal.airThreadFile(project, caller.sessionId))
+            assertNull(Terminal.airThreadFile(project, "чужая-сессия"))
+
+            val started = onPooledThreadPumpingEdt {
+                manager.spawn(
+                    role = Role.REVIEWER,
+                    task = "ревью",
+                    parentName = "modules-bc",
+                    requestedName = null,
+                    requestedModel = null,
+                    domain = "adr",
+                    caller = caller,
+                )
+            } as? SpawnResult.Started ?: throw AssertionError("агент не поднялся")
+
+            val record = Files.list(agent.registryDirectory).use { files ->
+                files.toList().map { Json.parse(Files.readString(it)) }
+                    .first { it["name"]?.asString == started.agent.name }
+            }
+            assertEquals(caller.sessionId, record["mjcParentSession"]?.asString)
+            // Имя — текущее, из реестра, а не устаревшее из аргумента.
+            assertEquals("инт html", record["mjcParent"]?.asString)
+            onPooledThreadPumpingEdt { manager.close(started.agent.name) }
+        } finally {
+            com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project).closeFile(thread)
+        }
+    }
+
     fun testTabIsDetachedFromToolWindowAndCanBeReturned() {
         // Перенос в editor area целиком здесь не проверить (окон редактора в тестах нет, см.
         // выше). Проверяем его половину, из-за которой внизу оставалась пустая вкладка агента:
