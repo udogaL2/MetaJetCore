@@ -4,6 +4,7 @@ import com.intellij.openapi.diagnostic.Logger
 import dev.metajetcore.roles.Role
 import dev.metajetcore.roles.RoleInstaller
 import dev.metajetcore.roles.Roles
+import dev.metajetcore.util.Commands
 import dev.metajetcore.util.Json
 import java.io.RandomAccessFile
 import java.nio.charset.StandardCharsets
@@ -109,13 +110,58 @@ object Codex {
     data class Session(val id: String, val rollout: Path)
 
     /**
+     * Сессия, которую ведёт процесс [rootPid] (процесс вкладки агента) или его потомок, — по
+     * открытому им файлу ленты.
+     *
+     * Это и есть привязка «агент → сессия»: Codex держит свою ленту открытой, пока жив
+     * (проверено на 0.169), а процесс вкладки плагин запустил сам. Чужая сессия в том же
+     * каталоге так не подхватится — её файл открыт другим процессом. Несколько лент основного
+     * треда или ни одной — null: связь наугад хуже отсутствия связи.
+     *
+     * [Lookup.Unavailable] — открытые файлы узнать нечем (нет lsof, Windows).
+     */
+    fun sessionOfProcess(rootPid: Long, claimed: Set<String>, root: Path = sessionsDirectory()): Lookup {
+        val pids = processTree(rootPid)
+        val files = Commands.openFiles(pids) ?: return Lookup.Unavailable
+        val sessionsRoot = normalize(root)
+        val sessions = files.asSequence()
+            .map { Paths.get(it) }
+            .filter { it.name.startsWith("rollout-") && it.name.endsWith(".jsonl") }
+            .filter { normalize(it).startsWith(sessionsRoot) }
+            .mapNotNull { path -> readMeta(path)?.takeUnless { it.subagent || it.id in claimed }?.let { Session(it.id, path) } }
+            .distinctBy { it.id }
+            .toList()
+        if (sessions.size > 1) log.info("MetaJetCore: у процесса $rootPid несколько лент Codex: ${sessions.map { it.id }}")
+        return Lookup.Found(sessions.singleOrNull())
+    }
+
+    sealed interface Lookup {
+        data class Found(val session: Session?) : Lookup
+        data object Unavailable : Lookup
+    }
+
+    private fun processTree(rootPid: Long): List<Long> = try {
+        ProcessHandle.of(rootPid).map { handle ->
+            listOf(rootPid) + handle.descendants().map { it.pid() }.toList()
+        }.orElse(listOf(rootPid))
+    } catch (_: Throwable) {
+        listOf(rootPid)
+    }
+
+    /**
      * Новая сессия Codex в каталоге [cwd], начатая не раньше [sinceMillis] и ещё никем не
-     * занятая.
+     * занятая, — запасной путь для систем без lsof (Windows); основной — [sessionOfProcess].
      *
      * Адрес Codex-агента — UUID, а имя треда выдумывает модель, поэтому опознать «свою»
      * сессию можно только так: новый файл ленты, тот же каталог, после момента спавна.
      * Два одновременных старта в одном каталоге так не развести — поэтому спавны Codex
      * сериализуются вызывающим.
+     *
+     * «Новая» — по времени **начала** сессии из `session_meta`, а не по времени изменения
+     * файла. Лента живой сессии пользователя в том же каталоге дописывается постоянно, и по
+     * mtime она «свежее» только что запущенного агента: так плагин однажды привязал агента к
+     * личной сессии Codex разработчика, и оркестратор слал задания ему. mtime остаётся только
+     * дешёвым предфильтром: файл новой сессии заведомо изменён после спавна.
      */
     fun findNewSession(cwd: Path, sinceMillis: Long, claimed: Set<String>, root: Path = sessionsDirectory()): Session? {
         if (!Files.isDirectory(root)) return null
@@ -129,25 +175,56 @@ object Codex {
         } catch (e: Exception) {
             return null
         }
-        return candidates.sortedByDescending { runCatching { Files.getLastModifiedTime(it).toMillis() }.getOrDefault(0L) }
-            .firstNotNullOfOrNull { path ->
-                val meta = readMeta(path) ?: return@firstNotNullOfOrNull null
-                val (id, metaCwd) = meta
-                if (id in claimed || normalize(Paths.get(metaCwd)) != target) null else Session(id, path)
+        val matches = candidates.mapNotNull { path ->
+            val meta = readMeta(path) ?: return@mapNotNull null
+            // Время начала неизвестно — не наша: связь наугад хуже отсутствия связи.
+            val startedAt = meta.startedAt ?: return@mapNotNull null
+            when {
+                meta.subagent || meta.id in claimed -> null
+                startedAt < sinceMillis - CLOCK_SLACK_MS -> null
+                normalize(Paths.get(meta.cwd)) != target -> null
+                else -> Session(meta.id, path)
             }
+        }.distinctBy { it.id }
+        // Две новые сессии в каталоге — какая наша, не сказать.
+        return matches.singleOrNull()
     }
 
-    /** Первая строка ленты — `session_meta` с `id` и `cwd`. */
-    internal fun readMeta(path: Path): Pair<String, String>? = try {
+    /** Заголовок ленты: id треда, каталог и момент начала сессии (null — не узнали). */
+    internal data class Meta(val id: String, val cwd: String, val startedAt: Long?, val subagent: Boolean = false)
+
+    /**
+     * Первая строка ленты — `session_meta` с `id`, `cwd` и `timestamp` начала сессии.
+     * Нет `timestamp` — берём время из имени файла (`rollout-2026-11-16T13-23-54-<id>`,
+     * местное время): оно тоже ставится при создании сессии.
+     */
+    internal fun readMeta(path: Path): Meta? = try {
         Files.newBufferedReader(path, StandardCharsets.UTF_8).use { reader ->
             val first = reader.readLine() ?: return null
             val payload = Json.parseOrNull(first)?.takeIf { it["type"]?.asString == "session_meta" }?.get("payload")
             val id = payload?.get("id")?.asString ?: return null
             val cwd = payload["cwd"]?.asString ?: return null
-            id to cwd
+            val started = payload["timestamp"]?.asString
+                ?.let { runCatching { java.time.Instant.parse(it).toEpochMilli() }.getOrNull() }
+                ?: startedFromFileName(path.name)
+            // Служебные субагенты Codex (guardian и т.п.) пишут свою ленту с
+            // `source: {"subagent": …}` из того же процесса — это не сессия агента.
+            val subagent = (payload["source"] as? Json.Obj)?.fields?.containsKey("subagent") == true
+            Meta(id, cwd, started, subagent)
         }
     } catch (e: Exception) {
         null
+    }
+
+    private val FILE_TIME = Regex("^rollout-(\\d{4}-\\d{2}-\\d{2})T(\\d{2})-(\\d{2})-(\\d{2})-")
+
+    internal fun startedFromFileName(name: String): Long? {
+        val m = FILE_TIME.find(name) ?: return null
+        val (date, h, min, sec) = m.destructured
+        return runCatching {
+            java.time.LocalDateTime.parse("${date}T$h:$min:$sec")
+                .atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+        }.getOrNull()
     }
 
     private fun normalize(path: Path): String =

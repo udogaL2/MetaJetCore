@@ -1,7 +1,7 @@
 package dev.metajetcore.registry
 
 import com.intellij.openapi.diagnostic.Logger
-import java.util.concurrent.TimeUnit
+import dev.metajetcore.util.Commands
 
 /**
  * Какая сессия Claude Code вызвала инструмент — по TCP-соединению запроса, без имени.
@@ -22,7 +22,6 @@ object CallerResolver {
 
     /** claude может держать MCP-клиент в дочернем процессе или за обёрткой — поднимаемся. */
     private const val MAX_ANCESTOR_DEPTH = 6
-    private const val COMMAND_TIMEOUT_S = 3L
 
     /**
      * Запись реестра сессии, открывшей соединение с порта [clientPort] к серверу на
@@ -122,28 +121,5 @@ object CallerResolver {
     /** Порт из `127.0.0.1:50418`, `[::1]:50418`, `*:50418`. */
     private fun portOf(endpoint: String): Int? = endpoint.substringAfterLast(':').trim().toIntOrNull()
 
-    /**
-     * Вывод — в файл, а не чтением потока: чтение заблокировало бы поток до конца процесса, и
-     * таймаут не сработал бы, а повисший lsof (сетевая ФС) держал бы спавн оркестратора.
-     */
-    private fun run(command: List<String>): String? {
-        val out = java.io.File.createTempFile("mjc-caller", ".txt")
-        return try {
-            val process = ProcessBuilder(command)
-                .redirectOutput(out)
-                .redirectError(ProcessBuilder.Redirect.DISCARD)
-                .start()
-            if (!process.waitFor(COMMAND_TIMEOUT_S, TimeUnit.SECONDS)) {
-                process.destroyForcibly()
-                null
-            } else {
-                out.readText()
-            }
-        } catch (_: Exception) {
-            // Нет такой утилиты — пробуем следующую.
-            null
-        } finally {
-            out.delete()
-        }
-    }
+    private fun run(command: List<String>): String? = Commands.run(command)
 }

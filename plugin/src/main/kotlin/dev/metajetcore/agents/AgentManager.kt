@@ -556,14 +556,28 @@ class AgentManager(private val project: Project) : Disposable {
         SpawnResult.Started(info, pendingBriefing = task, siblings = siblings, taskDelivered = true)
     }
 
+    /**
+     * Сессия Codex, которую ведёт процесс вкладки агента, — по открытому им файлу ленты
+     * ([Codex.sessionOfProcess]). Не «самая свежая лента в каталоге»: так плагин однажды
+     * привязал агента к личной сессии Codex разработчика, работавшего в том же каталоге, и
+     * оркестратор слал задания ему.
+     *
+     * Только где открытые файлы узнать нечем (Windows без lsof) — по времени начала сессии,
+     * и лишь если кандидат единственный.
+     */
     private fun awaitCodexSession(handle: TabHandle, since: Long): Codex.Session? {
         val claimed = externalAgents.values.map { it.sessionId }.toSet()
         val deadline = System.currentTimeMillis() + settings.readyTimeoutSeconds * 1000L
         while (System.currentTimeMillis() < deadline) {
-            Codex.findNewSession(projectDirectory(), since, claimed)?.let { return it }
-            if (runOnEdt { Terminal.isTerminated(handle) || !Terminal.isOpen(project, handle) }) {
-                return Codex.findNewSession(projectDirectory(), since, claimed)
+            val pid = runOnEdt { Terminal.process(handle) }?.pid
+            if (pid != null) {
+                when (val lookup = Codex.sessionOfProcess(pid, claimed)) {
+                    is Codex.Lookup.Found -> lookup.session?.let { return it }
+                    Codex.Lookup.Unavailable -> Codex.findNewSession(projectDirectory(), since, claimed)?.let { return it }
+                }
             }
+            // Процесс умер — сессии у агента нет, чужую вместо неё не берём.
+            if (runOnEdt { Terminal.isTerminated(handle) || !Terminal.isOpen(project, handle) }) return null
             Thread.sleep(POLL_INTERVAL_MS)
         }
         return null

@@ -69,6 +69,78 @@ class CodexTest {
     }
 
     @Test
+    fun liveSessionOfTheUserIsNotTakenForTheNewAgent() {
+        // Случай 16.11: пользователь работает в своём Codex в том же каталоге, его лента
+        // дописывается прямо во время спавна. По mtime она свежее — но начата раньше.
+        val root = Files.createTempDirectory("sessions")
+        val day = Files.createDirectories(root.resolve("2026/11/16"))
+        val project = Files.createTempDirectory("project").toRealPath()
+        val spawnAt = System.currentTimeMillis()
+        fun meta(id: String, startedAt: Long) =
+            """{"type":"session_meta","payload":{"id":"$id","cwd":"$project","timestamp":"${java.time.Instant.ofEpochMilli(startedAt)}"}}"""
+
+        val users = day.resolve("rollout-2026-11-16T13-23-54-users.jsonl")
+        Files.writeString(users, meta("users", spawnAt - 180_000) + "\n" + started + "\n")
+        assertNull(Codex.findNewSession(project, spawnAt, emptySet(), root))
+
+        val agent = day.resolve("rollout-2026-11-16T13-26-51-agent.jsonl")
+        Files.writeString(agent, meta("agent", spawnAt + 1_000) + "\n")
+        // Лента пользователя изменена позже ленты агента — всё равно берётся агент.
+        Files.writeString(users, complete("ещё ход") + "\n", java.nio.file.StandardOpenOption.APPEND)
+        Files.setLastModifiedTime(users, java.nio.file.attribute.FileTime.fromMillis(spawnAt + 5_000))
+        assertEquals("agent", Codex.findNewSession(project, spawnAt, emptySet(), root)?.id)
+    }
+
+    @Test
+    fun sessionIsBoundToTheProcessThatHoldsItsRollout() {
+        // Привязка «агент → сессия» — по файлу ленты, открытому процессом вкладки агента.
+        // Рядом в том же каталоге — живая сессия пользователя, свежее по всем часам: не наша.
+        org.junit.Assume.assumeTrue(dev.metajetcore.util.Commands.lsof != null)
+        val root = Files.createTempDirectory("sessions").toRealPath()
+        val day = Files.createDirectories(root.resolve("2026/11/16"))
+        fun write(name: String, id: String, source: String) = day.resolve(name).also {
+            Files.writeString(it, """{"type":"session_meta","payload":{"id":"$id","cwd":"/p","source":$source}}""" + "\n")
+        }
+        val agentFile = write("rollout-2026-11-16T13-26-53-agent.jsonl", "agent", "\"cli\"")
+        val guardian = write("rollout-2026-11-16T13-28-20-guard.jsonl", "guard", """{"subagent":{"other":"guardian"}}""")
+        val usersFile = write("rollout-2026-11-16T13-27-00-users.jsonl", "users", "\"vscode\"")
+        val stray = Files.createTempFile("not-a-session", ".txt")
+
+        fun holder(vararg files: Path) = ProcessBuilder(
+            "python3", "-c",
+            "import sys,time; fs=[open(p,'a') for p in sys.argv[1:]]; print('ok', flush=True); time.sleep(30)",
+            *files.map { it.toString() }.toTypedArray(),
+        ).start().also { it.inputStream.bufferedReader().readLine() }
+
+        // Агент — внук процесса вкладки: шелл → обёртка → codex.
+        val tab = ProcessBuilder(
+            "bash", "-c",
+            "python3 -c \"import sys,time; fs=[open(p,'a') for p in sys.argv[1:]]; print('ok', flush=True); time.sleep(30)\" '$agentFile' '$guardian' '$stray'",
+        ).start().also { it.inputStream.bufferedReader().readLine() }
+        val user = holder(usersFile)
+        try {
+            val found = Codex.sessionOfProcess(tab.pid(), emptySet(), root)
+            assertEquals("agent", ((found as Codex.Lookup.Found).session)?.id)
+            // Уже занятая — не достаётся второму агенту.
+            assertEquals(Codex.Lookup.Found(null), Codex.sessionOfProcess(tab.pid(), setOf("agent"), root))
+            // Процесс пользователя к агенту не относится.
+            assertEquals("users", (Codex.sessionOfProcess(user.pid(), emptySet(), root) as Codex.Lookup.Found).session?.id)
+        } finally {
+            tab.descendants().forEach { it.destroyForcibly() }
+            tab.destroyForcibly()
+            user.destroyForcibly()
+        }
+    }
+
+    @Test
+    fun startTimeFallsBackToTheFileName() {
+        val expected = java.time.LocalDateTime.parse("2026-11-16T13:23:54")
+            .atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+        assertEquals(expected, Codex.startedFromFileName("rollout-2026-11-16T13-23-54-01a1e419-6f46.jsonl"))
+        assertNull(Codex.startedFromFileName("rollout-broken.jsonl"))
+    }
+
+    @Test
     fun tomlStringEscapes() {
         assertEquals("\"a\\\"b\\\\c\\nd\"", Codex.tomlString("a\"b\\c\nd"))
     }
