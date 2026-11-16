@@ -40,6 +40,11 @@ data class AgentInfo(
     val status: String?,
     val managed: Boolean,
     val harness: Harness = Harness.CLAUDE,
+    /**
+     * Точный адрес Claude-агента для `SendMessage` (`uds:<сокет>`). Имя для этого не годится:
+     * оно не уникально, и сообщение по нему может уйти чужой сессии (docs/PLAN-TEAM.md).
+     */
+    val address: String? = null,
 )
 
 /** Ответ агента не-Claude, собранный плагином (для Claude-агентов канал — SendMessage). */
@@ -63,8 +68,11 @@ sealed interface DeliveryResult {
      */
     data class Queued(val position: Int) : DeliveryResult
 
-    /** Агент — сессия Claude Code: ей пишут SendMessage, плагин второй канал не заводит. */
-    data object UseSendMessage : DeliveryResult
+    /**
+     * Агент — сессия Claude Code: ей пишут SendMessage, плагин второй канал не заводит.
+     * [address] — точный адрес для `SendMessage`, имя для этого не годится.
+     */
+    data class UseSendMessage(val address: String?) : DeliveryResult
 
     data object UnknownAgent : DeliveryResult
 
@@ -181,6 +189,37 @@ class AgentManager(private val project: Project) : Disposable {
 
     /** Собранные, но ещё не отданные оркестратору ответы агентов не-Claude. */
     private val pending = ConcurrentHashMap<String, MutableList<String>>()
+
+    /**
+     * Кто какого агента запустил. Всё, что плагин делает с агентами, ограничено группой
+     * вызывающего оркестратора (docs/PLAN-TEAM.md); граница хранится на диске, чтобы
+     * пережить перезагрузку плагина, при которой агенты в терминалах остаются живы.
+     */
+    internal val team: TeamStore
+        get() = teamStore ?: synchronized(this) {
+            teamStore ?: TeamStore(reportsDirectory().parent.resolve(TEAM_FILE)).also { teamStore = it }
+        }
+
+    @Volatile
+    private var teamStore: TeamStore? = null
+
+    @Volatile
+    private var restored = false
+
+    /**
+     * Тестам — свой файл групп. Сервис проекта в лёгкой фикстуре один на все тесты, а файл по
+     * умолчанию лежит в настоящем `~/.claude`: без подмены тесты делили бы группы между собой
+     * и с живыми агентами разработчика.
+     */
+    internal fun useTeamFile(file: Path) {
+        teamStore = TeamStore(file)
+        restored = false
+        tabs.clear()
+        spawned.clear()
+        externalAgents.values.forEach { it.dispose() }
+        externalAgents.clear()
+        pending.clear()
+    }
 
     /**
      * Свою сессию Codex опознаём как «новая лента в этом каталоге после момента старта».
@@ -340,6 +379,13 @@ class AgentManager(private val project: Project) : Disposable {
 
     // ------------------------------------------------------------------ spawn
 
+    /**
+     * Запустить агента в группе [caller].
+     *
+     * Вызывающий обязателен: агент без группы был бы ничьим — им не мог бы управлять ни один
+     * оркестратор, а связь «наугад» по имени из `parent` и привела к тому, что задания
+     * уходили чужим сессиям (docs/PLAN-TEAM.md). [parentName] теперь только для журнала.
+     */
     fun spawn(
         role: Role,
         task: String,
@@ -348,46 +394,45 @@ class AgentManager(private val project: Project) : Disposable {
         requestedModel: String?,
         domain: String?,
         requestedHarness: Harness? = null,
-        caller: SessionRecord? = null,
+        caller: SessionRecord,
     ): SpawnResult {
         val harness = requestedHarness ?: settings.harnessFor(role)
         if (role == Role.ORCHESTRATOR && harness != Harness.CLAUDE) {
             return SpawnResult.Failed("оркестратор работает только в Claude Code")
         }
-        // Имя родителя приводим к тому, как сессия называется в реестре: оркестратор
-        // копирует его из ListAgents вместе с ref-хвостом (см. canonicalName).
-        val requestedParent = parentName?.takeIf { it.isNotBlank() }?.let { canonicalName(it) }
+        val owner = team.ownerKey(caller)
         // Вызывающая сессия, определённая по соединению, главнее имени из аргумента: имя модель
         // помнит старым после /rename, а процесс не врёт (docs/PLAN-CALLER.md). Имя наружу —
         // текущее, из реестра.
-        if (caller != null && requestedParent != null && caller.name != requestedParent) {
+        val requestedParent = parentName?.takeIf { it.isNotBlank() }?.let { canonicalName(it) }
+        if (requestedParent != null && caller.name != requestedParent) {
             log.info("MetaJetCore: parent='$requestedParent', но вызвала сессия '${caller.name}' (${caller.sessionId}) — берём её")
         }
-        val parent = caller?.name?.takeIf { it.isNotBlank() } ?: requestedParent
+        val parent = Parent(
+            name = caller.name?.takeIf { it.isNotBlank() } ?: requestedParent,
+            sessionId = caller.sessionId,
+            address = caller.address,
+        )
 
-        // Кто этой роли уже работает — снимаем ДО открытия вкладки, иначе в списке окажется
-        // и сам новичок. Спавн этим не отменяется: несколько имплементеров по
-        // непересекающимся доменам — штатная схема, и запрещать её значило бы ломать
-        // нормальную работу ради борьбы с дублями. Но в ответе список будет: живой прогон
+        // Кто этой роли уже работает в группе — снимаем ДО открытия вкладки, иначе в списке
+        // окажется и сам новичок. Спавн этим не отменяется: несколько имплементеров по
+        // непересекающимся доменам — штатная схема. Но в ответе список будет: живой прогон
         // дал четырёх имплементеров подряд, то есть сам оркестратор на живых не смотрит.
-        val siblings = reusable(role)
+        val siblings = reusable(role, caller)
 
-        // Родителя разрешаем один раз: нужна и вкладка (чтобы открыть агента рядом), и
-        // запись реестра (чтобы отдать наружу sessionId вместо неуникального имени).
-        val parentTab = if (caller != null) resolveParent(caller) else parent?.let { resolveParent(it) }
-        val parentSession = caller?.sessionId ?: parent?.let { parentSessionId(it, parentTab?.record) }
+        val parentTab = resolveParent(caller)
         // Оркестратор может жить не в терминале, а во вкладке AIR (Agent Threads) — тогда рядом
         // с ним открываем по её файлу.
-        val parentFile = if (parentTab?.handle == null) parentSession?.let { runOnEdt { Terminal.airThreadFile(project, it) } } else null
-        if (parent != null && parentTab?.handle == null && parentFile == null) {
+        val parentFile = if (parentTab?.handle == null) runOnEdt { Terminal.airThreadFile(project, caller.sessionId) } else null
+        if (parentTab?.handle == null && parentFile == null) {
             // Не отказ: агент нужнее, чем его место на экране. Но в логе это должно быть
             // видно — иначе «вкладка снова упала вниз» разбирается вслепую.
-            log.info("MetaJetCore: вкладка родителя '$parent' не найдена, агент откроется в текущем окне")
+            log.info("MetaJetCore: вкладка родителя '${parent.name}' не найдена, агент откроется в текущем окне")
         }
         val place = ParentPlace(parentTab?.handle, parentFile)
 
         val name = requestedName?.takeIf { it.isNotBlank() } ?: generateName(role, domain)
-        if (SessionRegistry.isNameTaken(name) || externalAgents.containsKey(name)) {
+        if (SessionRegistry.isNameTaken(name) || externalAgents.containsKey(name) || team.all().any { it.name == name }) {
             return SpawnResult.Failed(
                 "имя '$name' уже занято живой сессией; передай другое или закрой ту сессию",
             )
@@ -395,11 +440,11 @@ class AgentManager(private val project: Project) : Disposable {
 
         val model = modelFor(role, harness, requestedModel)
         when (harness) {
-            Harness.CODEX -> return spawnCodex(role, task, name, model, parent, parentSession, place, siblings)
-            Harness.B24 -> return spawnB24(role, task, name, model, parent, parentSession, place, siblings)
+            Harness.CODEX -> return spawnCodex(role, task, name, model, parent, owner, place, siblings)
+            Harness.B24 -> return spawnB24(role, task, name, model, parent, owner, place, siblings)
             Harness.CLAUDE -> Unit
         }
-        val manualCommand = manualCommand(role, name, model, parent, parentSession)
+        val manualCommand = manualCommand(role, name, model, parent)
 
         if (!runOnEdt { Terminal.isAvailable(project) }) {
             return SpawnResult.Manual(manualCommand, "терминальное API IDE недоступно")
@@ -414,7 +459,7 @@ class AgentManager(private val project: Project) : Disposable {
                 project = project,
                 name = name,
                 workingDirectory = projectDirectory(),
-                env = agentEnv(role, name, model, parent, parentSession),
+                env = agentEnv(role, name, model, parent),
                 command = argv,
             )?.also { child ->
                 Terminal.setAgentIcon(child, CLAUDE_AGENT_KEY)
@@ -424,7 +469,7 @@ class AgentManager(private val project: Project) : Disposable {
 
         tabs[name] = handle
 
-        val record = when (val ready = awaitSession(name, handle)) {
+        val record = when (val ready = awaitSession(handle)) {
             is Readiness.Ready -> ready.record
             Readiness.Exited -> {
                 tabs.remove(name)
@@ -462,10 +507,25 @@ class AgentManager(private val project: Project) : Disposable {
             pid = record.pid,
             status = record.status,
             managed = true,
+            address = record.address,
         )
         spawned[actualName] = info
+        team.add(
+            TeamMember(
+                name = actualName,
+                owner = owner,
+                harness = Harness.CLAUDE,
+                role = role,
+                model = model,
+                pid = record.pid.toLong(),
+                procStart = record.procStart,
+            ),
+        )
         return SpawnResult.Started(info, pendingBriefing = task, siblings = siblings)
     }
+
+    /** Оркестратор, запустивший агента, — как его видит окружение агента. */
+    internal data class Parent(val name: String?, val sessionId: String?, val address: String?)
 
     /**
      * Модель агента: явная из вызова, затем из настроек роли, затем дефолт роли.
@@ -498,14 +558,14 @@ class AgentManager(private val project: Project) : Disposable {
         task: String,
         name: String,
         model: String,
-        parent: String?,
-        parentSession: String?,
+        parent: Parent,
+        owner: String,
         place: ParentPlace,
         siblings: List<AgentInfo>,
     ): SpawnResult = synchronized(codexSpawnLock) {
         // Пустую задачу не отправляем пустой: без первого сообщения сессии не будет.
         val firstMessage = task.ifBlank { CODEX_IDLE_TASK }
-        val env = codexEnv(role, name, model, parent, parentSession, firstMessage)
+        val env = codexEnv(role, name, model, parent, firstMessage)
         val manual = codexManualCommand(role, model, env)
         if (!runOnEdt { Terminal.isAvailable(project) }) {
             return SpawnResult.Manual(manual, "терминальное API IDE недоступно")
@@ -542,12 +602,19 @@ class AgentManager(private val project: Project) : Disposable {
                 )
             }
         externalAgents[name] = CodexAgent(session)
+        val tabPid = runOnEdt { Terminal.process(handle) }?.pid
+        team.add(
+            TeamMember(
+                name = name, owner = owner, harness = Harness.CODEX, role = role, model = model,
+                pid = tabPid, sessionId = session.id, rollout = session.rollout.toString(),
+            ),
+        )
         val info = AgentInfo(
             name = name,
             role = role,
             model = model,
             sessionId = session.id,
-            pid = runOnEdt { Terminal.process(handle) }?.pid?.toInt(),
+            pid = tabPid?.toInt(),
             status = "busy",
             managed = true,
             harness = Harness.CODEX,
@@ -595,14 +662,14 @@ class AgentManager(private val project: Project) : Disposable {
         task: String,
         name: String,
         model: String,
-        parent: String?,
-        parentSession: String?,
+        parent: Parent,
+        owner: String,
         place: ParentPlace,
         siblings: List<AgentInfo>,
     ): SpawnResult {
         val sessionId = UUID.randomUUID().toString()
         val channel = B24.channel(sessionId)
-        val env = b24Env(role, name, model, parent, parentSession, task, channel)
+        val env = b24Env(role, name, model, parent, task, channel)
         val manual = b24ManualCommand(sessionId, model, env, task.isNotBlank())
         if (!runOnEdt { Terminal.isAvailable(project) }) {
             return SpawnResult.Manual(manual, "терминальное API IDE недоступно")
@@ -646,12 +713,19 @@ class AgentManager(private val project: Project) : Disposable {
         }
         externalAgents[name] = B24Agent(sessionId, channel, hasTask = task.isNotBlank())
         ensureOutboxPump()
+        val tabPid = runOnEdt { Terminal.process(handle) }?.pid
+        team.add(
+            TeamMember(
+                name = name, owner = owner, harness = Harness.B24, role = role, model = model,
+                pid = tabPid, sessionId = sessionId, channel = channel.dir.toString(),
+            ),
+        )
         val info = AgentInfo(
             name = name,
             role = role,
             model = model,
             sessionId = sessionId,
-            pid = runOnEdt { Terminal.process(handle) }?.pid?.toInt(),
+            pid = tabPid?.toInt(),
             status = if (task.isNotBlank()) "busy" else "idle",
             managed = true,
             harness = Harness.B24,
@@ -697,21 +771,22 @@ class AgentManager(private val project: Project) : Disposable {
      * Вкладку, которую плагин не запускал (подхвачена по дереву процессов), не добиваем: там
      * процесс — шелл разработчика. Если он жив, отвечаем [CloseResult.TabLeftOpen].
      */
-    fun close(rawName: String): CloseResult {
-        // Имя нормализуем один раз здесь: дальше оно уходит и в реестр, и в обе карты,
-        // и расхождение между ними означало бы вкладку-сироту.
-        val name = canonicalName(rawName)
-        val handle = tabFor(name) ?: return CloseResult.UnknownTab
+    fun close(caller: SessionRecord, rawName: String): CloseResult {
+        // Только агент своей группы: закрыть чужого — значит оборвать чужую работу.
+        val member = member(caller, rawName) ?: return CloseResult.UnknownTab
+        val name = member.entry.name
+        val handle = tabOf(member) ?: return CloseResult.UnknownTab
         val external = externalAgents[name]
         if (external == null && runOnEdt { Terminal.isOpen(project, handle) }) {
             runOnEdt { Terminal.send(handle, "/exit", execute = true) }
         }
-        if (external == null) awaitSessionGone(name)
+        if (external == null) member.entry.pid?.let { awaitSessionGone(it) }
         // Последний ответ мог прийти прямо перед выходом — собираем, пока агент ещё известен.
         collectReplies()
         externalAgents.remove(name)?.dispose()
         // Управлять больше нечем: сессии нет. Дальше речь только об уборке вкладки.
         spawned.remove(name)
+        team.remove(member.entry)
 
         // Codex и b24 завершаем сигналом, а не командой в TUI. Живой прогон в IDE: `/quit` у
         // Codex не срабатывал ни слитно с Enter, ни с Enter отдельно после паузы — терминал IDE
@@ -743,14 +818,16 @@ class AgentManager(private val project: Project) : Disposable {
     }
 
     /** Сброс контекста между этапами: сессия и вкладка остаются живыми. */
-    fun reset(rawName: String): ResetResult {
-        val name = canonicalName(rawName)
-        externalAgents[name]?.let { agent ->
+    fun reset(caller: SessionRecord, rawName: String): ResetResult {
+        val member = member(caller, rawName) ?: return ResetResult.UnknownTab
+        externalAgents[member.entry.name]?.let { agent ->
             // Ответ хода, закончившегося до сброса, ещё должен попасть в ящик.
             collectReplies()
             return agent.reset()
         }
-        val handle = tabFor(name) ?: return ResetResult.UnknownTab
+        // sessionId Claude-агента после /clear сменится, но агент узнаётся по процессу —
+        // в группе он остаётся (см. members).
+        val handle = tabOf(member) ?: return ResetResult.UnknownTab
         return if (runOnEdt { Terminal.send(handle, "/clear", execute = true) }) ResetResult.Done
         else ResetResult.UnknownTab
     }
@@ -766,11 +843,10 @@ class AgentManager(private val project: Project) : Disposable {
      * Claude-агентам плагин сообщений не возит: у них есть SendMessage, и второй канал
      * означал бы две очереди без порядка между ними.
      */
-    fun deliver(rawName: String, text: String): DeliveryResult {
-        val name = canonicalName(rawName)
-        val agent = externalAgents[name]
-            ?: return if (SessionRegistry.findByName(name) != null) DeliveryResult.UseSendMessage
-            else DeliveryResult.UnknownAgent
+    fun deliver(caller: SessionRecord, rawName: String, text: String): DeliveryResult {
+        val member = member(caller, rawName) ?: return DeliveryResult.UnknownAgent
+        val agent = externalAgents[member.entry.name]
+            ?: return DeliveryResult.UseSendMessage(member.record?.address)
         // Сначала дочитать ленту: занятость агента должна быть свежей, а ответы, прочитанные
         // попутно, — оказаться в ящике, а не потеряться.
         collectReplies()
@@ -817,15 +893,25 @@ class AgentManager(private val project: Project) : Disposable {
      * любого. Возвращаем всё, что накопилось, — по таймауту тоже: частичный результат лучше
      * пустого, оркестратор позовёт снова за остальными.
      */
-    fun awaitMessages(names: List<String>?, timeoutMs: Long): AwaitResult {
-        val wanted = names?.map { canonicalName(it) }?.filter { it.isNotEmpty() }?.distinct()
-        val notInMailbox = wanted.orEmpty().filter { !externalAgents.containsKey(it) && !pending.containsKey(it) }
-        val waitFor = wanted?.minus(notInMailbox.toSet())
+    fun awaitMessages(caller: SessionRecord, names: List<String>?, timeoutMs: Long): AwaitResult {
+        // Ящик — только агентов своей группы: чужой ответ, забранный отсюда, до своего
+        // оркестратора уже не дойдёт.
+        val group = members(caller).filter { externalAgents.containsKey(it.entry.name) }
+        val own = group.map { it.entry.name }.toSet()
+        fun ownName(raw: String): String? {
+            val bare = canonicalName(raw)
+            return group.firstOrNull { it.entry.name == raw.trim() || it.name == raw.trim() }?.entry?.name
+                ?: group.firstOrNull { it.entry.name == bare || it.name == bare }?.entry?.name
+        }
+        val requested = names?.map { it.trim() }?.filter { it.isNotEmpty() }?.distinct()
+        val notInMailbox = requested.orEmpty().filter { ownName(it) == null }
+        val wanted = requested?.mapNotNull { ownName(it) }?.distinct()
+        val waitFor = wanted
         val deadline = System.currentTimeMillis() + timeoutMs
         while (true) {
             collectReplies()
             val ready = when {
-                waitFor == null -> pending.values.any { it.isNotEmpty() }
+                waitFor == null -> own.any { pending[it]?.isNotEmpty() == true }
                 waitFor.isEmpty() -> true
                 else -> waitFor.all { name ->
                     pending[name]?.isNotEmpty() == true || !externalAgents.containsKey(name)
@@ -835,14 +921,14 @@ class AgentManager(private val project: Project) : Disposable {
             Thread.sleep(POLL_INTERVAL_MS)
         }
         val messages = mutableListOf<AgentMessage>()
-        for (name in waitFor ?: pending.keys.toList()) {
+        for (name in waitFor ?: own.toList()) {
             val queue = pending[name] ?: continue
             synchronized(queue) {
                 queue.forEach { messages += AgentMessage(name, it) }
                 queue.clear()
             }
         }
-        val still = (waitFor ?: externalAgents.keys.toList()).filter { name ->
+        val still = (waitFor ?: own.toList()).filter { name ->
             messages.none { it.from == name } && externalAgents[name]?.busy == true
         }
         return AwaitResult(messages, still, notInMailbox)
@@ -897,10 +983,10 @@ class AgentManager(private val project: Project) : Disposable {
      * этом отрисовался кириллицей верно, то есть портится именно наш ввод. Молча искажать
      * текст хуже, чем отказаться: искажение выглядит как исполненная команда.
      */
-    fun brief(rawName: String, text: String): BriefResult {
+    fun brief(caller: SessionRecord, rawName: String, text: String): BriefResult {
         val nonAscii = text.filter { it.code >= 128 }
         if (nonAscii.isNotEmpty()) return BriefResult.NotAscii(nonAscii.toSet().joinToString(""))
-        val handle = tabFor(rawName) ?: return BriefResult.UnknownTab
+        val handle = member(caller, rawName)?.let { tabOf(it) } ?: return BriefResult.UnknownTab
         return if (runOnEdt { Terminal.send(handle, text, execute = true, paste = true) }) {
             BriefResult.Sent
         } else {
@@ -909,75 +995,37 @@ class AgentManager(private val project: Project) : Disposable {
     }
 
     /** Что сейчас на экране вкладки агента. Для разбора «запустился, но молчит». */
-    fun readScreen(rawName: String): String? {
-        val handle = tabFor(rawName) ?: return null
+    fun readScreen(caller: SessionRecord, rawName: String): String? {
+        val handle = member(caller, rawName)?.let { tabOf(it) } ?: return null
         return runOnEdt { Terminal.readScreen(handle) }
     }
 
     /**
-     * Вкладка по имени сессии: сперва своя карта, затем поиск по дереву процессов.
+     * Вкладка агента группы: сперва своя карта, затем по процессу агента — никогда по имени,
+     * имя не уникально и могло достаться чужой сессии.
      *
-     * Второй путь нужен, чтобы запуск оркестратора оставался ровно `/orchestrate` в любой
-     * вкладке. Плагин знает только те вкладки, которые создал сам; всё остальное он
-     * доопределяет сопоставлением pid — см. [TabResolver]. Найденное запоминаем, чтобы не
-     * искать заново на каждый вызов.
+     * Найденную вкладку помечаем как принадлежащую агенту: процесс в ней — агент, которого
+     * запустил этот плагин (возможно, до своей перезагрузки), и при закрытии его можно добить.
      */
-    private fun tabFor(rawName: String): TabHandle? {
-        val name = canonicalName(rawName)
-        tabs[name]?.let { return it }
-        val resolved = runOnEdt { TabResolver.findTabForSession(project, name) } ?: return null
-        tabs[name] = resolved
-        return resolved
+    private fun tabOf(member: Member): TabHandle? {
+        tabs[member.entry.name]?.let { return it }
+        val found = runOnEdt {
+            member.record?.let { TabResolver.resolveRecord(project, it)?.handle }
+                ?: member.entry.pid?.let { pid -> Terminal.handles(project).firstOrNull { Terminal.process(it)?.pid == pid } }
+        } ?: return null
+        found.ownsProcess = true
+        tabs[member.entry.name] = found
+        return found
     }
 
     /**
-     * Вкладка родителя вместе с его записью в реестре.
+     * Вкладка оркестратора — по его процессу, без поиска по имени.
      *
-     * Отдельно от [tabFor] ради записи: карта вкладок её не хранит, а для связи
-     * «агент → оркестратор» нужна именно она — см. [parentSessionId].
+     * В карту вкладок агентов не кладём: она по именам, и вкладка оркестратора под его именем
+     * подменила бы вкладку агента-тёзки из другой группы — close_agent закрыл бы оркестратора.
      */
-    private fun resolveParent(name: String): SessionTab? {
-        val resolved = runOnEdt { TabResolver.resolve(project, name) } ?: return null
-        tabs[name] = resolved.handle
-        return resolved
-    }
-
-    /** Вкладка уже известной сессии — по её процессу, без поиска по имени. */
-    private fun resolveParent(record: SessionRecord): SessionTab? {
-        val resolved = runOnEdt { TabResolver.resolveRecord(project, record) } ?: return null
-        record.name?.takeIf { it.isNotBlank() }?.let { tabs[it] = resolved.handle }
-        return resolved
-    }
-
-    /**
-     * `sessionId` оркестратора — то, чем связь «агент → его оркестратор» задаётся на самом
-     * деле.
-     *
-     * Имя для этого не годится, и это не придирка: имя задаёт человек, оно не уникально
-     * (замер: три живые записи реестра с именем «слитие мастера») и меняется по ходу работы.
-     * `sessionId` уникален и переживает resume — у тех же трёх записей он один и тот же.
-     *
-     * Источник по убыванию надёжности:
-     *
-     *  1. Запись, по которой нашлась вкладка родителя. Она получена сопоставлением pid, то
-     *     есть привязана к конкретному процессу `claude`, — единственный способ развести
-     *     тёзок.
-     *  2. Реестр по имени, но **только если ответ однозначен**: все записи с этим именем
-     *     дают один `sessionId`. Иначе — null: отсутствие связи честнее, чем связь наугад,
-     *     потому что наугад означает чужую команду на экране наблюдателя.
-     */
-    internal fun parentSessionId(name: String, matched: SessionRecord? = null): String? {
-        matched?.sessionId?.takeIf { it.isNotBlank() }?.let { return it }
-        val ids = SessionRegistry.byName(name).map { it.sessionId }.filter { it.isNotBlank() }.distinct()
-        return if (ids.size == 1) {
-            ids.first()
-        } else {
-            if (ids.size > 1) {
-                log.info("MetaJetCore: имя '$name' носят ${ids.size} разные сессии, родитель не определён")
-            }
-            null
-        }
-    }
+    private fun resolveParent(record: SessionRecord): SessionTab? =
+        runOnEdt { TabResolver.resolveRecord(project, record) }
 
     /**
      * Имя сессии из строки, которую дал оркестратор.
@@ -1069,54 +1117,155 @@ class AgentManager(private val project: Project) : Disposable {
     }
 
     /** Агент не-Claude: сообщения ему — через send_to_agent, а не SendMessage. */
-    fun isExternal(rawName: String): Boolean = externalAgents.containsKey(canonicalName(rawName))
+    fun isExternal(caller: SessionRecord, rawName: String): Boolean =
+        member(caller, rawName)?.let { externalAgents.containsKey(it.entry.name) } == true
 
-    fun focus(rawName: String): Boolean {
-        val handle = tabFor(rawName) ?: return false
+    fun focus(caller: SessionRecord, rawName: String): Boolean {
+        val handle = member(caller, rawName)?.let { tabOf(it) } ?: return false
         return runOnEdt { Terminal.focus(handle) }
     }
 
     /**
-     * Живые агенты этой роли в проекте — те, кому задачу можно отдать вместо нового спавна.
+     * Живые агенты этой роли в группе — те, кому задачу можно отдать вместо нового спавна.
      *
      * Оркестратор в списке не участвует: он один и не заменяем. Занятость агента тоже не
      * смотрим — `busy` означает «сейчас думает», а не «занят другой задачей»: сообщение всё
      * равно встанет в его очередь.
      */
-    fun reusable(role: Role): List<AgentInfo> =
+    fun reusable(role: Role, caller: SessionRecord): List<AgentInfo> =
         if (role == Role.ORCHESTRATOR) emptyList()
-        else list().filter { it.role == role }
+        else list(caller).filter { it.role == role }
 
-    /** Живые сессии в директории проекта, обогащённые тем, что плагин знает про вкладки. */
-    fun list(): List<AgentInfo> {
-        forgetClosedTabs()
+    /**
+     * Агенты группы [caller] — и только они.
+     *
+     * Раньше здесь были все сессии в каталоге проекта: личные сессии разработчика и агенты
+     * других оркестраторов выглядели для оркестратора как его команда, и он писал им
+     * (docs/PLAN-TEAM.md).
+     */
+    fun list(caller: SessionRecord): List<AgentInfo> {
+        val group = members(caller)
         // Статус агента не-Claude — по его ленте: дочитываем, заодно ответы встают в ящик.
         collectReplies()
-        val external = externalAgents.map { (name, agent) ->
-            val known = spawned[name]
+        return group.map { member ->
+            val entry = member.entry
+            val external = externalAgents[entry.name]
             AgentInfo(
-                name = name,
-                role = known?.role,
-                model = known?.model.orEmpty(),
-                sessionId = agent.sessionId,
-                pid = known?.pid,
-                status = agent.status(),
-                managed = tabs.containsKey(name),
-                harness = agent.harness,
+                name = member.name,
+                role = entry.role ?: member.record?.agent?.let { Role.fromId(it) },
+                model = entry.model,
+                sessionId = external?.sessionId ?: member.record?.sessionId,
+                pid = member.record?.pid ?: entry.pid?.toInt(),
+                status = external?.status() ?: member.record?.status,
+                managed = tabs.containsKey(entry.name),
+                harness = entry.harness,
+                address = member.record?.address,
             )
         }
-        return external + SessionRegistry.inDirectory(projectDirectory()).map { record ->
-            val name = record.name.orEmpty()
-            val known = spawned[name]
-            AgentInfo(
-                name = name,
-                role = known?.role ?: record.agent?.let { Role.fromId(it) },
-                model = known?.model ?: "",
-                sessionId = record.sessionId,
-                pid = record.pid,
-                status = record.status,
-                managed = tabs.containsKey(name),
-            )
+    }
+
+    // ------------------------------------------------------------- group
+
+    /** Агент группы как он виден сейчас: запись группы и, у Claude, его запись реестра. */
+    private class Member(val entry: TeamMember, val record: SessionRecord?) {
+        /** Текущее имя: Claude-агента могли переименовать (`/rename`). */
+        val name: String get() = record?.name?.takeIf { it.isNotBlank() } ?: entry.name
+    }
+
+    /**
+     * Живые агенты группы вызывающего. Умерших вычёркиваем из группы здесь же.
+     *
+     * Claude-агент узнаётся по процессу (pid и время старта), а не по sessionId и имени:
+     * sessionId меняется по `/clear` (а его шлёт reset_agent), имя — по `/rename`.
+     */
+    private fun members(caller: SessionRecord): List<Member> {
+        val owner = team.ownerKey(caller)
+        restore()
+        forgetClosedTabs()
+        val registry = SessionRegistry.all()
+        return team.members(owner).mapNotNull { entry ->
+            when (entry.harness) {
+                Harness.CLAUDE -> {
+                    val byPid = registry.filter { it.pid.toLong() == entry.pid }
+                    val record = byPid.firstOrNull { sameProcess(it, entry) }
+                    when {
+                        record != null -> Member(entry, record)
+                        // pid занял другой процесс, или процесса нет — агента больше нет.
+                        byPid.isNotEmpty() || !alive(entry) -> null.also { forget(entry) }
+                        // Жив, но записи нет: реестр переписывается (например, по /clear).
+                        else -> Member(entry, null)
+                    }
+                }
+                Harness.CODEX, Harness.B24 ->
+                    if (externalAgents.containsKey(entry.name)) Member(entry, null) else null.also { forget(entry) }
+            }
+        }
+    }
+
+    /** Агент группы по имени, которое дал оркестратор: текущему или данному при спавне. */
+    private fun member(caller: SessionRecord, rawName: String): Member? {
+        val wanted = rawName.trim()
+        if (wanted.isEmpty()) return null
+        val bare = canonicalName(wanted)
+        val group = members(caller)
+        return group.firstOrNull { it.name == wanted || it.entry.name == wanted }
+            ?: group.firstOrNull { it.name == bare || it.entry.name == bare }
+    }
+
+    private fun sameProcess(record: SessionRecord, entry: TeamMember): Boolean =
+        entry.procStart == null || record.procStart == null || record.procStart == entry.procStart
+
+    private fun alive(entry: TeamMember): Boolean =
+        entry.pid?.let { SessionRegistry.isProcessAlive(it.toInt()) } ?: false
+
+    private fun forget(entry: TeamMember) {
+        team.remove(entry)
+        tabs.remove(entry.name)
+        spawned.remove(entry.name)
+        externalAgents.remove(entry.name)?.dispose()
+    }
+
+    /**
+     * После перезагрузки плагина: поднять агентов не-Claude из записи группы. Claude-агентам
+     * поднимать нечего — они в реестре. Живость — по pid процесса вкладки.
+     *
+     * Ленты дочитываем до конца и прочитанное отбрасываем: что из этого оркестратор уже
+     * получил до перезагрузки, неизвестно, а повторный ответ хуже пропущенного — его
+     * приняли бы за новый ход. Пропущенное остаётся в журнале ящика и в самой ленте.
+     */
+    private fun restore() {
+        if (restored) return
+        synchronized(this) {
+            if (restored) return
+            restored = true
+            for (entry in team.all()) {
+                if (entry.harness == Harness.CLAUDE || externalAgents.containsKey(entry.name)) continue
+                if (!alive(entry)) {
+                    team.remove(entry)
+                    continue
+                }
+                val agent: ExternalAgent? = when (entry.harness) {
+                    Harness.CODEX -> {
+                        val id = entry.sessionId
+                        val rollout = entry.rollout?.let { Paths.get(it) }
+                        if (id != null && rollout != null && Files.isRegularFile(rollout)) CodexAgent(Codex.Session(id, rollout)) else null
+                    }
+                    Harness.B24 -> {
+                        val id = entry.sessionId
+                        val dir = entry.channel?.let { Paths.get(it) }
+                        if (id != null && dir != null && Files.isDirectory(dir)) B24Agent(id, B24.Channel(dir), hasTask = false) else null
+                    }
+                    Harness.CLAUDE -> null
+                }
+                if (agent == null) {
+                    team.remove(entry)
+                    continue
+                }
+                agent.readCompletedTurns()
+                externalAgents[entry.name] = agent
+                if (agent is B24Agent) ensureOutboxPump()
+                log.info("MetaJetCore: агент '${entry.name}' (${entry.harness.key}) восстановлен в группе ${entry.owner}")
+            }
         }
     }
 
@@ -1150,8 +1299,7 @@ class AgentManager(private val project: Project) : Disposable {
         role: Role,
         name: String,
         model: String,
-        parentName: String? = null,
-        parentSessionId: String? = null,
+        parent: Parent? = null,
     ): Map<String, String> {
         val env = LinkedHashMap<String, String>()
         // Имя сессии — это адрес для SendMessage. Без него имя выводится платформой из имени
@@ -1164,23 +1312,26 @@ class AgentManager(private val project: Project) : Disposable {
         // Каталог для развёрнутых отчётов — ВНЕ репозитория, иначе в каждом проекте
         // пришлось бы добавлять строку в .gitignore, а артефакты агентов там не нужны.
         env["MJC_REPORTS_DIR"] = reportsDirectory().toString().replace(BACKSLASH, '/')
-        // Кто завёл этого агента. Связь знает только плагин и только здесь: в реестре Claude
-        // Code поля «родитель» нет вовсе, а сторонним наблюдателям дерево команды иначе
-        // приходится угадывать по общему префиксу имени — на двух командах в одном проекте
-        // догадка разваливается.
-        //
-        // Две переменные, и это не дубль. `MJC_PARENT_SESSION` — настоящий ключ: sessionId
-        // уникален и переживает resume. `MJC_PARENT` — имя, оно для человека и для старых
-        // получателей; **ключом оно быть не может**, потому что не уникально (замер: три
-        // живые записи реестра с именем «слитие мастера») и меняется по ходу работы.
-        //
-        // Ключа может не быть, даже когда имя есть: родителя не удалось определить
-        // однозначно (см. parentSessionId). Тогда наблюдатель обязан считать связь
-        // неизвестной, а не достраивать её по имени.
-        parentName?.takeIf { it.isNotBlank() }?.let { env["MJC_PARENT"] = it.take(MAX_PARENT_NAME) }
-        parentSessionId?.takeIf { it.isNotBlank() }?.let { env["MJC_PARENT_SESSION"] = it }
+        putParent(env, parent)
         env.putAll(settings.extraEnv())
         return env
+    }
+
+    /**
+     * Кто завёл этого агента. Связь знает только плагин и только здесь: в реестре Claude Code
+     * поля «родитель» нет вовсе.
+     *
+     * Три переменные, и это не дубль. `MJC_PARENT_ADDRESS` — куда отвечать: `uds:<сокет>`
+     * оркестратора, адрес ровно его процесса. `MJC_PARENT_SESSION` — ключ связи для
+     * наблюдателей: sessionId уникален и переживает resume. `MJC_PARENT` — имя, оно для
+     * человека; **ни адресом, ни ключом оно быть не может**: не уникально (замер: три живые
+     * записи реестра с именем «слитие мастера») и меняется по `/rename`. По имени ответ агента
+     * уходил первой совпавшей сессии — то есть, возможно, чужой (docs/PLAN-TEAM.md).
+     */
+    private fun putParent(env: MutableMap<String, String>, parent: Parent?) {
+        parent?.name?.takeIf { it.isNotBlank() }?.let { env["MJC_PARENT"] = it.take(MAX_PARENT_NAME) }
+        parent?.sessionId?.takeIf { it.isNotBlank() }?.let { env["MJC_PARENT_SESSION"] = it }
+        parent?.address?.takeIf { it.isNotBlank() }?.let { env["MJC_PARENT_ADDRESS"] = it }
     }
 
     /**
@@ -1192,16 +1343,14 @@ class AgentManager(private val project: Project) : Disposable {
         role: Role,
         name: String,
         model: String,
-        parentName: String?,
-        parentSessionId: String?,
+        parent: Parent?,
         task: String,
     ): Map<String, String> {
         val env = LinkedHashMap<String, String>()
         env["MJC_AGENT_NAME"] = name
         env["MJC_ROLE"] = role.id
         env["MJC_REPORTS_DIR"] = reportsDirectory().toString().replace(BACKSLASH, '/')
-        parentName?.takeIf { it.isNotBlank() }?.let { env["MJC_PARENT"] = it.take(MAX_PARENT_NAME) }
-        parentSessionId?.takeIf { it.isNotBlank() }?.let { env["MJC_PARENT_SESSION"] = it }
+        putParent(env, parent)
         env[ENV_TASK] = task
         env[ENV_TRUST] = Codex.trustOverride(projectDirectory())
         if (model.isNotBlank()) env[ENV_MODEL] = model
@@ -1251,8 +1400,7 @@ class AgentManager(private val project: Project) : Disposable {
         role: Role,
         name: String,
         model: String,
-        parentName: String?,
-        parentSessionId: String?,
+        parent: Parent?,
         task: String,
         channel: B24.Channel,
     ): Map<String, String> {
@@ -1260,8 +1408,7 @@ class AgentManager(private val project: Project) : Disposable {
         env["MJC_AGENT_NAME"] = name
         env["MJC_ROLE"] = role.id
         env["MJC_REPORTS_DIR"] = reportsDirectory().toString().replace(BACKSLASH, '/')
-        parentName?.takeIf { it.isNotBlank() }?.let { env["MJC_PARENT"] = it.take(MAX_PARENT_NAME) }
-        parentSessionId?.takeIf { it.isNotBlank() }?.let { env["MJC_PARENT_SESSION"] = it }
+        putParent(env, parent)
         if (task.isNotBlank()) env[ENV_TASK] = task
         env[ENV_ROLE_PROMPT] = dev.metajetcore.roles.Roles.promptFor(role, Harness.B24)
         env[ENV_B24_EVENTS] = channel.events.toString()
@@ -1369,11 +1516,10 @@ class AgentManager(private val project: Project) : Disposable {
         role: Role,
         name: String,
         model: String,
-        parentName: String? = null,
-        parentSessionId: String? = null,
+        parent: Parent? = null,
     ): String {
         val shell = ShellDialect.detect(System.getenv("SHELL"))
-        val env = agentEnv(role, name, model, parentName, parentSessionId)
+        val env = agentEnv(role, name, model, parent)
             .entries.joinToString(" ") { (key, value) -> "$key='$value'" }
         return shell.unsetNames(inheritedMarkers()) + env + " " + commandWithFlags(role)
     }
@@ -1429,18 +1575,42 @@ class AgentManager(private val project: Project) : Disposable {
      * может стартовать долго. Смерть процесса до регистрации — это ошибка запуска (команды
      * нет, обёртка упала), и ждать полный таймаут ради неё незачем.
      */
-    private fun awaitSession(name: String, handle: TabHandle): Readiness {
+    private fun awaitSession(handle: TabHandle): Readiness {
         val deadline = System.currentTimeMillis() + settings.readyTimeoutSeconds * 1000L
         while (System.currentTimeMillis() < deadline) {
-            SessionRegistry.findByName(name)?.let { return Readiness.Ready(it) }
+            sessionInTab(handle)?.let { return Readiness.Ready(it) }
             val exited = runOnEdt { Terminal.isTerminated(handle) || !Terminal.isOpen(project, handle) }
             if (exited) {
                 // Запись могла появиться в последний момент: агент поднялся и сразу вышел.
-                return SessionRegistry.findByName(name)?.let { Readiness.Ready(it) } ?: Readiness.Exited
+                return sessionInTab(handle)?.let { Readiness.Ready(it) } ?: Readiness.Exited
             }
             Thread.sleep(POLL_INTERVAL_MS)
         }
         return Readiness.Timeout
+    }
+
+    /**
+     * Запись реестра сессии, которая живёт в процессе вкладки (сама или потомком обёртки).
+     *
+     * По процессу, а не по имени: имя не уникально, и запись чужой сессии с тем же именем,
+     * появившаяся во время спавна, стала бы «нашим агентом» — со всеми его сообщениями.
+     */
+    private fun sessionInTab(handle: TabHandle): SessionRecord? {
+        val tabPid = runOnEdt { Terminal.process(handle) }?.pid ?: return null
+        return SessionRegistry.all().firstOrNull { record -> tabPid in ancestorsOf(record.pid.toLong()) }
+    }
+
+    private fun ancestorsOf(pid: Long): Set<Long> {
+        val result = LinkedHashSet<Long>()
+        var handle = runCatching { ProcessHandle.of(pid).orElse(null) }.getOrNull()
+        result.add(pid)
+        var depth = 0
+        while (handle != null && depth < MAX_ANCESTOR_DEPTH) {
+            handle = runCatching { handle!!.parent().orElse(null) }.getOrNull()
+            handle?.let { result.add(it.pid()) }
+            depth++
+        }
+        return result
     }
 
     /**
@@ -1473,13 +1643,14 @@ class AgentManager(private val project: Project) : Disposable {
         return false
     }
 
-    private fun awaitSessionGone(name: String) {
+    /** Ждём, пока запись процесса [pid] уйдёт из реестра. По pid: имя могло достаться чужому. */
+    private fun awaitSessionGone(pid: Long) {
         val deadline = System.currentTimeMillis() + EXIT_TIMEOUT_MS
         while (System.currentTimeMillis() < deadline) {
-            if (SessionRegistry.findByName(name) == null) return
+            if (SessionRegistry.all().none { it.pid.toLong() == pid }) return
             Thread.sleep(POLL_INTERVAL_MS)
         }
-        log.warn("MetaJetCore: сессия '$name' осталась в реестре после /exit")
+        log.warn("MetaJetCore: сессия процесса $pid осталась в реестре после /exit")
     }
 
     /**
@@ -1514,6 +1685,10 @@ class AgentManager(private val project: Project) : Disposable {
         const val MAX_PARENT_NAME = 64
 
         const val POLL_INTERVAL_MS = 250L
+
+        /** Обёртка пользователя может стоять между шеллом вкладки и `claude` в несколько слоёв. */
+        const val MAX_ANCESTOR_DEPTH = 6
+        const val TEAM_FILE = "team.json"
         const val EXIT_TIMEOUT_MS = 15_000L
         const val TAB_READY_TIMEOUT_MS = 20_000L
         const val TAB_CLOSE_TIMEOUT_MS = 3_000L

@@ -27,6 +27,14 @@ class McpTools(private val project: Project) {
 
     private val manager: AgentManager get() = project.getService(AgentManager::class.java)
 
+    /**
+     * Кто вызвал инструмент — по соединению запроса (см. [CallerResolver]). Подменяется в
+     * тестах: там вызовы идут не по сети.
+     */
+    internal var resolveCaller: (Caller?) -> SessionRecord? = { caller ->
+        caller?.let { CallerResolver.recordFor(it.clientPort, it.serverPort) }
+    }
+
     fun definitions(): List<Json> = listOf(
         tool(
             name = "spawn_agent",
@@ -37,7 +45,8 @@ class McpTools(private val project: Project) {
                     "этим же участком, новый не нужен — отдай задачу ему через SendMessage, " +
                     "у него уже набран контекст. Новый заводи, когда участок другой. " +
                     "Задачу инструмент НЕ передаёт — после успешного спавна отправь её сам " +
-                    "через SendMessage на возвращённое имя.",
+                    "через SendMessage на возвращённый адрес. Агент входит в ТВОЮ группу: " +
+                    "плагин определяет тебя сам, по соединению.",
             properties = Json.obj(
                 "role" to schema(
                     "string",
@@ -47,8 +56,8 @@ class McpTools(private val project: Project) {
                 "task" to schema("string", "Брифинг: что сделать, и файловый домен агента"),
                 "parent" to schema(
                     "string",
-                    "Имя ТВОЕЙ сессии (первая строка вывода ListAgents). " +
-                        "Нужно, чтобы вкладка открылась рядом с тобой, а не в общей куче.",
+                    "Имя ТВОЕЙ сессии (первая строка вывода ListAgents) — для журнала. " +
+                        "Кто ты, плагин определяет сам, по соединению: имя не уникально.",
                 ),
                 "name" to schema("string", "Переопределить имя сессии; обычно не нужно"),
                 "model" to schema("string", "Переопределить модель роли"),
@@ -99,7 +108,10 @@ class McpTools(private val project: Project) {
         ),
         tool(
             name = "list_agents",
-            description = "Живые сессии Claude Code в директории этого проекта с их статусом.",
+            description = "Агенты ТВОЕЙ группы — те, кого ты запустил через spawn_agent, — со " +
+                "статусом и точным адресом для SendMessage. Других сессий для тебя нет: " +
+                "в ListAgents видны и чужие (личные сессии разработчика, агенты других " +
+                "оркестраторов) — им не пиши никогда.",
             properties = Json.obj(),
             required = emptyList(),
         ),
@@ -162,18 +174,22 @@ class McpTools(private val project: Project) {
         val args = params["arguments"] ?: Json.obj()
 
         return try {
+            if (name == "diagnostics") return diagnostics()
+            if (name !in AGENT_TOOLS) return textResult("неизвестный инструмент: $name", isError = true)
+            // Сразу, пока соединение открыто: по нему и определяется вызывающий. Без него
+            // инструменты не работают вовсе — «по всему проекту» означало бы чужих агентов
+            // (docs/PLAN-TEAM.md).
+            val me = resolveCaller(caller) ?: return textResult(NO_CALLER, isError = true)
             when (name) {
-                "spawn_agent" -> spawnAgent(args, caller)
-                "send_to_agent" -> sendToAgent(args)
-                "await_messages" -> awaitMessages(args)
-                "list_agents" -> listAgents()
-                "brief_agent" -> briefAgent(args)
-                "reset_agent" -> resetAgent(args)
-                "close_agent" -> closeAgent(args)
-                "focus_agent" -> focusAgent(args)
-                "read_tab" -> readTab(args)
-                "diagnostics" -> diagnostics()
-                else -> textResult("неизвестный инструмент: $name", isError = true)
+                "spawn_agent" -> spawnAgent(args, me)
+                "send_to_agent" -> sendToAgent(args, me)
+                "await_messages" -> awaitMessages(args, me)
+                "list_agents" -> listAgents(me)
+                "brief_agent" -> briefAgent(args, me)
+                "reset_agent" -> resetAgent(args, me)
+                "close_agent" -> closeAgent(args, me)
+                "focus_agent" -> focusAgent(args, me)
+                else -> readTab(args, me)
             }
         } catch (e: Throwable) {
             // Инструмент, бросивший исключение, для оркестратора выглядит как обрыв связи.
@@ -184,7 +200,7 @@ class McpTools(private val project: Project) {
 
     // ---------------------------------------------------------------- actions
 
-    private fun spawnAgent(args: Json, caller: Caller?): Json {
+    private fun spawnAgent(args: Json, callerRecord: SessionRecord): Json {
         val roleId = args["role"]?.asString
             ?: return textResult("ошибка: не указана role", isError = true)
         val role = Role.fromId(roleId)
@@ -205,9 +221,6 @@ class McpTools(private val project: Project) {
         val requestedName = args["name"]?.asString
         val requestedModel = args["model"]?.asString
         val domain = args["domain"]?.asString
-        // Сразу, пока соединение открыто: по нему и определяется вызывающий. Один раз на
-        // вызов — состав ревью спавнит нескольких, а вызывающий у них общий.
-        val callerRecord = caller?.let { CallerResolver.recordFor(it.clientPort, it.serverPort) }
         val panel = MjcSettings.getInstance().reviewPanelMembers()
         // Итоговое ревью разворачивается в состав из настроек одним вызовом: оркестратору не
         // нужно знать настройки, и второго ревьювера не «забыть». Явный harness или name —
@@ -237,7 +250,8 @@ class McpTools(private val project: Project) {
                     append("Автоматически открыть вкладку не вышло: ${result.reason}.\n")
                     append("Попроси разработчика выполнить в новой вкладке:\n\n")
                     append(result.command)
-                    append("\n\nПосле запуска агент появится в ListAgents.")
+                    append("\n\nЗапущенный вручную агент в твою группу не попадёт: плагин его не ")
+                    append("запускал. Если разработчик не может открыть вкладку — работай без агента.")
                 },
             )
 
@@ -254,9 +268,9 @@ class McpTools(private val project: Project) {
             // после спавна ещё не поздно отдать задачу тому, кто в теме.
             val siblings = result.siblings.filter { it.name !in skipSiblings }
             if (siblings.isNotEmpty()) {
-                append("\n\nВНИМАНИЕ: этой же роли в проекте уже работают ")
+                append("\n\nВНИМАНИЕ: этой же роли в твоей группе уже работают ")
                 append(siblings.joinToString(", ") { it.name })
-                append(". Если задача про их участок — отдай её им через SendMessage, ")
+                append(". Если задача про их участок — отдай её им (SendMessage на их адрес из list_agents), ")
                 append("а этого закрой через close_agent: у них набран контекст, ")
                 append("новый агент входит в задачу с нуля. Если участок другой — ")
                 append("всё верно, продолжай.")
@@ -274,7 +288,11 @@ class McpTools(private val project: Project) {
                 append("ответ забери через await_messages(names=[\"${result.agent.name}\"]).")
             } else {
                 append("\n\nСЛЕДУЮЩИЙ ШАГ, ОБЯЗАТЕЛЬНО: отправь агенту задачу через ")
-                append("SendMessage(to=\"${result.agent.name}\"). ")
+                append("SendMessage(to=\"${sendTo(result.agent)}\"). ")
+                if (result.agent.address != null) {
+                    append("Пиши ему только на этот адрес, не по имени: имя не уникально, и ")
+                    append("сообщение по нему может уйти чужой сессии. ")
+                }
                 append("Плагин задачу не передаёт намеренно: терминал искажает не-ASCII ")
                 append("(проверено живым прогоном), а сообщения доставляются как есть. ")
                 append("Отправь ему это:\n\n")
@@ -295,7 +313,7 @@ class McpTools(private val project: Project) {
         task: String,
         parent: String?,
         requestedModel: String?,
-        callerRecord: SessionRecord?,
+        callerRecord: SessionRecord,
     ): Json {
         val started = mutableListOf<SpawnResult.Started>()
         val sections = mutableListOf<String>()
@@ -329,8 +347,9 @@ class McpTools(private val project: Project) {
             if (started.size > 1) {
                 val merger = started.firstOrNull { it.agent.harness == Harness.CLAUDE } ?: started.first()
                 val channel = if (merger.agent.harness == Harness.CLAUDE) "SendMessage" else "send_to_agent"
+                val to = if (merger.agent.harness == Harness.CLAUDE) sendTo(merger.agent) else merger.agent.name
                 append("\n\nСВЕДЕНИЕ. Каждый пишет свой файл отчёта (суффикс слота к пути из задачи). ")
-                append("Когда ответят все, отправь ${merger.agent.name} ($channel) пути отчётов остальных и ")
+                append("Когда ответят все, отправь ${merger.agent.name} ($channel на \"$to\") пути отчётов остальных и ")
                 append("попроси свести их в итоговый файл по исходному пути из задачи: находки объединить, ")
                 append("дубли схлопнуть, расхождения между ревьюверами отметить, STATUS: FAIL, если FAIL хотя ")
                 append("бы у одного. Повторное ревью дельты — всем участникам, тем же агентам.")
@@ -339,21 +358,27 @@ class McpTools(private val project: Project) {
         return textResult(text, isError = started.isEmpty())
     }
 
-    private fun listAgents(): Json {
-        val agents = manager.list()
-        if (agents.isEmpty()) return textResult("В этом проекте нет живых сессий Claude Code.")
+    private fun listAgents(me: SessionRecord): Json {
+        val agents = manager.list(me)
+        if (agents.isEmpty()) {
+            return textResult(
+                "В твоей группе агентов нет. Сессии, которые видны в ListAgents, — не твои: " +
+                    "им не пиши. Агент нужен — spawn_agent.",
+            )
+        }
         return textResult(
-            agents.joinToString("\n") { describe(it) } +
+            "Твоя группа:\n" + agents.joinToString("\n") { describe(it) } +
                 "\n\nАгент с ролью — это готовая к работе сессия с набранным контекстом. " +
-                "Задачу по участку, который агент уже вёл, отправляй ему через SendMessage: " +
-                "новый агент на то же место входит в задачу с нуля.",
+                "Задачу по участку, который агент уже вёл, отправляй ему: Claude-агенту — " +
+                "SendMessage на его адрес, Codex и b24 — send_to_agent. Новый агент на то же " +
+                "место входит в задачу с нуля. Никаким другим сессиям не пиши.",
         )
     }
 
-    private fun briefAgent(args: Json): Json {
+    private fun briefAgent(args: Json, me: SessionRecord): Json {
         val name = args["name"]?.asString ?: return textResult("ошибка: нет name", isError = true)
         val text = args["text"]?.asString ?: return textResult("ошибка: нет text", isError = true)
-        return when (val result = manager.brief(name, text)) {
+        return when (val result = manager.brief(me, name, text)) {
             is BriefResult.Sent -> textResult("отправлено в '$name'")
 
             is BriefResult.NotAscii -> textResult(
@@ -363,29 +388,26 @@ class McpTools(private val project: Project) {
                 isError = true,
             )
 
-            is BriefResult.UnknownTab -> textResult(
-                "вкладка '$name' плагину неизвестна; используй SendMessage",
-                isError = true,
-            )
+            is BriefResult.UnknownTab -> textResult(notInGroup(name), isError = true)
         }
     }
 
-    private fun resetAgent(args: Json): Json {
+    private fun resetAgent(args: Json, me: SessionRecord): Json {
         val name = args["name"]?.asString ?: return textResult("ошибка: нет name", isError = true)
-        return when (val result = manager.reset(name)) {
+        return when (val result = manager.reset(me, name)) {
             ResetResult.Done -> textResult(
                 "контекст '$name' сброшен; новую задачу отправь через " +
-                    if (manager.isExternal(name)) "send_to_agent" else "SendMessage",
+                    if (manager.isExternal(me, name)) "send_to_agent" else "SendMessage на его адрес из list_agents",
             )
-            ResetResult.UnknownTab -> textResult("вкладка '$name' плагину неизвестна", isError = true)
+            ResetResult.UnknownTab -> textResult(notInGroup(name), isError = true)
             is ResetResult.Unsupported -> textResult(result.reason, isError = true)
         }
     }
 
-    private fun sendToAgent(args: Json): Json {
+    private fun sendToAgent(args: Json, me: SessionRecord): Json {
         val name = args["name"]?.asString ?: return textResult("ошибка: нет name", isError = true)
         val text = args["text"]?.asString ?: return textResult("ошибка: нет text", isError = true)
-        return when (val result = manager.deliver(name, text)) {
+        return when (val result = manager.deliver(me, name, text)) {
             DeliveryResult.Sent ->
                 textResult("отправлено '$name'; ответ забери через await_messages(names=[\"$name\"])")
             is DeliveryResult.Queued -> textResult(
@@ -396,21 +418,20 @@ class McpTools(private val project: Project) {
                     "Ответ на него придёт через await_messages(names=[\"$name\"]) после ответов на " +
                     "то, что ты отправил раньше.",
             )
-            DeliveryResult.UseSendMessage -> textResult(
-                "'$name' — сессия Claude Code: пиши ей SendMessage. Плагин второй канал не " +
-                    "заводит — у двух очередей не было бы порядка между собой.",
+            is DeliveryResult.UseSendMessage -> textResult(
+                "'$name' — сессия Claude Code: пиши ей SendMessage(to=\"${result.address ?: name}\"). " +
+                    "Плагин второй канал не заводит — у двух очередей не было бы порядка между собой.",
                 isError = true,
             )
-            DeliveryResult.UnknownAgent ->
-                textResult("агент '$name' плагину неизвестен; см. list_agents", isError = true)
+            DeliveryResult.UnknownAgent -> textResult(notInGroup(name), isError = true)
             is DeliveryResult.Failed -> textResult("не доставлено: ${result.reason}", isError = true)
         }
     }
 
-    private fun awaitMessages(args: Json): Json {
+    private fun awaitMessages(args: Json, me: SessionRecord): Json {
         val names = args["names"]?.asList?.mapNotNull { it.asString }?.takeIf { it.isNotEmpty() }
         val timeout = (args["timeout_s"]?.asLong ?: DEFAULT_AWAIT_S).coerceIn(0, MAX_AWAIT_S)
-        val result = manager.awaitMessages(names, timeout * 1000)
+        val result = manager.awaitMessages(me, names, timeout * 1000)
         return textResult(
             buildString {
                 if (result.messages.isEmpty()) append("Новых ответов нет.\n")
@@ -424,20 +445,19 @@ class McpTools(private val project: Project) {
                 }
                 if (result.notInMailbox.isNotEmpty()) {
                     append(
-                        "Не ждём: ${result.notInMailbox.joinToString()} — это сессии Claude Code " +
-                            "или неизвестные имена; ответы Claude-агентов приходят через SendMessage.\n",
+                        "Не ждём: ${result.notInMailbox.joinToString()} — это Claude-агенты (их ответы " +
+                            "приходят через SendMessage) или не агенты твоей группы.\n",
                     )
                 }
             }.trimEnd(),
         )
     }
 
-    private fun closeAgent(args: Json): Json {
+    private fun closeAgent(args: Json, me: SessionRecord): Json {
         val name = args["name"]?.asString ?: return textResult("ошибка: нет name", isError = true)
-        return when (val result = manager.close(name)) {
+        return when (val result = manager.close(me, name)) {
             is CloseResult.Closed -> textResult("'$name' завершён, вкладка закрыта")
-            is CloseResult.UnknownTab ->
-                textResult("вкладка '$name' плагину неизвестна", isError = true)
+            is CloseResult.UnknownTab -> textResult(notInGroup(name), isError = true)
             // Не ошибка: агент завершён, то есть инструмент своё дело сделал. Ошибкой это
             // выглядело бы как «закрыть не удалось», и оркестратор пошёл бы повторять вызов
             // на уже мёртвой сессии.
@@ -445,24 +465,32 @@ class McpTools(private val project: Project) {
         }
     }
 
-    private fun focusAgent(args: Json): Json {
+    private fun focusAgent(args: Json, me: SessionRecord): Json {
         val name = args["name"]?.asString ?: return textResult("ошибка: нет name", isError = true)
-        return if (manager.focus(name)) textResult("вкладка '$name' показана")
-        else textResult("вкладка '$name' плагину неизвестна", isError = true)
+        return if (manager.focus(me, name)) textResult("вкладка '$name' показана")
+        else textResult(notInGroup(name), isError = true)
     }
 
-    private fun readTab(args: Json): Json {
+    private fun readTab(args: Json, me: SessionRecord): Json {
         val name = args["name"]?.asString ?: return textResult("ошибка: нет name", isError = true)
-        val screen = manager.readScreen(name)
+        val screen = manager.readScreen(me, name)
         return when {
-            screen == null && !manager.knownTabs().contains(name) -> textResult(
-                "вкладка '$name' плагину неизвестна; известны: ${manager.knownTabs().joinToString()}",
-                isError = true,
-            )
-            screen == null -> textResult("экран вкладки '$name' прочитать не удалось", isError = true)
-            else -> textResult("экран вкладки '$name':\n\n$screen")
+            screen != null -> textResult("экран вкладки '$name':\n\n$screen")
+            manager.list(me).none { it.name == name } -> textResult(notInGroup(name), isError = true)
+            else -> textResult("экран вкладки '$name' прочитать не удалось", isError = true)
         }
     }
+
+    /**
+     * Чужой и несуществующий агент — один ответ: оркестратору незачем знать, что у соседа
+     * есть агент с таким именем, а «закрыть не удалось, попробуй ещё» звало бы повторять.
+     */
+    private fun notInGroup(name: String): String =
+        "в твоей группе нет агента '$name' — плагин работает только с агентами, которых ты " +
+            "запустил сам. Твоя группа — list_agents."
+
+    /** Куда писать Claude-агенту: точный адрес, имя — только если адреса нет. */
+    private fun sendTo(agent: AgentInfo): String = agent.address ?: agent.name
 
     private fun diagnostics(): Json {
         val settings = dev.metajetcore.settings.MjcSettings.getInstance()
@@ -497,7 +525,10 @@ class McpTools(private val project: Project) {
         if (agent.model.isNotBlank()) append("  модель=${agent.model}")
         agent.status?.let { append("  статус=$it") }
         agent.pid?.let { append("  pid=$it") }
-        if (!agent.managed) append("  (вкладка не под управлением плагина)")
+        // Без адреса — не «пиши по имени»: по имени сообщение может уйти чужой сессии. Адреса
+        // нет, пока процесс жив, а записи в реестре нет (сессия пересоздаёт её, например по /clear).
+        if (agent.harness == Harness.CLAUDE) append("  адрес=${agent.address ?: "(пока нет — повтори list_agents через минуту)"}")
+        if (!agent.managed) append("  (вкладка не найдена)")
     }
 
     private fun tool(
@@ -536,6 +567,18 @@ class McpTools(private val project: Project) {
         const val DEFAULT_AWAIT_S = 45L
         const val MAX_AWAIT_S = 120L
         const val REVIEW_DOMAIN = "review"
+
+        /** Инструменты, которые работают с агентами и потому — только в группе вызывающего. */
+        val AGENT_TOOLS = setOf(
+            "spawn_agent", "send_to_agent", "await_messages", "list_agents", "brief_agent",
+            "reset_agent", "close_agent", "focus_agent", "read_tab",
+        )
+
+        const val NO_CALLER =
+            "не удалось определить, какая сессия вызывает инструмент (по соединению с плагином). " +
+                "Без этого плагин не работает с агентами: он показывает и трогает только агентов " +
+                "группы вызывающего, а угадывать группу нельзя — это были бы чужие агенты. " +
+                "Скажи разработчику: подробности в idea.log по строке «вызывающий по порту»."
 
         /**
          * Приписка к задаче участника состава. Плагин дописывает её сам, потому что промпт

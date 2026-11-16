@@ -25,7 +25,17 @@ data class SessionRecord(
     val status: String?,
     val version: String?,
     val startedAt: Long?,
+    /**
+     * Сокет входящих сообщений сессии. `uds:<путь>` — точный адрес для `SendMessage`: имя
+     * не уникально и меняется по `/rename`, а сокет принадлежит ровно этому процессу.
+     */
+    val messagingSocketPath: String? = null,
+    /** Время старта процесса — с pid отличает процесс от позднейшего тёзки по pid. */
+    val procStart: String? = null,
 ) {
+    /** Адрес для `SendMessage`, по которому сообщение придёт именно этой сессии. */
+    val address: String? get() = messagingSocketPath?.takeIf { it.isNotBlank() }?.let { "uds:$it" }
+
     val isIdle: Boolean get() = status == "idle"
     val isBusy: Boolean get() = status == "busy"
 
@@ -44,6 +54,8 @@ data class SessionRecord(
                 status = root["status"]?.asString,
                 version = root["version"]?.asString,
                 startedAt = root["startedAt"]?.asLong,
+                messagingSocketPath = root["messagingSocketPath"]?.asString,
+                procStart = root["procStart"]?.asString,
             )
         }
     }
@@ -112,6 +124,8 @@ object SessionRegistry {
     }
 
     fun byName(name: String): List<SessionRecord> = all().filter { it.name == name }
+
+    fun bySessionId(sessionId: String): SessionRecord? = all().firstOrNull { it.sessionId == sessionId }
 
     fun findByName(name: String): SessionRecord? {
         val matches = byName(name)

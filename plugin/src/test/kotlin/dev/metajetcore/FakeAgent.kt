@@ -90,8 +90,8 @@ object FakeAgent {
         FILE="${'$'}REG/${'$'}${'$'}.json"
         # mjcParent* — не поля реестра Claude Code: так тест видит, какую связь с родителем
         # агент получил в окружении.
-        printf '{"pid":%s,"sessionId":"11111111-2222-4333-8444-555555555555","cwd":"%s","name":"%s","agent":"%s","status":"idle","version":"fake","mjcParent":"%s","mjcParentSession":"%s"}' \
-            "${'$'}${'$'}" "${'$'}(pwd)" "${'$'}CLAUDE_CODE_SESSION_NAME" "${'$'}CLAUDE_CODE_AGENT" "${'$'}MJC_PARENT" "${'$'}MJC_PARENT_SESSION" > "${'$'}FILE"
+        printf '{"pid":%s,"sessionId":"11111111-2222-4333-8444-555555555555","cwd":"%s","name":"%s","agent":"%s","status":"idle","version":"fake","messagingSocketPath":"/tmp/cc-socks/%s.sock","mjcParent":"%s","mjcParentSession":"%s","mjcParentAddress":"%s"}' \
+            "${'$'}${'$'}" "${'$'}(pwd)" "${'$'}CLAUDE_CODE_SESSION_NAME" "${'$'}CLAUDE_CODE_AGENT" "${'$'}${'$'}" "${'$'}MJC_PARENT" "${'$'}MJC_PARENT_SESSION" "${'$'}MJC_PARENT_ADDRESS" > "${'$'}FILE"
         while IFS= read -r LINE; do
             case "${'$'}LINE" in
                 */exit*) break ;;

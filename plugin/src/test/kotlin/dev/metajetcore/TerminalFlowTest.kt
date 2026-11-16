@@ -10,7 +10,9 @@ import dev.metajetcore.agents.SpawnResult
 import dev.metajetcore.harness.B24
 import dev.metajetcore.harness.Codex
 import dev.metajetcore.harness.Harness
+import dev.metajetcore.agents.TeamMember
 import dev.metajetcore.mcp.McpTools
+import dev.metajetcore.registry.SessionRecord
 import dev.metajetcore.registry.SessionRegistry
 import dev.metajetcore.roles.Role
 import dev.metajetcore.settings.MjcSettings
@@ -53,7 +55,26 @@ class TerminalFlowTest : BasePlatformTestCase() {
         // встречает: вкладку с живым чужим процессом он не закрывает (см. TabLeftOpen).
         TestDialogManager.setTestDialog(TestDialog.OK)
         agent = FlowSupport.useFakeAgent(project)
+        manager.useTeamFile(Files.createTempDirectory("mjc-team").resolve("team.json"))
     }
+
+    /**
+     * Оркестратор, от имени которого идут вызовы. Все операции с агентами — только в его
+     * группе, поэтому без вызывающего тесту нечего делать. Процесс — сам тест: сессии
+     * оркестратора в реестре нет и не нужно, вкладку рядом с ним плагин просто не найдёт.
+     */
+    private val orc = SessionRecord(
+        pid = ProcessHandle.current().pid().toInt(),
+        sessionId = "orc-flow",
+        name = "mjc-orc",
+        cwd = "",
+        kind = "interactive",
+        agent = "mjc-orchestrator",
+        status = "busy",
+        version = "fake",
+        startedAt = null,
+        messagingSocketPath = "/tmp/cc-socks/orc.sock",
+    )
 
     override fun tearDown() {
         try {
@@ -84,6 +105,7 @@ class TerminalFlowTest : BasePlatformTestCase() {
                 requestedName = null,
                 requestedModel = null,
                 domain = "flow",
+                caller = orc,
             )
         }
 
@@ -100,6 +122,18 @@ class TerminalFlowTest : BasePlatformTestCase() {
         // Имя в записи реестра взято из CLAUDE_CODE_SESSION_NAME — значит окружение доехало
         // через API вкладки, а не потерялось по дороге.
         assertNotNull("сессии нет в реестре", SessionRegistry.findByName(name))
+        // Отвечать агент будет на точный адрес своего оркестратора, не по имени.
+        val raw = Files.list(agent.registryDirectory).use { files ->
+            files.toList().filter { it.toString().endsWith(".json") }.map { Json.parse(Files.readString(it)) }
+                .first { it["name"]?.asString == name }
+        }
+        assertEquals("uds:/tmp/cc-socks/orc.sock", raw["mjcParentAddress"]?.asString)
+        // Агент — в группе вызывающего, с адресом; чужому оркестратору его не видно.
+        val listed = manager.list(orc).single { it.name == name }
+        assertEquals("uds:/tmp/cc-socks/${listed.pid}.sock", listed.address)
+        val stranger = orc.copy(pid = orc.pid + 1, sessionId = "orc-other", procStart = "x")
+        assertTrue(manager.list(stranger).isEmpty())
+        assertEquals(CloseResult.UnknownTab, onPooledThreadPumpingEdt { manager.close(stranger, name) })
         // Задачу плагин не доставляет: содержательный канал — SendMessage.
         assertEquals("разобраться в задаче", started.pendingBriefing)
 
@@ -108,27 +142,28 @@ class TerminalFlowTest : BasePlatformTestCase() {
         assertEquals(
             "reset не прошёл",
             dev.metajetcore.agents.ResetResult.Done,
-            onPooledThreadPumpingEdt { manager.reset(name) },
+            onPooledThreadPumpingEdt { manager.reset(orc, name) },
         )
 
         // Не-ASCII в терминал не отправляем — он его искажает (docs/ARCHITECTURE.md §2.7.1).
         assertTrue(
             "кириллица должна отклоняться",
-            onPooledThreadPumpingEdt { manager.brief(name, "Проверь модуль") }
+            onPooledThreadPumpingEdt { manager.brief(orc, name, "Проверь модуль") }
                 is dev.metajetcore.agents.BriefResult.NotAscii,
         )
 
         // Экран вкладки читается — это единственный способ увидеть зависшего агента.
-        assertNotNull("экран не прочитан", onPooledThreadPumpingEdt { manager.readScreen(name) })
+        assertNotNull("экран не прочитан", onPooledThreadPumpingEdt { manager.readScreen(orc, name) })
 
         // Закрытие: /exit доезжает, агент убирает свою запись и завершается, вкладка
         // закрывается вместе с ним без модального вопроса про запущенный процесс.
         assertEquals(
             "close не прошёл",
             CloseResult.Closed,
-            onPooledThreadPumpingEdt { manager.close(name) },
+            onPooledThreadPumpingEdt { manager.close(orc, name) },
         )
         assertNull("запись осталась в реестре", SessionRegistry.findByName(name))
+        assertTrue("агент остался в группе", manager.list(orc).none { it.name == name })
         assertFalse("вкладка осталась под управлением", manager.knownTabs().contains(name))
     }
 
@@ -141,7 +176,7 @@ class TerminalFlowTest : BasePlatformTestCase() {
         // Выход «изнутри»: строка уходит прямо во вкладку, мимо close_agent.
         assertEquals(
             dev.metajetcore.agents.BriefResult.Sent,
-            onPooledThreadPumpingEdt { manager.brief(name, "/exit") },
+            onPooledThreadPumpingEdt { manager.brief(orc, name, "/exit") },
         )
         awaitPumpingEdt("вкладка закрылась сама") { !manager.knownTabs().contains(name) }
         if (handle != null) assertFalse("вкладка осталась на экране", Terminal.isOpen(project, handle))
@@ -156,7 +191,7 @@ class TerminalFlowTest : BasePlatformTestCase() {
         val timeout = manager.tabDeadTimeoutMs
         manager.tabDeadTimeoutMs = 2_000L
         try {
-            assertEquals(CloseResult.Closed, onPooledThreadPumpingEdt { manager.close(name) })
+            assertEquals(CloseResult.Closed, onPooledThreadPumpingEdt { manager.close(orc, name) })
             assertFalse("вкладка осталась под управлением", manager.knownTabs().contains(name))
         } finally {
             manager.tabDeadTimeoutMs = timeout
@@ -165,7 +200,7 @@ class TerminalFlowTest : BasePlatformTestCase() {
 
     private fun spawnResearcher(domain: String): String {
         val result = onPooledThreadPumpingEdt {
-            manager.spawn(Role.RESEARCHER, "задача", null, null, null, domain)
+            manager.spawn(Role.RESEARCHER, "задача", null, null, null, domain, caller = orc)
         }
         return (result as? SpawnResult.Started)?.agent?.name
             ?: throw AssertionError("агент не поднялся: $result\nошибка агента: ${agentError()}\nреестр:\n${registryDump()}")
@@ -193,11 +228,12 @@ class TerminalFlowTest : BasePlatformTestCase() {
                 requestedName = null,
                 requestedModel = null,
                 domain = "near",
+                caller = orc,
             )
         } as? SpawnResult.Started ?: throw AssertionError("агент не поднялся без editor area")
 
         assertEquals("mjc-rev-near", started.agent.name)
-        onPooledThreadPumpingEdt { manager.close(started.agent.name) }
+        onPooledThreadPumpingEdt { manager.close(orc, started.agent.name) }
         Terminal.closeTab(project, parent)
     }
 
@@ -244,7 +280,7 @@ class TerminalFlowTest : BasePlatformTestCase() {
             assertEquals(caller.sessionId, record["mjcParentSession"]?.asString)
             // Имя — текущее, из реестра, а не устаревшее из аргумента.
             assertEquals("инт html", record["mjcParent"]?.asString)
-            onPooledThreadPumpingEdt { manager.close(started.agent.name) }
+            onPooledThreadPumpingEdt { manager.close(caller, started.agent.name) }
         } finally {
             com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project).closeFile(thread)
         }
@@ -291,10 +327,11 @@ class TerminalFlowTest : BasePlatformTestCase() {
             SessionRegistry.findByName("mjc-manual-session") != null
         }
 
-        val found = dev.metajetcore.terminal.TabResolver
-            .findTabForSession(project, "mjc-manual-session")
+        val record = SessionRegistry.findByName("mjc-manual-session")!!
+        val found = dev.metajetcore.terminal.TabResolver.resolveRecord(project, record)
         assertNotNull("вкладку по дереву процессов не нашли", found)
-        assertEquals("mjc-manual-session", found!!.name)
+        // Тот же терминал — по процессу, а не по заголовку.
+        assertSame(tab.view, found!!.handle.view)
 
         Terminal.send(tab, "/exit", execute = true)
         awaitPumpingEdt("сессия ушла из реестра") {
@@ -317,12 +354,24 @@ class TerminalFlowTest : BasePlatformTestCase() {
         ) ?: throw AssertionError("вкладка не создалась")
         awaitPumpingEdt("шелл поднялся") { Terminal.isRunning(tab) }
         manager.register("mjc-stuck", tab)
+        // Как будто агент группы: закрывать можно только своих. pid — живой процесс самого
+        // теста: записи реестра у него нет, значит «агент жив, сессия не зарегистрирована».
+        manager.team.add(
+            TeamMember(
+                name = "mjc-stuck",
+                owner = manager.team.ownerKey(orc),
+                harness = Harness.CLAUDE,
+                role = Role.RESEARCHER,
+                model = "",
+                pid = ProcessHandle.current().pid(),
+            ),
+        )
 
         // Ждать полный продовый таймаут тесту незачем: процесс здесь не умрёт никогда.
         val timeout = manager.tabDeadTimeoutMs
         manager.tabDeadTimeoutMs = 2_000L
         try {
-            val result = onPooledThreadPumpingEdt { manager.close("mjc-stuck") }
+            val result = onPooledThreadPumpingEdt { manager.close(orc, "mjc-stuck") }
             assertTrue("ожидался TabLeftOpen, получено $result", result is CloseResult.TabLeftOpen)
             // Вкладка остаётся под управлением: её экран — единственное объяснение того,
             // почему процесс не завершился, и read_tab по ней должен работать.
@@ -349,7 +398,7 @@ class TerminalFlowTest : BasePlatformTestCase() {
 
     /** Экран вкладки — то, что видел бы разработчик. Без него отладка стенда слепая. */
     private fun screenOf(name: String): String =
-        onPooledThreadPumpingEdt { manager.readScreen(name) } ?: "(экран недоступен)"
+        onPooledThreadPumpingEdt { manager.readScreen(orc, name) } ?: "(экран недоступен)"
 
     fun testCodexAgentLifecycle() {
         if (dev.metajetcore.shell.ShellDialect.isWindows()) return
@@ -372,6 +421,7 @@ class TerminalFlowTest : BasePlatformTestCase() {
                 requestedModel = "opus",
                 domain = "cdx",
                 requestedHarness = Harness.CODEX,
+                caller = orc,
             )
         }
         val started = result as? SpawnResult.Started
@@ -383,26 +433,26 @@ class TerminalFlowTest : BasePlatformTestCase() {
         assertEquals("", started.agent.model)
 
         // Задача доехала через env дословно: кавычки целы, ${'$'}HOME не раскрыт.
-        val first = onPooledThreadPumpingEdt { manager.awaitMessages(listOf(name), 10_000) }
+        val first = onPooledThreadPumpingEdt { manager.awaitMessages(orc, listOf(name), 10_000) }
         assertEquals(first.toString(), listOf("ECHO: проверь \"кавычки\" и ${'$'}HOME"), first.messages.map { it.text })
 
-        val listed = manager.list().firstOrNull { it.name == name }
+        val listed = manager.list(orc).firstOrNull { it.name == name }
         assertEquals("idle", listed?.status)
         assertEquals(Harness.CODEX, listed?.harness)
 
         assertEquals(
             dev.metajetcore.agents.DeliveryResult.Sent,
-            onPooledThreadPumpingEdt { manager.deliver(name, "вторая задача") },
+            onPooledThreadPumpingEdt { manager.deliver(orc, name, "вторая задача") },
         )
-        val second = onPooledThreadPumpingEdt { manager.awaitMessages(listOf(name), 10_000) }
+        val second = onPooledThreadPumpingEdt { manager.awaitMessages(orc, listOf(name), 10_000) }
         assertEquals(second.toString(), listOf("ECHO: вторая задача"), second.messages.map { it.text })
 
         assertTrue(
-            onPooledThreadPumpingEdt { manager.reset(name) } is dev.metajetcore.agents.ResetResult.Unsupported,
+            onPooledThreadPumpingEdt { manager.reset(orc, name) } is dev.metajetcore.agents.ResetResult.Unsupported,
         )
-        assertEquals(CloseResult.Closed, onPooledThreadPumpingEdt { manager.close(name) })
+        assertEquals(CloseResult.Closed, onPooledThreadPumpingEdt { manager.close(orc, name) })
         assertFalse("вкладка осталась под управлением", manager.knownTabs().contains(name))
-        assertNull(manager.list().firstOrNull { it.name == name })
+        assertNull(manager.list(orc).firstOrNull { it.name == name })
     }
 
     fun testB24AgentLifecycle() {
@@ -424,6 +474,7 @@ class TerminalFlowTest : BasePlatformTestCase() {
                 requestedModel = "bitrix/bitrixgpt-6.5-agent",
                 domain = "b24",
                 requestedHarness = Harness.B24,
+                caller = orc,
             )
         }
         val started = result as? SpawnResult.Started
@@ -433,7 +484,7 @@ class TerminalFlowTest : BasePlatformTestCase() {
         assertEquals(Harness.B24, started.agent.harness)
         assertEquals("bitrix/bitrixgpt-6.5-agent", started.agent.model)
 
-        val first = onPooledThreadPumpingEdt { manager.awaitMessages(listOf(name), 10_000) }
+        val first = onPooledThreadPumpingEdt { manager.awaitMessages(orc, listOf(name), 10_000) }
         assertEquals(first.toString(), listOf("ECHO: проверь \"кавычки\" и ${'$'}HOME"), first.messages.map { it.text })
 
         // Что доехало в argv: модель, режим прав по общей настройке, промпт роли с протоколом.
@@ -444,17 +495,17 @@ class TerminalFlowTest : BasePlatformTestCase() {
         assertEquals("auto", seen["approval"]?.asString)
         assertTrue(seen["prompt"]?.asString.orEmpty().contains("Протокол команды"))
 
-        val listed = manager.list().firstOrNull { it.name == name }
+        val listed = manager.list(orc).firstOrNull { it.name == name }
         assertEquals("idle", listed?.status)
         assertEquals(Harness.B24, listed?.harness)
 
         // Ход с инструментом: пока он идёт, второе сообщение ждёт в очереди плагина.
-        assertEquals(DeliveryResult.Sent, onPooledThreadPumpingEdt { manager.deliver(name, "медленно раз") })
-        assertEquals(DeliveryResult.Queued(1), onPooledThreadPumpingEdt { manager.deliver(name, "два") })
+        assertEquals(DeliveryResult.Sent, onPooledThreadPumpingEdt { manager.deliver(orc, name, "медленно раз") })
+        assertEquals(DeliveryResult.Queued(1), onPooledThreadPumpingEdt { manager.deliver(orc, name, "два") })
         val replies = mutableListOf<String>()
         repeat(3) {
             if (replies.size < 2) {
-                replies += onPooledThreadPumpingEdt { manager.awaitMessages(listOf(name), 10_000) }.messages.map { it.text }
+                replies += onPooledThreadPumpingEdt { manager.awaitMessages(orc, listOf(name), 10_000) }.messages.map { it.text }
             }
         }
         // Ответ первого хода — итог, а не «Делаю.» из сообщения с инструментом; второе
@@ -463,15 +514,15 @@ class TerminalFlowTest : BasePlatformTestCase() {
 
         assertEquals(
             dev.metajetcore.agents.ResetResult.Done,
-            onPooledThreadPumpingEdt { manager.reset(name) },
+            onPooledThreadPumpingEdt { manager.reset(orc, name) },
         )
-        onPooledThreadPumpingEdt { manager.deliver(name, "три") }
-        val afterReset = onPooledThreadPumpingEdt { manager.awaitMessages(listOf(name), 10_000) }
+        onPooledThreadPumpingEdt { manager.deliver(orc, name, "три") }
+        val afterReset = onPooledThreadPumpingEdt { manager.awaitMessages(orc, listOf(name), 10_000) }
         assertEquals(afterReset.toString(), listOf("ECHO(после /clear): три"), afterReset.messages.map { it.text })
 
-        assertEquals(CloseResult.Closed, onPooledThreadPumpingEdt { manager.close(name) })
+        assertEquals(CloseResult.Closed, onPooledThreadPumpingEdt { manager.close(orc, name) })
         assertFalse("вкладка осталась под управлением", manager.knownTabs().contains(name))
-        assertNull(manager.list().firstOrNull { it.name == name })
+        assertNull(manager.list(orc).firstOrNull { it.name == name })
         assertFalse("канал не удалён", Files.exists(channel))
     }
 
@@ -485,7 +536,7 @@ class TerminalFlowTest : BasePlatformTestCase() {
         settings.reviewPanel = mutableMapOf("claude_code" to 1, "codex" to 1)
         Files.createDirectories(manager.projectDirectory())
 
-        val tools = McpTools(project)
+        val tools = McpTools(project).also { it.resolveCaller = { orc } }
         val result = onPooledThreadPumpingEdt {
             tools.call(
                 Json.obj(
@@ -503,17 +554,18 @@ class TerminalFlowTest : BasePlatformTestCase() {
         val codexName = "mjc-rev-review-codex"
         try {
             assertTrue(text, text.contains("запущено: 2"))
-            assertTrue(text, text.contains("SendMessage(to=\"$claudeName\")"))
+            val claudeAddress = manager.list(orc).first { it.name == claudeName }.address!!
+            assertTrue(text, text.contains("SendMessage(to=\"$claudeAddress\")"))
             assertTrue(text, text.contains("await_messages(names=[\"$codexName\"])"))
             // Сводит Claude-участник, а не оркестратор.
-            assertTrue(text, text.contains("отправь $claudeName (SendMessage)"))
+            assertTrue(text, text.contains("отправь $claudeName (SendMessage на \"$claudeAddress\")"))
             // Задача Codex-у ушла при старте — вместе с припиской про его файл отчёта.
-            val first = onPooledThreadPumpingEdt { manager.awaitMessages(listOf(codexName), 10_000) }
+            val first = onPooledThreadPumpingEdt { manager.awaitMessages(orc, listOf(codexName), 10_000) }
             val echoed = first.messages.singleOrNull()?.text.orEmpty()
             assertTrue(echoed, echoed.startsWith("ECHO: ревью ветки") && echoed.contains("review-review-codex.md"))
         } finally {
             for (name in listOf(claudeName, codexName)) {
-                if (manager.knownTabs().contains(name)) onPooledThreadPumpingEdt { manager.close(name) }
+                if (manager.knownTabs().contains(name)) onPooledThreadPumpingEdt { manager.close(orc, name) }
             }
         }
         assertFalse(manager.knownTabs().contains(claudeName))
