@@ -349,6 +349,21 @@ class AgentManager(private val project: Project) : Disposable {
      */
     internal var tabDeadTimeoutMs: Long = EXIT_TIMEOUT_MS
 
+    /**
+     * Каталог, в котором стартует агент.
+     *
+     * Каталог проекта IDE — не обязательно место работы. `bx clone` даёт рядом с основным
+     * checkout клон со своим порталом, и оркестратор, запущенный в checkout, ведёт фичу в
+     * клоне. Агент, запущенный в checkout, там и пишет: Codex с workspace-write в клон
+     * писать не может вовсе, а скиллы и AGENTS.md видит не те (16.11, modu-impl-fe).
+     * Угадать клон плагин не может — у оркестратора cwd тот же checkout, — поэтому
+     * каталог передаёт оркестратор (`workdir`), а без него берётся каталог вызывающего.
+     */
+    internal fun workDirFor(requested: Path?, caller: SessionRecord?): Path =
+        requested
+            ?: caller?.cwd?.takeIf { it.isNotBlank() }?.let { Paths.get(it) }?.takeIf { Files.isDirectory(it) }
+            ?: projectDirectory()
+
     fun projectDirectory(): Path =
         project.basePath?.let { Paths.get(it) } ?: Paths.get(System.getProperty("user.dir"))
 
@@ -395,8 +410,10 @@ class AgentManager(private val project: Project) : Disposable {
         domain: String?,
         requestedHarness: Harness? = null,
         caller: SessionRecord,
+        workdir: Path? = null,
     ): SpawnResult {
         val harness = requestedHarness ?: settings.harnessFor(role)
+        val workDir = workDirFor(workdir, caller)
         if (role == Role.ORCHESTRATOR && harness != Harness.CLAUDE) {
             return SpawnResult.Failed("оркестратор работает только в Claude Code")
         }
@@ -440,8 +457,8 @@ class AgentManager(private val project: Project) : Disposable {
 
         val model = modelFor(role, harness, requestedModel)
         when (harness) {
-            Harness.CODEX -> return spawnCodex(role, task, name, model, parent, owner, place, siblings)
-            Harness.B24 -> return spawnB24(role, task, name, model, parent, owner, place, siblings)
+            Harness.CODEX -> return spawnCodex(role, task, name, model, parent, owner, place, siblings, workDir)
+            Harness.B24 -> return spawnB24(role, task, name, model, parent, owner, place, siblings, workDir)
             Harness.CLAUDE -> Unit
         }
         val manualCommand = manualCommand(role, name, model, parent)
@@ -458,7 +475,7 @@ class AgentManager(private val project: Project) : Disposable {
             Terminal.openTab(
                 project = project,
                 name = name,
-                workingDirectory = projectDirectory(),
+                workingDirectory = workDir,
                 env = agentEnv(role, name, model, parent),
                 command = argv,
             )?.also { child ->
@@ -562,10 +579,11 @@ class AgentManager(private val project: Project) : Disposable {
         owner: String,
         place: ParentPlace,
         siblings: List<AgentInfo>,
+        workDir: Path,
     ): SpawnResult = synchronized(codexSpawnLock) {
         // Пустую задачу не отправляем пустой: без первого сообщения сессии не будет.
         val firstMessage = task.ifBlank { CODEX_IDLE_TASK }
-        val env = codexEnv(role, name, model, parent, firstMessage)
+        val env = codexEnv(role, name, model, parent, firstMessage, workDir)
         val manual = codexManualCommand(role, model, env)
         if (!runOnEdt { Terminal.isAvailable(project) }) {
             return SpawnResult.Manual(manual, "терминальное API IDE недоступно")
@@ -576,7 +594,7 @@ class AgentManager(private val project: Project) : Disposable {
             Terminal.openTab(
                 project = project,
                 name = name,
-                workingDirectory = projectDirectory(),
+                workingDirectory = workDir,
                 env = env,
                 command = argv,
             )?.also { child ->
@@ -586,7 +604,7 @@ class AgentManager(private val project: Project) : Disposable {
         } ?: return SpawnResult.Manual(manual, "не удалось открыть вкладку терминала")
         tabs[name] = handle
 
-        val session = awaitCodexSession(handle, since)
+        val session = awaitCodexSession(handle, since, workDir)
             ?: run {
                 val exited = runOnEdt { Terminal.isTerminated(handle) || !Terminal.isOpen(project, handle) }
                 if (exited) tabs.remove(name)
@@ -632,7 +650,7 @@ class AgentManager(private val project: Project) : Disposable {
      * Только где открытые файлы узнать нечем (Windows без lsof) — по времени начала сессии,
      * и лишь если кандидат единственный.
      */
-    private fun awaitCodexSession(handle: TabHandle, since: Long): Codex.Session? {
+    private fun awaitCodexSession(handle: TabHandle, since: Long, workDir: Path): Codex.Session? {
         val claimed = externalAgents.values.map { it.sessionId }.toSet()
         val deadline = System.currentTimeMillis() + settings.readyTimeoutSeconds * 1000L
         while (System.currentTimeMillis() < deadline) {
@@ -640,7 +658,7 @@ class AgentManager(private val project: Project) : Disposable {
             if (pid != null) {
                 when (val lookup = Codex.sessionOfProcess(pid, claimed)) {
                     is Codex.Lookup.Found -> lookup.session?.let { return it }
-                    Codex.Lookup.Unavailable -> Codex.findNewSession(projectDirectory(), since, claimed)?.let { return it }
+                    Codex.Lookup.Unavailable -> Codex.findNewSession(workDir, since, claimed)?.let { return it }
                 }
             }
             // Процесс умер — сессии у агента нет, чужую вместо неё не берём.
@@ -666,6 +684,7 @@ class AgentManager(private val project: Project) : Disposable {
         owner: String,
         place: ParentPlace,
         siblings: List<AgentInfo>,
+        workDir: Path,
     ): SpawnResult {
         val sessionId = UUID.randomUUID().toString()
         val channel = B24.channel(sessionId)
@@ -684,7 +703,7 @@ class AgentManager(private val project: Project) : Disposable {
             Terminal.openTab(
                 project = project,
                 name = name,
-                workingDirectory = projectDirectory(),
+                workingDirectory = workDir,
                 env = env,
                 command = argv,
             )?.also { child -> TabPlacement.placeNear(project, place.handle, child, place.file) }
@@ -1345,6 +1364,7 @@ class AgentManager(private val project: Project) : Disposable {
         model: String,
         parent: Parent?,
         task: String,
+        workDir: Path = projectDirectory(),
     ): Map<String, String> {
         val env = LinkedHashMap<String, String>()
         env["MJC_AGENT_NAME"] = name
@@ -1352,7 +1372,9 @@ class AgentManager(private val project: Project) : Disposable {
         env["MJC_REPORTS_DIR"] = reportsDirectory().toString().replace(BACKSLASH, '/')
         putParent(env, parent)
         env[ENV_TASK] = task
-        env[ENV_TRUST] = Codex.trustOverride(projectDirectory())
+        // Доверие — каталогу, где агент стартует: sandbox workspace-write пускает писать
+        // только в него, и доверенным должен быть именно он, иначе Codex спросит на старте.
+        env[ENV_TRUST] = Codex.trustOverride(workDir)
         if (model.isNotBlank()) env[ENV_MODEL] = model
         env.putAll(settings.extraEnv())
         return env

@@ -167,6 +167,20 @@ class TerminalFlowTest : BasePlatformTestCase() {
         assertFalse("вкладка осталась под управлением", manager.knownTabs().contains(name))
     }
 
+    fun testAgentStartsInTheRequestedWorkdir() {
+        // Агент работает там, где ведётся фича (клон `bx clone`), а не в каталоге проекта IDE.
+        val clone = Files.createTempDirectory("modules-feature").toRealPath()
+        val started = onPooledThreadPumpingEdt {
+            manager.spawn(Role.RESEARCHER, "задача", null, null, null, "wd", caller = orc, workdir = clone)
+        } as? SpawnResult.Started ?: throw AssertionError("агент не поднялся\nреестр:\n${registryDump()}")
+        try {
+            val record = SessionRegistry.all().first { it.pid == started.agent.pid }
+            assertEquals(clone.toString(), record.cwd)
+        } finally {
+            onPooledThreadPumpingEdt { manager.close(orc, started.agent.name) }
+        }
+    }
+
     fun testTabClosesWhenTheAgentExitsByItself() {
         // Агент вышел сам — по /exit изнутри или упал. Процесс вкладки и есть агент, поэтому
         // вкладка обязана закрыться без close_agent, а плагин — забыть её: иначе на экране

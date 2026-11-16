@@ -357,6 +357,27 @@ class McpIntegrationTest : BasePlatformTestCase() {
         assertEquals("uds:/tmp/cc-socks/9001.sock", manager.codexEnv(Role.REVIEWER, "r", "", orc, "t")["MJC_PARENT_ADDRESS"])
     }
 
+    fun testAgentStartsInTheRequestedWorkdir() {
+        // 16.11: оркестратор в основном checkout вёл фичу в клоне `bx clone` рядом, агента
+        // плагин запускал в checkout — Codex не смог писать в клон. Каталог — от оркестратора.
+        val clone = Files.createTempDirectory("modules-feature").toRealPath()
+        assertEquals(clone, manager.workDirFor(clone, orcA))
+        // Без workdir — каталог вызывающего, если он есть на диске, иначе каталог проекта.
+        val callerDir = Files.createTempDirectory("orc-cwd").toRealPath()
+        assertEquals(callerDir, manager.workDirFor(null, orcA.copy(cwd = callerDir.toString())))
+        assertEquals(manager.projectDirectory(), manager.workDirFor(null, orcA.copy(cwd = "/нет/такого")))
+        // Доверие Codex — тому же каталогу, иначе sandbox не пустит писать.
+        val env = manager.codexEnv(Role.IMPLEMENTER, "i", "", null, "t", clone)
+        assertTrue(env["MJC_CODEX_TRUST"], env["MJC_CODEX_TRUST"]!!.contains(clone.toString()))
+    }
+
+    fun testSpawnRejectsBadWorkdir() {
+        for (bad in listOf("relative/dir", "/нет/такого/каталога")) {
+            val text = spawnCall("workdir" to Json.of(bad))
+            assertTrue(text, text.contains("не абсолютный путь существующего каталога"))
+        }
+    }
+
     fun testEnvironmentOmitsParentWhenThereIsNone() {
         // Именно отсутствие ключа, а не пустая строка: пустое значение получатель принял бы
         // за настоящий адрес.

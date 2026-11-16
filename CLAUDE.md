@@ -48,6 +48,9 @@
   заголовку нет и не заводить. Адрес Claude-сессии — `uds:<messagingSocketPath>`,
   агент отвечает на `MJC_PARENT_ADDRESS`. Любая новая операция с агентами обязана брать
   `caller` и работать через `members(caller)`.
+- **Каталог агента — `workdir` из `spawn_agent`**, затем cwd вызывающего, затем каталог проекта
+  (`AgentManager.workDirFor`). Оркестратор часто стартует в основном checkout, а фичу ведёт в
+  клоне `bx clone` рядом — угадать клон нельзя. Доверие Codex — тому же каталогу.
 - **Сессия Claude в IDE — не обязательно терминал.** Вкладка AIR (Agent Threads):
   `AgentThreadViewContentFile`, `getThreadId()` = `sessionId`. По ней агент открывается рядом
   с родителем (`Terminal.airThreadFile`). Подробности — `ARCHITECTURE.md` §2.11.

@@ -60,6 +60,13 @@ class McpTools(private val project: Project) {
                         "Кто ты, плагин определяет сам, по соединению: имя не уникально.",
                 ),
                 "name" to schema("string", "Переопределить имя сессии; обычно не нужно"),
+                "workdir" to schema(
+                    "string",
+                    "Абсолютный путь каталога, где стартует агент и куда он пишет. По умолчанию — твой " +
+                        "рабочий каталог. ОБЯЗАТЕЛЕН, если фича ведётся не там, где запущен ты (клон " +
+                        "`bx clone` рядом с основным checkout): агент Codex пишет только в свой каталог, " +
+                        "и скиллы, AGENTS.md, CLAUDE.md видит оттуда же.",
+                ),
                 "model" to schema("string", "Переопределить модель роли"),
                 "domain" to schema(
                     "string",
@@ -221,6 +228,15 @@ class McpTools(private val project: Project) {
         val requestedName = args["name"]?.asString
         val requestedModel = args["model"]?.asString
         val domain = args["domain"]?.asString
+        val workdirArg = args["workdir"]?.asString?.trim()?.takeIf { it.isNotEmpty() }
+        val workdir = workdirArg?.let {
+            val path = runCatching { java.nio.file.Paths.get(it) }.getOrNull()
+            // Отказ, а не каталог по умолчанию: агент в чужом каталоге и есть исходная поломка.
+            if (path == null || !path.isAbsolute || !java.nio.file.Files.isDirectory(path)) {
+                return textResult("workdir '$it' — не абсолютный путь существующего каталога", isError = true)
+            }
+            path.toRealPath()
+        }
         val panel = MjcSettings.getInstance().reviewPanelMembers()
         // Итоговое ревью разворачивается в состав из настроек одним вызовом: оркестратору не
         // нужно знать настройки, и второго ревьювера не «забыть». Явный harness или name —
@@ -228,7 +244,7 @@ class McpTools(private val project: Project) {
         if (role == Role.REVIEWER && harness == null && requestedName.isNullOrBlank() &&
             domain?.trim().equals(REVIEW_DOMAIN, ignoreCase = true) && panel.isNotEmpty()
         ) {
-            return spawnReviewPanel(panel, task, parent, requestedModel, callerRecord)
+            return spawnReviewPanel(panel, task, parent, requestedModel, callerRecord, workdir)
         }
 
         return when (
@@ -241,6 +257,7 @@ class McpTools(private val project: Project) {
                 domain = domain,
                 requestedHarness = harness,
                 caller = callerRecord,
+                workdir = workdir,
             )
         ) {
             is SpawnResult.Started -> textResult("Агент запущен.\n" + describeStarted(result))
@@ -314,6 +331,7 @@ class McpTools(private val project: Project) {
         parent: String?,
         requestedModel: String?,
         callerRecord: SessionRecord,
+        workdir: java.nio.file.Path?,
     ): Json {
         val started = mutableListOf<SpawnResult.Started>()
         val sections = mutableListOf<String>()
@@ -330,6 +348,7 @@ class McpTools(private val project: Project) {
                     domain = member.slot,
                     requestedHarness = member.harness,
                     caller = callerRecord,
+                    workdir = workdir,
                 )
             ) {
                 is SpawnResult.Started -> {
